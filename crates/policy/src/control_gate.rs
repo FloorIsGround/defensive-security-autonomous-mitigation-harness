@@ -1,0 +1,380 @@
+//! Central Control-Plane Policy Validator Gate, Quotas, and Wake Circuit Breaker.
+//!
+//! Every watch proposal passes through this deterministic validator regardless
+//! of whether it originated from `reasoner-d`, an MCP client, or an operator
+//! acting as an investigator.
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, Utc};
+use defsec_protocol::canonical::canonical_sha256_hex;
+use defsec_protocol::rpc::{PolicyDecision, PrincipalRole, ScopedCapability};
+use defsec_protocol::watch::{WatchClass, WatchSpec};
+use serde::{Deserialize, Serialize};
+
+use crate::edge_floor::{EdgeSafetyConfig, validate_watch_spec};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPolicyConfig {
+    pub policy_version: u32,
+    pub max_ephemeral_per_incident: usize,
+    pub max_ephemeral_per_host: usize,
+    pub max_proposals_per_incident: usize,
+    pub max_equivalent_renewals_per_incident: usize,
+    pub edge_floor: EdgeSafetyConfig,
+}
+
+impl Default for ControlPolicyConfig {
+    fn default() -> Self {
+        Self {
+            policy_version: 1,
+            max_ephemeral_per_incident: 5,
+            max_ephemeral_per_host: 10,
+            max_proposals_per_incident: 25,
+            max_equivalent_renewals_per_incident: 1,
+            edge_floor: EdgeSafetyConfig::default(),
+        }
+    }
+}
+
+/// Snapshot of existing state needed to evaluate a watch proposal deterministically.
+#[derive(Debug, Clone, Default)]
+pub struct ProposalContext {
+    pub active_host_watches: Vec<WatchSpec>,
+    pub active_incident_watches: Vec<WatchSpec>,
+    pub prior_incident_proposal_count: usize,
+    pub prior_equivalent_fingerprints_in_incident: HashMap<String, usize>,
+}
+
+/// Compute a deterministic target fingerprint for a watch spec so equivalent
+/// ephemeral watches (same host + collector parameters) cannot be duplicated or
+/// renewed indefinitely via watch replacement.
+pub fn watch_target_fingerprint(spec: &WatchSpec) -> String {
+    let key = serde_json::json!({
+        "host_id": spec.host_id,
+        "collector": spec.collector,
+    });
+    canonical_sha256_hex(&key).unwrap_or_else(|_| format!("{}:err", spec.host_id))
+}
+
+/// Evaluate a watch proposal under a `ScopedCapability` and `ControlPolicyConfig`.
+pub fn evaluate_watch_proposal(
+    capability: &ScopedCapability,
+    spec: &WatchSpec,
+    ctx: &ProposalContext,
+    cfg: &ControlPolicyConfig,
+    now: DateTime<Utc>,
+) -> PolicyDecision {
+    let deny = |rule_id: &str, reason: String| PolicyDecision {
+        allowed: false,
+        rule_id: rule_id.into(),
+        reason,
+        policy_version: cfg.policy_version,
+    };
+
+    // 1. Capability expiry & role authorization
+    if capability.expires_at <= now {
+        return deny("cap.expired", "capability token has expired".into());
+    }
+
+    match (capability.role, spec.class) {
+        (PrincipalRole::Observer, _) => {
+            return deny(
+                "role.observer_readonly",
+                "observer role cannot submit watch proposals".into(),
+            );
+        }
+        (PrincipalRole::Investigator, WatchClass::Baseline) => {
+            return deny(
+                "baseline.protected",
+                "reasoning/investigator identities cannot create or modify baseline watches".into(),
+            );
+        }
+        (PrincipalRole::Investigator, WatchClass::Ephemeral) => {}
+        (PrincipalRole::Admin, _) => {}
+    }
+
+    // 2. Host & collector scope checks (never trust model-provided IDs as authority)
+    if capability.role != PrincipalRole::Admin {
+        if !capability.allowed_hosts.iter().any(|h| h == &spec.host_id) {
+            return deny(
+                "scope.host_denied",
+                format!("host '{}' is outside capability scope", spec.host_id),
+            );
+        }
+        if !capability
+            .allowed_collectors
+            .contains(&spec.collector.collector_type())
+        {
+            return deny(
+                "scope.collector_denied",
+                format!(
+                    "collector '{}' is outside capability scope",
+                    spec.collector.collector_type().as_str()
+                ),
+            );
+        }
+        let Some(cap_inc) = &capability.incident_id else {
+            return deny(
+                "scope.missing_incident",
+                "ephemeral watch proposal requires an incident-scoped capability".into(),
+            );
+        };
+        if spec.incident_id.as_deref() != Some(cap_inc.as_str()) {
+            return deny(
+                "scope.incident_mismatch",
+                "watch incident_id must match capability incident scope".into(),
+            );
+        }
+    }
+
+    // 3. Enforce at least the edge safety floor centrally before signing/dispatching
+    if let Err(e) = validate_watch_spec(spec, &cfg.edge_floor, now) {
+        return deny("spec.safety_floor", e.to_string());
+    }
+
+    // 4. Ephemeral quotas, duplicate suppression, and renewal-loop prevention
+    if spec.class == WatchClass::Ephemeral {
+        if ctx.active_incident_watches.len() >= cfg.max_ephemeral_per_incident {
+            return deny(
+                "quota.incident_ephemeral_cap",
+                format!(
+                    "incident already has {} active ephemeral watches (cap {})",
+                    ctx.active_incident_watches.len(),
+                    cfg.max_ephemeral_per_incident
+                ),
+            );
+        }
+        let active_host_ephemeral = ctx
+            .active_host_watches
+            .iter()
+            .filter(|w| w.class == WatchClass::Ephemeral)
+            .count();
+        if active_host_ephemeral >= cfg.max_ephemeral_per_host {
+            return deny(
+                "quota.host_ephemeral_cap",
+                format!(
+                    "host '{}' already has {} active ephemeral watches (cap {})",
+                    spec.host_id, active_host_ephemeral, cfg.max_ephemeral_per_host
+                ),
+            );
+        }
+        if ctx.prior_incident_proposal_count >= cfg.max_proposals_per_incident {
+            return deny(
+                "quota.incident_proposal_cap",
+                format!(
+                    "incident proposal limit ({}) reached",
+                    cfg.max_proposals_per_incident
+                ),
+            );
+        }
+
+        let fp = watch_target_fingerprint(spec);
+        if ctx
+            .active_host_watches
+            .iter()
+            .any(|w| watch_target_fingerprint(w) == fp)
+        {
+            return deny(
+                "dedup.equivalent_active_watch",
+                "an equivalent watch with the same host and collector target is already active".into(),
+            );
+        }
+        let prior_equiv = ctx
+            .prior_equivalent_fingerprints_in_incident
+            .get(&fp)
+            .copied()
+            .unwrap_or(0);
+        if prior_equiv > cfg.max_equivalent_renewals_per_incident {
+            return deny(
+                "quota.renewal_loop_blocked",
+                "equivalent ephemeral watch renewal limit exceeded for this incident".into(),
+            );
+        }
+    }
+
+    PolicyDecision {
+        allowed: true,
+        rule_id: "policy.accepted".into(),
+        reason: "watch specification satisfies central policy and safety floor".into(),
+        policy_version: cfg.policy_version,
+    }
+}
+
+/// Durable wake circuit breaker enforcing cooldowns, per-watch/host/global
+/// budgets, and reserved capacity for high-priority health/liveness alerts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeBudgetConfig {
+    pub max_host_wakeups_per_hour: u32,
+    pub max_global_wakeups_per_hour: u32,
+    pub reserved_health_wakeups_per_hour: u32,
+}
+
+impl Default for WakeBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_host_wakeups_per_hour: 12,
+            max_global_wakeups_per_hour: 60,
+            reserved_health_wakeups_per_hour: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeDecision {
+    Allow,
+    Suppress { reason: String },
+}
+
+pub fn check_wake_budget(
+    now: DateTime<Utc>,
+    is_health_priority: bool,
+    watch_cooldown_seconds: u64,
+    watch_max_per_hour: u32,
+    last_watch_wake: Option<DateTime<Utc>>,
+    watch_wakes_last_hour: u32,
+    host_wakes_last_hour: u32,
+    global_wakes_last_hour: u32,
+    cfg: &WakeBudgetConfig,
+) -> WakeDecision {
+    if !is_health_priority {
+        if let Some(last) = last_watch_wake
+            && now < last + Duration::seconds(watch_cooldown_seconds as i64)
+        {
+            return WakeDecision::Suppress {
+                reason: "watch cooldown active".into(),
+            };
+        }
+        if watch_wakes_last_hour >= watch_max_per_hour {
+            return WakeDecision::Suppress {
+                reason: "per-watch hourly wake budget exhausted".into(),
+            };
+        }
+        if host_wakes_last_hour >= cfg.max_host_wakeups_per_hour {
+            return WakeDecision::Suppress {
+                reason: "per-host hourly wake budget exhausted".into(),
+            };
+        }
+        let non_health_cap = cfg
+            .max_global_wakeups_per_hour
+            .saturating_sub(cfg.reserved_health_wakeups_per_hour);
+        if global_wakes_last_hour >= non_health_cap {
+            return WakeDecision::Suppress {
+                reason: "global non-health wake budget exhausted (capacity reserved for health events)".into(),
+            };
+        }
+    } else if global_wakes_last_hour >= cfg.max_global_wakeups_per_hour {
+        return WakeDecision::Suppress {
+            reason: "global hard wake circuit breaker tripped".into(),
+        };
+    }
+
+    WakeDecision::Allow
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use defsec_protocol::watch::{
+        CollectorSpec, CollectorType, CompareTarget, SystemdUnitStateParams, TriggerPredicate,
+        WakePolicy, WatchLifecycle, WatchSchedule,
+    };
+
+    fn make_cap(role: PrincipalRole, now: DateTime<Utc>) -> ScopedCapability {
+        ScopedCapability {
+            principal_id: "reasoner-1".into(),
+            role,
+            run_id: Some("run-1".into()),
+            incident_id: Some("inc-42".into()),
+            allowed_hosts: vec!["edge-07".into()],
+            allowed_collectors: vec![
+                CollectorType::SystemdUnitState,
+                CollectorType::SocketsListening,
+            ],
+            expires_at: now + Duration::minutes(15),
+        }
+    }
+
+    fn make_spec(id: &str, class: WatchClass, host: &str, unit: &str, now: DateTime<Utc>) -> WatchSpec {
+        WatchSpec {
+            id: id.into(),
+            version: 1,
+            host_id: host.into(),
+            class,
+            incident_id: Some("inc-42".into()),
+            collector: CollectorSpec::SystemdUnitState(SystemdUnitStateParams {
+                unit: unit.into(),
+                hash_unit_files: true,
+            }),
+            schedule: WatchSchedule {
+                interval_seconds: 30,
+                timeout_seconds: 5,
+            },
+            trigger: TriggerPredicate::FieldChanged {
+                compare_against: CompareTarget::LastObserved,
+                fields: vec!["active_state".into()],
+            },
+            wake_policy: WakePolicy {
+                cooldown_seconds: 180,
+                max_wakeups_per_hour: 4,
+            },
+            lifecycle: WatchLifecycle {
+                enabled: true,
+                expires_at: Some(now + Duration::hours(2)),
+                max_runs: Some(240),
+            },
+        }
+    }
+
+    #[test]
+    fn investigator_cannot_touch_baseline_or_cross_host_or_exceed_quota() {
+        let now = Utc::now();
+        let cfg = ControlPolicyConfig::default();
+        let cap = make_cap(PrincipalRole::Investigator, now);
+        let ctx = ProposalContext::default();
+
+        // Baseline forbidden
+        let baseline = make_spec("b1", WatchClass::Baseline, "edge-07", "sshd.service", now);
+        let d = evaluate_watch_proposal(&cap, &baseline, &ctx, &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "baseline.protected");
+
+        // Cross-host forbidden
+        let cross = make_spec("e1", WatchClass::Ephemeral, "edge-99", "sshd.service", now);
+        let d = evaluate_watch_proposal(&cap, &cross, &ctx, &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "scope.host_denied");
+
+        // Valid ephemeral accepted
+        let valid = make_spec("e2", WatchClass::Ephemeral, "edge-07", "nginx.service", now);
+        let d = evaluate_watch_proposal(&cap, &valid, &ctx, &cfg, now);
+        assert!(d.allowed);
+
+        // Equivalent duplicate rejected
+        let mut dup_ctx = ctx.clone();
+        dup_ctx.active_host_watches.push(valid.clone());
+        let dup = make_spec("e3", WatchClass::Ephemeral, "edge-07", "nginx.service", now);
+        let d = evaluate_watch_proposal(&cap, &dup, &dup_ctx, &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "dedup.equivalent_active_watch");
+    }
+
+    #[test]
+    fn wake_circuit_breaker_reserves_capacity_for_health_events() {
+        let now = Utc::now();
+        let cfg = WakeBudgetConfig {
+            max_host_wakeups_per_hour: 10,
+            max_global_wakeups_per_hour: 20,
+            reserved_health_wakeups_per_hour: 5,
+        };
+        // At 15 global wakes, non-health is suppressed, health still allowed.
+        assert!(matches!(
+            check_wake_budget(now, false, 60, 10, None, 0, 0, 15, &cfg),
+            WakeDecision::Suppress { .. }
+        ));
+        assert_eq!(
+            check_wake_budget(now, true, 60, 10, None, 0, 0, 15, &cfg),
+            WakeDecision::Allow
+        );
+    }
+}

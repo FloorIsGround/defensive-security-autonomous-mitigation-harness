@@ -1,0 +1,25 @@
+[package]
+name = "control-d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+defsec-policy.workspace = true
+defsec-protocol.workspace = true
+hex.workspace = true
+nix.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+agent-d = { path = "../agent-d" }
