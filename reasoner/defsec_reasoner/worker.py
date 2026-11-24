@@ -34,9 +34,22 @@ from defsec_reasoner.provenance import (
     wrap_json,
     wrap_observation,
 )
-from defsec_reasoner.rpc_client import ControlRpcClient, RpcError, RpcTransportError
+from defsec_reasoner.rpc_client import (
+    ACTION_VERB_KINDS,
+    ControlRpcClient,
+    RpcError,
+    RpcTransportError,
+    normalize_action_verb,
+)
 
-__all__ = ["RunBudgets", "ReasonerWorker", "WorkerOutcome", "INVESTIGATION_TOOLS"]
+__all__ = [
+    "RunBudgets",
+    "ReasonerWorker",
+    "WorkerOutcome",
+    "INVESTIGATION_TOOLS",
+    "ACTION_TOOLS",
+    "ACTION_TOOL_NAMES",
+]
 
 logger = logging.getLogger("defsec.reasoner.worker")
 
@@ -50,6 +63,8 @@ class RunBudgets:
     max_total_tokens: int = 16000
     max_cost_usd: float = 0.25
     max_proposals_per_run: int = 3
+    max_action_proposals_per_run: int = 1
+    enable_action_proposals: bool = False
     max_context_bytes: int = 32768
     lease_seconds: int = 120
 
@@ -70,6 +85,8 @@ class WorkerOutcome:
     findings: int = 0
     proposals: int = 0
     proposals_accepted: int = 0
+    action_proposals_submitted: int = 0
+    action_proposals_accepted: int = 0
     budget_stop_reason: str | None = None
     summary: str = ""
     error: str | None = None
@@ -181,6 +198,85 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
 
 TOOL_NAMES = [tool["name"] for tool in INVESTIGATION_TOOLS]
 
+#: Phase 8 typed mitigation tools. Only exposed when
+#: ``RunBudgets.enable_action_proposals`` is explicitly True (safe opt-in).
+ACTION_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "propose_action",
+        "description": (
+            "Submit ONE typed mitigation action from a closed catalog. There is no "
+            "shell, script, or free-form remediation: the only verbs are "
+            "nft_block_ip, systemd_stop_unit, and host_isolate. Every action must "
+            "cite at least one verified observation_id and include a concrete "
+            "rollback_plan; the central policy gate may auto-authorize reversible "
+            "low-blast verbs under human-owned policy, or require an independent "
+            "operator dual-signature for high-blast verbs (status pending_approval). "
+            "A rejection is final. Arguments: verb (closed-catalog object with a "
+            "'verb' tag), evidence_observation_ids (array of integers), "
+            "expected_effect, blast_radius, rollback_plan."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "verb": {
+                    "type": "object",
+                    "properties": {
+                        "verb": {"type": "string", "enum": list(ACTION_VERB_KINDS)},
+                        "ip": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["inbound", "outbound", "both"]},
+                        "unit": {"type": "string"},
+                        "preserve_mgmt_cidrs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "ttl_seconds": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["verb"],
+                    "additionalProperties": False,
+                },
+                "evidence_observation_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                },
+                "expected_effect": {"type": "string"},
+                "blast_radius": {"type": "string"},
+                "rollback_plan": {"type": "string"},
+            },
+            "required": [
+                "verb",
+                "evidence_observation_ids",
+                "expected_effect",
+                "blast_radius",
+                "rollback_plan",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_actions",
+        "description": (
+            "List action proposal summaries for this run's host and incident "
+            "(proposal/intent IDs, auth mode, status). Read-only; no arguments."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+ACTION_TOOL_NAMES = frozenset(tool["name"] for tool in ACTION_TOOLS)
+
+#: Top-level keys that are not fields of the tagged ``ActionVerb`` object.
+_ACTION_METADATA_KEYS = frozenset(
+    {
+        "verb",
+        "evidence_observation_ids",
+        "expected_effect",
+        "blast_radius",
+        "rollback_plan",
+        "idempotency_key",
+    }
+)
+
 
 class ReasonerWorker:
     """Bounded episodic worker; dormant until a trigger is leased."""
@@ -264,6 +360,8 @@ class ReasonerWorker:
             "budgets": {
                 "max_turns": self.budgets.max_turns,
                 "max_proposals_per_run": self.budgets.max_proposals_per_run,
+                "max_action_proposals_per_run": self.budgets.max_action_proposals_per_run,
+                "enable_action_proposals": self.budgets.enable_action_proposals,
                 "max_total_tokens": self.budgets.max_total_tokens,
                 "max_cost_usd": self.budgets.max_cost_usd,
             },
@@ -277,8 +375,18 @@ class ReasonerWorker:
         context_block = render_context_block(
             run_header, envelopes, capabilities, max_block_bytes=self.budgets.max_context_bytes
         )
+        tools = (
+            INVESTIGATION_TOOLS + ACTION_TOOLS
+            if self.budgets.enable_action_proposals
+            else INVESTIGATION_TOOLS
+        )
         system_prompt = build_system_prompt(
-            self.backend_id, self.model_id, self.budgets, TOOL_NAMES, self.prompt_schema_version
+            self.backend_id,
+            self.model_id,
+            self.budgets,
+            [tool["name"] for tool in tools],
+            self.prompt_schema_version,
+            enable_action_proposals=self.budgets.enable_action_proposals,
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -289,6 +397,8 @@ class ReasonerWorker:
         deadline = time.monotonic() + self.budgets.max_wall_seconds
         proposals = findings = 0
         proposals_accepted = 0
+        action_proposals = 0
+        action_proposals_accepted = 0
         finish_requested = False
         final_text: str | None = None
 
@@ -306,7 +416,7 @@ class ReasonerWorker:
                     outcome.budget_stop_reason = "max_cost_usd"
                     break
                 try:
-                    turn = self.adapter.chat(messages, INVESTIGATION_TOOLS)
+                    turn = self.adapter.chat(messages, tools)
                 except ProviderError as exc:
                     return self._fail_lease(
                         client, outcome, lease_token, f"provider failure: {exc}", retryable=exc.retryable
@@ -336,6 +446,7 @@ class ReasonerWorker:
                             incident_id=incident_id,
                             host_id=host_id,
                             proposals_done=proposals,
+                            action_proposals_done=action_proposals,
                             findings_done=findings,
                         )
                         if result.get("_accepted_proposal"):
@@ -343,10 +454,17 @@ class ReasonerWorker:
                             proposals_accepted += 1
                         elif result.get("_proposal_attempted"):
                             proposals += 1
+                        if result.get("_action_proposal_accepted"):
+                            action_proposals += 1
+                            action_proposals_accepted += 1
+                        elif result.get("_action_proposal_attempted"):
+                            action_proposals += 1
                         if result.get("_finding_recorded"):
                             findings += 1
                         result.pop("_accepted_proposal", None)
                         result.pop("_proposal_attempted", None)
+                        result.pop("_action_proposal_accepted", None)
+                        result.pop("_action_proposal_attempted", None)
                         result.pop("_finding_recorded", None)
                         messages.append(
                             {
@@ -373,6 +491,8 @@ class ReasonerWorker:
 
         outcome.proposals = proposals
         outcome.proposals_accepted = proposals_accepted
+        outcome.action_proposals_submitted = action_proposals
+        outcome.action_proposals_accepted = action_proposals_accepted
         outcome.findings = findings
         outcome.summary = clip_utf8(
             final_text or "investigation run finished without a final model summary", 2048
@@ -393,8 +513,10 @@ class ReasonerWorker:
             outcome.error = str(exc)
             return outcome
         logger.info(
-            "event %s completed: turns=%s findings=%s proposals=%s (accepted=%s)",
+            "event %s completed: turns=%s findings=%s proposals=%s (accepted=%s) "
+            "action_proposals=%s (accepted=%s)",
             event_id, outcome.turns, findings, proposals, proposals_accepted,
+            action_proposals, action_proposals_accepted,
         )
         return outcome
 
@@ -409,6 +531,7 @@ class ReasonerWorker:
         incident_id: str,
         host_id: str,
         proposals_done: int,
+        action_proposals_done: int,
         findings_done: int,
     ) -> tuple[dict[str, Any], bool]:
         """Execute ONE allowed investigation tool via the RPC. No shell ever.
@@ -419,6 +542,115 @@ class ReasonerWorker:
         name = call.name
         args = call.arguments if isinstance(call.arguments, dict) else {}
         try:
+            if name in ACTION_TOOL_NAMES and not self.budgets.enable_action_proposals:
+                # Safe default: the tools are not advertised, and a hijacked
+                # model that emits them anyway is refused before any RPC.
+                return (
+                    {
+                        "error": "forbidden",
+                        "detail": "typed action proposals are disabled for this worker run",
+                    },
+                    False,
+                )
+            if name == "propose_action":
+                if action_proposals_done >= self.budgets.max_action_proposals_per_run:
+                    return (
+                        {
+                            "error": "budget",
+                            "detail": "action proposal budget of "
+                            f"{self.budgets.max_action_proposals_per_run} for this run is exhausted",
+                        },
+                        False,
+                    )
+                raw_verb = args.get("verb")
+                if isinstance(raw_verb, dict):
+                    verb_payload: Any = raw_verb
+                elif isinstance(raw_verb, str):
+                    # Tolerate the flat form while still validating strictly.
+                    verb_payload = {
+                        key: value
+                        for key, value in args.items()
+                        if key not in _ACTION_METADATA_KEYS
+                    }
+                    verb_payload["verb"] = raw_verb
+                else:
+                    return (
+                        {"error": "invalid", "detail": "verb must be a closed-catalog object"},
+                        False,
+                    )
+                try:
+                    verb = normalize_action_verb(verb_payload)
+                    evidence = args.get("evidence_observation_ids")
+                    if not isinstance(evidence, list) or not evidence:
+                        raise ValueError(
+                            "evidence_observation_ids must cite at least one verified observation"
+                        )
+                    if not all(
+                        isinstance(i, int) and not isinstance(i, bool) for i in evidence
+                    ):
+                        raise ValueError("evidence_observation_ids must be integers")
+                    expected_effect = str(args.get("expected_effect") or "").strip()
+                    blast_radius = str(args.get("blast_radius") or "").strip()
+                    rollback_plan = str(args.get("rollback_plan") or "").strip()
+                    for field, value in (
+                        ("expected_effect", expected_effect),
+                        ("blast_radius", blast_radius),
+                        ("rollback_plan", rollback_plan),
+                    ):
+                        if not value:
+                            raise ValueError(f"{field} must be a non-empty string")
+                except ValueError as exc:
+                    return {"error": "invalid", "detail": str(exc)}, False
+                try:
+                    reply = client.propose_action(
+                        run_id,
+                        incident_id,
+                        args.get("idempotency_key")
+                        or f"{run_id}-a{action_proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        verb,
+                        [int(i) for i in evidence],
+                        expected_effect,
+                        blast_radius,
+                        rollback_plan,
+                    )
+                except RpcError as exc:
+                    return (
+                        {
+                            "error": exc.code,
+                            "detail": exc.message,
+                            "_action_proposal_attempted": True,
+                        },
+                        False,
+                    )
+                decision = reply.get("decision") or {}
+                result = {
+                    "decision": decision,
+                    "proposal_id": reply.get("proposal_id"),
+                    "intent_id": reply.get("intent_id"),
+                    "auth_mode": reply.get("auth_mode"),
+                    "status": reply.get("status"),
+                    "authorized_intent": reply.get("authorized_intent"),
+                    "_action_proposal_attempted": True,
+                }
+                if decision.get("allowed"):
+                    result["_action_proposal_accepted"] = True
+                return result, False
+            if name == "list_actions":
+                if args.get("host_id") is not None and str(args.get("host_id")) != host_id:
+                    return {"error": "forbidden", "detail": "host is outside run scope"}, False
+                if (
+                    args.get("incident_id") is not None
+                    and str(args.get("incident_id")) != incident_id
+                ):
+                    return {"error": "forbidden", "detail": "incident is outside run scope"}, False
+                return (
+                    {
+                        "actions": client.list_actions(
+                            host_id=host_id, incident_id=incident_id
+                        )
+                    },
+                    False,
+                )
             if name == "query_observations":
                 target_host = str(args.get("host_id") or host_id)
                 if target_host != host_id:

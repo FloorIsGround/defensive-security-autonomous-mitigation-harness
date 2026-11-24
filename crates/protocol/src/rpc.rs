@@ -7,8 +7,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::action::{
+    ActionAuthMode, ActionIntentPayload, ActionIntentStatus, ActionReceipt, ActionSummary,
+    ActionVerb, AuthorizedActionIntent,
+};
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
+use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +152,22 @@ pub enum InvestigationRequest {
         error: String,
         retryable: bool,
     },
+    ProposeAction {
+        run_id: String,
+        incident_id: String,
+        idempotency_key: String,
+        verb: ActionVerb,
+        evidence_observation_ids: Vec<i64>,
+        expected_effect: String,
+        blast_radius: String,
+        rollback_plan: String,
+    },
+    ListActions {
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        incident_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +297,22 @@ pub enum InvestigationResponse {
         event_id: i64,
         status: String,
     },
+    ActionProposalEvaluated {
+        decision: PolicyDecision,
+        #[serde(default)]
+        proposal_id: Option<i64>,
+        #[serde(default)]
+        intent_id: Option<String>,
+        #[serde(default)]
+        auth_mode: Option<ActionAuthMode>,
+        #[serde(default)]
+        status: Option<ActionIntentStatus>,
+        #[serde(default)]
+        authorized_intent: Option<AuthorizedActionIntent>,
+    },
+    Actions {
+        actions: Vec<ActionSummary>,
+    },
     Error {
         code: String,
         message: String,
@@ -329,6 +366,23 @@ pub enum AdminRequest {
         #[serde(default)]
         limit: Option<u32>,
     },
+    ListActions {
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        incident_id: Option<String>,
+    },
+    GetActionIntent {
+        intent_id: String,
+    },
+    ApproveAction {
+        intent_id: String,
+        approver: String,
+        operator_approval: SignedEnvelope,
+    },
+    RecordActionReceipt {
+        receipt: ActionReceipt,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +430,23 @@ pub enum AdminResponse {
     },
     PolicyDecisions {
         decisions: Vec<PolicyDecisionRecord>,
+    },
+    Actions {
+        actions: Vec<ActionSummary>,
+    },
+    ActionIntentDetail {
+        payload: ActionIntentPayload,
+        #[serde(default)]
+        authorized_intent: Option<AuthorizedActionIntent>,
+        status: ActionIntentStatus,
+    },
+    ActionApproved {
+        intent_id: String,
+        authorized_intent: AuthorizedActionIntent,
+    },
+    ActionReceiptAck {
+        intent_id: String,
+        status: ActionIntentStatus,
     },
     Error {
         code: String,

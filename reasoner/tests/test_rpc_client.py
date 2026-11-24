@@ -13,6 +13,9 @@ from pathlib import Path
 REASONER_ROOT = Path(__file__).resolve().parents[1]
 if str(REASONER_ROOT) not in sys.path:
     sys.path.insert(0, str(REASONER_ROOT))
+TESTS_ROOT = Path(__file__).resolve().parent
+if str(TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(TESTS_ROOT))
 
 import unittest  # noqa: E402
 

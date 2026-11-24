@@ -58,6 +58,8 @@ class FakeControlServer:
         expire_leases: bool = False,
         complete_error: dict[str, str] | None = None,
         proposal_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
+        action_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
+        action_auth_modes: dict[str, str] | None = None,
         triggers: list[dict[str, Any]] | None = None,
     ) -> None:
         self.socket_path = str(socket_path)
@@ -65,6 +67,16 @@ class FakeControlServer:
         self.expire_leases = expire_leases
         self.complete_error = complete_error
         self.proposal_policy = proposal_policy or (lambda spec: (True, "policy.accepted", "ok"))
+        self.action_policy = action_policy or (lambda verb: (True, "policy.action_ok", "ok"))
+        #: Per-verb authorization tier, mirroring Phase 8's policy engine.
+        self.action_auth_modes = dict(
+            action_auth_modes
+            or {
+                "nft_block_ip": "policy_bounded_autonomous",
+                "systemd_stop_unit": "policy_bounded_autonomous",
+                "host_isolate": "dual_signed_operator",
+            }
+        )
         self.triggers = triggers or [
             self._default_trigger(),
         ]
@@ -92,6 +104,7 @@ class FakeControlServer:
         ]
         self.findings: list[dict[str, Any]] = []
         self.proposals: list[dict[str, Any]] = []
+        self.action_proposals: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.requests: list[dict[str, Any]] = []
         self.completed_events: list[int] = []
@@ -272,6 +285,83 @@ class FakeControlServer:
             "finding_id": finding["finding_id"],
             "verified_evidence_count": len(finding["evidence_observation_ids"]),
         }
+
+    def _op_propose_action(self, req: dict[str, Any]) -> dict[str, Any]:
+        verb = req.get("verb") or {}
+        kind = verb.get("verb")
+        if kind not in ("nft_block_ip", "systemd_stop_unit", "host_isolate"):
+            return self._error("invalid_request", f"unknown action verb {kind!r}")
+        known = {o["observation_id"] for o in self.observations}
+        evidence = req.get("evidence_observation_ids") or []
+        if not evidence:
+            return self._error("invalid_request", "action must cite verified evidence")
+        for evidence_id in evidence:
+            if int(evidence_id) not in known:
+                return self._error(
+                    "invalid_request", "action evidence is missing or outside incident scope"
+                )
+        allowed, rule_id, reason = self.action_policy(verb)
+        auth_mode = self.action_auth_modes.get(kind, "dual_signed_operator")
+        proposal_id = len(self.action_proposals) + 1
+        if not allowed:
+            status = "rejected"
+        elif auth_mode == "policy_bounded_autonomous":
+            status = "authorized"
+        else:
+            status = "pending_approval"
+        intent_id = f"intent-{proposal_id}" if status == "authorized" else None
+        summary = {
+            "proposal_id": proposal_id,
+            "intent_id": intent_id,
+            "host_id": "edge-01",
+            "incident_id": req.get("incident_id", "inc-1"),
+            "auth_mode": auth_mode,
+            "status": status,
+            "verb": verb,
+            "expected_effect": req.get("expected_effect", ""),
+            "blast_radius": req.get("blast_radius", ""),
+            "rollback_plan": req.get("rollback_plan", ""),
+            "created_at": "2026-11-24T12:00:00Z",
+            "approver": None,
+        }
+        self.action_proposals.append(summary)
+        authorized_intent = None
+        if status == "authorized":
+            authorized_intent = {
+                "control_envelope": {
+                    "domain": "defsecautmit.action_intent.v1",
+                    "signing_key_id": "fake-control",
+                    "raw_payload": json.dumps(
+                        {"intent_id": intent_id, "proposal_id": proposal_id},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "signature_hex": "00" * 64,
+                },
+                "operator_approval": None,
+            }
+        return {
+            "result": "action_proposal_evaluated",
+            "decision": {
+                "allowed": allowed,
+                "rule_id": rule_id,
+                "reason": reason,
+                "policy_version": 1,
+            },
+            "proposal_id": proposal_id,
+            "intent_id": intent_id,
+            "auth_mode": auth_mode,
+            "status": status,
+            "authorized_intent": authorized_intent,
+        }
+
+    def _op_list_actions(self, req: dict[str, Any]) -> dict[str, Any]:
+        actions = list(self.action_proposals)
+        if req.get("host_id") is not None:
+            actions = [a for a in actions if a["host_id"] == req["host_id"]]
+        if req.get("incident_id") is not None:
+            actions = [a for a in actions if a["incident_id"] == req["incident_id"]]
+        return {"result": "actions", "actions": actions}
 
     def _op_lease_next_trigger(self, req: dict[str, Any]) -> dict[str, Any]:
         now = self._now()

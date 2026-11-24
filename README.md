@@ -16,7 +16,8 @@ See [adaptive_defensive_monitoring_harness_design_v0.2.md](docs/adaptive_defensi
 | `crates/control-d` | Authoritative control server: SQLite WAL ledger (`synchronous=FULL`), three-state baseline engine, Ed25519 bundle signer, hash-chained `audit_outbox`, and `SO_PEERCRED`-authenticated UDS servers (`agent.sock`, `admin.sock`, `investigate.sock`) |
 | `crates/admin-cli` | Operator CLI for host enrollment, baseline watch management, attributable baseline promotion, scoped capability token minting, incident closure, and audit chain verification |
 | `crates/mcp-adapter` | Thin Rust stdio MCP server (`--mode read-only` default or `--mode investigator`) bridging external agent clients (T3 Code, Codex, Claude) to `control-d`'s `investigate.sock` |
-| `reasoner/` | Zero-dependency Python 3.12 episodic reasoning worker (`reasoner-d`), replaceable model adapters (OpenAI-compatible/Ollama/vLLM, Anthropic, ScriptedMock), provenance envelopes, and 4-scenario adaptive-vs-static benchmark suite |
+| `crates/action-exec-d` | Isolated privileged mitigation executor (`--mode dry-run` default or `enforce`) verifying Ed25519 control + independent operator dual signatures, local protected-asset denylists, atomic nonce replay protection, and automatic TTL rollback (`nft_block_ip`, `systemd_stop_unit`, `host_isolate`) |
+| `reasoner/` | Zero-dependency Python 3.12 episodic reasoning worker (`reasoner-d`), replaceable model adapters (OpenAI-compatible/Ollama/vLLM, Anthropic, ScriptedMock), provenance envelopes, optional bounded mitigation proposals, and 4-scenario adaptive-vs-static benchmark suite |
 | `console/` | Zero-dependency Node 24 localhost BFF + responsive Operator Web Console (`--demo` or live `control-d` UDS mode) with three-state baseline inspector, guided watch proposal composer, and independent audit-chain verifier |
 
 ## Build & Test

@@ -1,8 +1,17 @@
-use std::{fs, path::PathBuf, process::ExitCode};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use defsec_policy::edge_floor::is_valid_identifier;
 use defsec_protocol::{
+    action::ActionIntentStatus,
     rpc::{AdminRequest, AdminResponse, PrincipalRole},
+    signing::{DOMAIN_ACTION_APPROVAL_V1, SigningKeyPair},
     watch::CollectorType,
     wire::{read_frame, write_frame},
 };
@@ -61,6 +70,33 @@ enum Command {
         actor: String,
         #[arg(long)]
         resolution: String,
+    },
+    GenerateOperatorKey {
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    ListActions {
+        #[arg(long)]
+        host_id: Option<String>,
+        #[arg(long)]
+        incident_id: Option<String>,
+    },
+    GetAction {
+        intent_id: String,
+    },
+    ApproveAction {
+        intent_id: String,
+        #[arg(long)]
+        approver: String,
+        #[arg(long)]
+        operator_key_file: PathBuf,
+        #[arg(long)]
+        operator_key_id: String,
+    },
+    RecordReceipt {
+        receipt_json_file: PathBuf,
     },
     ListHosts,
     ListIncidents,
@@ -138,6 +174,20 @@ impl Command {
                 actor,
                 resolution,
             },
+            Self::ListActions {
+                host_id,
+                incident_id,
+            } => AdminRequest::ListActions {
+                host_id,
+                incident_id,
+            },
+            Self::GetAction { intent_id } => AdminRequest::GetActionIntent { intent_id },
+            Self::RecordReceipt { receipt_json_file } => AdminRequest::RecordActionReceipt {
+                receipt: serde_json::from_slice(&fs::read(receipt_json_file)?)?,
+            },
+            Self::GenerateOperatorKey { .. } | Self::ApproveAction { .. } => {
+                return Err("command requires local operator key handling".into());
+            }
             Self::ListHosts => AdminRequest::ListHosts,
             Self::ListIncidents => AdminRequest::ListIncidents,
             Self::VerifyAudit => AdminRequest::VerifyAuditChain,
@@ -145,24 +195,120 @@ impl Command {
     }
 }
 
-async fn run(args: Args) -> Result<AdminResponse, Box<dyn std::error::Error>> {
-    let request = args.command.into_request()?;
-    let mut socket = UnixStream::connect(args.admin_sock).await?;
-    write_frame(&mut socket, &request).await?;
-    Ok(read_frame(&mut socket)
+fn generate_operator_key(
+    key_id: &str,
+    out: &Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if !is_valid_identifier(key_id) {
+        return Err("invalid operator key ID".into());
+    }
+    let key = SigningKeyPair::generate(key_id);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(key.secret_hex().as_bytes())?;
+    file.sync_all()?;
+    Ok(serde_json::json!({"key_id": key.key_id(), "public_hex": key.public_hex()}))
+}
+
+fn load_operator_key(
+    key_id: &str,
+    path: &Path,
+) -> Result<SigningKeyPair, Box<dyn std::error::Error>> {
+    let check_permissions = |meta: fs::Metadata| {
+        if meta.is_file() && meta.permissions().mode() & 0o777 == 0o600 {
+            Ok(())
+        } else {
+            Err("operator key must be a regular file with mode 0600")
+        }
+    };
+    check_permissions(fs::symlink_metadata(path)?)?;
+    let file = File::open(path)?;
+    check_permissions(file.metadata()?)?;
+    let mut secret = String::new();
+    file.take(65).read_to_string(&mut secret)?;
+    Ok(SigningKeyPair::from_secret_hex(key_id, &secret)?)
+}
+
+async fn exchange(
+    socket: &mut UnixStream,
+    request: AdminRequest,
+) -> Result<AdminResponse, Box<dyn std::error::Error>> {
+    write_frame(socket, &request).await?;
+    Ok(read_frame(socket)
         .await?
         .ok_or("control daemon closed the socket without a response")?)
 }
 
+async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
+    let response = match args.command {
+        Command::GenerateOperatorKey { key_id, out } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&generate_operator_key(&key_id, &out)?)?
+            );
+            return Ok(false);
+        }
+        Command::ApproveAction {
+            intent_id,
+            approver,
+            operator_key_file,
+            operator_key_id,
+        } => {
+            let mut socket = UnixStream::connect(args.admin_sock).await?;
+            let detail = exchange(
+                &mut socket,
+                AdminRequest::GetActionIntent {
+                    intent_id: intent_id.clone(),
+                },
+            )
+            .await?;
+            match detail {
+                AdminResponse::Error { .. } => detail,
+                AdminResponse::ActionIntentDetail {
+                    payload,
+                    status: ActionIntentStatus::PendingApproval,
+                    ..
+                } if payload.intent_id == intent_id => {
+                    let key = load_operator_key(&operator_key_id, &operator_key_file)?;
+                    let operator_approval =
+                        key.sign_payload(DOMAIN_ACTION_APPROVAL_V1, &payload)?;
+                    exchange(
+                        &mut socket,
+                        AdminRequest::ApproveAction {
+                            intent_id,
+                            approver,
+                            operator_approval,
+                        },
+                    )
+                    .await?
+                }
+                _ => {
+                    return Err(
+                        "control daemon did not return the requested pending action intent".into(),
+                    );
+                }
+            }
+        }
+        command => {
+            let request = command.into_request()?;
+            let mut socket = UnixStream::connect(args.admin_sock).await?;
+            exchange(&mut socket, request).await?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(matches!(
+        response,
+        AdminResponse::Error { .. } | AdminResponse::AuditChainStatus { valid: false, .. }
+    ))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let result = run(Args::parse()).await.and_then(|response| {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        Ok(matches!(
-            response,
-            AdminResponse::Error { .. } | AdminResponse::AuditChainStatus { valid: false, .. }
-        ))
-    });
+    let result = run(Args::parse()).await;
     match result {
         Ok(false) => ExitCode::SUCCESS,
         Ok(true) => ExitCode::FAILURE,
@@ -176,6 +322,207 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_action_commands() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("admin-cli").chain(args.iter().copied()))
+                .unwrap()
+                .command
+        };
+        assert!(matches!(
+            parse(&["generate-operator-key", "--key-id", "operator", "--out", "key.hex"]),
+            Command::GenerateOperatorKey { key_id, out }
+                if key_id == "operator" && out == Path::new("key.hex")
+        ));
+        assert_eq!(
+            parse(&[
+                "list-actions",
+                "--host-id",
+                "edge",
+                "--incident-id",
+                "incident"
+            ])
+            .into_request()
+            .unwrap(),
+            AdminRequest::ListActions {
+                host_id: Some("edge".into()),
+                incident_id: Some("incident".into())
+            }
+        );
+        assert_eq!(
+            parse(&["list-actions"]).into_request().unwrap(),
+            AdminRequest::ListActions {
+                host_id: None,
+                incident_id: None
+            }
+        );
+        assert_eq!(
+            parse(&["get-action", "intent"]).into_request().unwrap(),
+            AdminRequest::GetActionIntent {
+                intent_id: "intent".into()
+            }
+        );
+        assert!(matches!(
+            parse(&["approve-action", "intent", "--approver", "Alice", "--operator-key-file",
+                "key.hex", "--operator-key-id", "operator"]),
+            Command::ApproveAction { intent_id, approver, operator_key_file, operator_key_id }
+                if intent_id == "intent" && approver == "Alice" && operator_key_id == "operator"
+                && operator_key_file == Path::new("key.hex")
+        ));
+        assert!(matches!(
+            parse(&["record-receipt", "receipt.json"]),
+            Command::RecordReceipt { receipt_json_file } if receipt_json_file == Path::new("receipt.json")
+        ));
+        assert!(
+            Args::try_parse_from([
+                "admin-cli",
+                "approve-action",
+                "intent",
+                "--approver",
+                "Alice"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["admin-cli", "generate-operator-key", "--key-id", "operator"])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn generates_private_operator_key_without_connecting() {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("d-{}", &id[..8]));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("operator.hex");
+        let args = Args {
+            admin_sock: dir.join("missing.sock"),
+            command: Command::GenerateOperatorKey {
+                key_id: "operator".into(),
+                out: path.clone(),
+            },
+        };
+        let result = run(args).await;
+        let permissions = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let key = load_operator_key("operator", &path).unwrap();
+        let overwrite = generate_operator_key("operator", &path);
+        let remaining_key = load_operator_key("operator", &path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!result.unwrap());
+        assert_eq!(permissions, 0o600);
+        assert!(overwrite.is_err());
+        assert_eq!(remaining_key.public_hex(), key.public_hex());
+    }
+
+    #[tokio::test]
+    async fn approval_signs_the_pending_payload_locally() {
+        use chrono::{Duration, Utc};
+        use defsec_protocol::{
+            action::{
+                ACTION_INTENT_SCHEMA_VERSION, ActionAuthMode, ActionIntentPayload, ActionVerb,
+            },
+            signing::{DOMAIN_ACTION_INTENT_V1, VerifyingKeyStore},
+        };
+        use tokio::net::UnixListener;
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("d-{}", &id[..8]));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("operator.hex");
+        let public = generate_operator_key("operator", &path).unwrap();
+        let mut trust = VerifyingKeyStore::new();
+        trust
+            .insert_public_hex("operator", public["public_hex"].as_str().unwrap())
+            .unwrap();
+        let admin_sock = dir.join("admin.sock");
+        let listener = UnixListener::bind(&admin_sock).unwrap();
+        let now = Utc::now();
+        let payload = ActionIntentPayload {
+            schema_version: ACTION_INTENT_SCHEMA_VERSION,
+            intent_id: "intent".into(),
+            nonce: "nonce".into(),
+            host_id: "edge".into(),
+            incident_id: "incident".into(),
+            proposal_id: 7,
+            auth_mode: ActionAuthMode::DualSignedOperator,
+            verb: ActionVerb::HostIsolate {
+                preserve_mgmt_cidrs: vec!["10.0.0.0/24".into()],
+                ttl_seconds: 60,
+            },
+            policy_version: 1,
+            issued_at: now,
+            expires_at: now + Duration::seconds(60),
+            rollback_plan: "Restore connectivity".into(),
+            evidence_observation_ids: vec![9],
+        };
+        let control_envelope = SigningKeyPair::generate("control")
+            .sign_payload(DOMAIN_ACTION_INTENT_V1, &payload)
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_frame(&mut socket).await.unwrap(),
+                Some(AdminRequest::GetActionIntent {
+                    intent_id: payload.intent_id.clone()
+                })
+            );
+            write_frame(
+                &mut socket,
+                &AdminResponse::ActionIntentDetail {
+                    payload: payload.clone(),
+                    authorized_intent: None,
+                    status: ActionIntentStatus::PendingApproval,
+                },
+            )
+            .await
+            .unwrap();
+            let Some(AdminRequest::ApproveAction {
+                intent_id,
+                approver,
+                operator_approval,
+            }) = read_frame(&mut socket).await.unwrap()
+            else {
+                panic!("missing approval")
+            };
+            assert_eq!(intent_id, payload.intent_id);
+            assert_eq!(approver, "Alice");
+            assert_eq!(operator_approval.raw_payload, control_envelope.raw_payload);
+            let (signed, _) = trust
+                .verify_and_decode::<ActionIntentPayload>(
+                    DOMAIN_ACTION_APPROVAL_V1,
+                    &operator_approval,
+                )
+                .unwrap();
+            assert_eq!(signed, payload);
+            write_frame(
+                &mut socket,
+                &AdminResponse::ActionApproved {
+                    intent_id,
+                    authorized_intent: defsec_protocol::action::AuthorizedActionIntent {
+                        control_envelope,
+                        operator_approval: Some(operator_approval),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let result = run(Args {
+            admin_sock,
+            command: Command::ApproveAction {
+                intent_id: "intent".into(),
+                approver: "Alice".into(),
+                operator_key_file: path,
+                operator_key_id: "operator".into(),
+            },
+        })
+        .await;
+        let server_result = server.await;
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!result.unwrap());
+        server_result.unwrap();
+    }
 
     #[test]
     fn parses_scoped_token_and_global_socket() {

@@ -206,12 +206,46 @@ def build_system_prompt(
     budgets: Any,
     tool_names: Iterable[str],
     prompt_schema_version: str,
+    *,
+    enable_action_proposals: bool = False,
 ) -> str:
     """The trusted system prompt: provenance rules, epistemic labels, budgets.
 
     Only trusted code produces this text; monitored data never appears here.
     """
     tools = ", ".join(sorted(tool_names))
+    max_actions = int(getattr(budgets, "max_action_proposals_per_run", 1))
+    if enable_action_proposals:
+        action_section = f"""
+TYPED MITIGATION ACTIONS (closed catalog; no shell, ever)
+- You may submit at most {max_actions} typed mitigation action proposal(s)
+  this run. The ONLY permitted verbs are: nft_block_ip (time-limited nftables IP
+  block), systemd_stop_unit (stop an explicitly unprotected unit), and
+  host_isolate (network isolation that preserves management CIDRs).
+- Arbitrary shell commands, scripts, package changes, file edits, and free-form
+  remediation do not exist in this grammar and are always refused. You cannot
+  approve, sign, execute, or roll back an action yourself.
+- Every action MUST cite at least one verified observation_id seen inside a
+  telemetry envelope, and MUST include a concrete rollback_plan. Report
+  expected_effect and blast_radius honestly and narrowly.
+- Low-blast-radius reversible verbs (nft_block_ip, systemd_stop_unit) may be
+  auto-authorized ONLY under a human-owned auto-mitigation policy. High-blast-
+  radius verbs (host_isolate) require an independent operator dual-signature
+  and remain pending_approval until an operator signs. The central policy gate
+  is deterministic and final: a rejection is final, never retry it.
+"""
+        remediation_line = (
+            "Typed mitigation actions are limited to the closed catalog below; "
+            "baseline promotion does not exist on your tool surface."
+        )
+        budget_actions = f" {max_actions} mitigation action proposal(s),"
+    else:
+        action_section = ""
+        remediation_line = (
+            "You can never create, modify, or disable baseline watches. Baseline\n"
+            "  promotion and remediation do not exist on your tool surface."
+        )
+        budget_actions = ""
     return f"""You are the automated episodic investigation worker (reasoner-d) of the
 DefSecAutMit defensive monitoring harness. Backend: {backend_id}. Model: {model_id}.
 Prompt schema version: {prompt_schema_version}.
@@ -241,11 +275,10 @@ SCOPED PROPOSALS
   scoped to the incident you are investigating, using collectors from the
   capability catalog you were given. A central deterministic policy validates
   every proposal; a rejection is final — do not retry rejected proposals.
-- You can never create, modify, or disable baseline watches. Baseline
-  promotion and remediation do not exist on your tool surface.
-
+- {remediation_line}
+{action_section}
 BUDGETS (hard limits enforced outside the model)
-- At most {budgets.max_turns} tool turns, {budgets.max_proposals_per_run} watch proposals,
+- At most {budgets.max_turns} tool turns, {budgets.max_proposals_per_run} watch proposals,{budget_actions}
   {budgets.max_total_tokens} total tokens, and ${budgets.max_cost_usd:.2f} of spend for this run.
   When you are done, stop calling tools and produce a final summary.
 """

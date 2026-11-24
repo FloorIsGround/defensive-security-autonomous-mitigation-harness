@@ -15,8 +15,10 @@ use crate::canonical::{CanonicalError, sha256_hex, to_canonical_json_bytes};
 
 pub const DOMAIN_WATCH_BUNDLE_V1: &str = "defsecautmit.watch_bundle.v1";
 pub const DOMAIN_AUDIT_ENTRY_V1: &str = "defsecautmit.audit_entry.v1";
-/// Reserved for Phase 8 gated remediation; never verified or dispatched in MVP.
+/// Phase 8 control-plane action intent signature domain.
 pub const DOMAIN_ACTION_INTENT_V1: &str = "defsecautmit.action_intent.v1";
+/// Phase 8 independent operator approval signature domain (dual authorization).
+pub const DOMAIN_ACTION_APPROVAL_V1: &str = "defsecautmit.action_approval.v1";
 
 #[derive(Debug, Error)]
 pub enum SigningError {

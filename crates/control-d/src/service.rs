@@ -8,6 +8,7 @@ use std::{
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use defsec_policy::{
+    action_gate::ActionSafetyConfig,
     control_gate::{ControlPolicyConfig, ProposalContext, evaluate_watch_proposal},
     edge_floor::is_valid_identifier,
 };
@@ -28,6 +29,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::ledger::{self, audit, json_column, rows};
+
+#[path = "actions.rs"]
+pub(crate) mod actions;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -87,6 +91,8 @@ struct State {
     db: Mutex<Connection>,
     key: SigningKeyPair,
     policy: ControlPolicyConfig,
+    action_safety: ActionSafetyConfig,
+    operator_keys: Mutex<VerifyingKeyStore>,
     bundle_updates: watch::Sender<()>,
 }
 
@@ -107,7 +113,20 @@ impl ControlService {
     pub fn open_with_policy(
         data_dir: impl AsRef<Path>,
         key_id: impl Into<String>,
+        policy: ControlPolicyConfig,
+    ) -> Result<Self> {
+        let action_safety = ActionSafetyConfig {
+            expected_policy_version: policy.policy_version,
+            ..Default::default()
+        };
+        Self::open_with_policies(data_dir, key_id, policy, action_safety)
+    }
+
+    pub fn open_with_policies(
+        data_dir: impl AsRef<Path>,
+        key_id: impl Into<String>,
         mut policy: ControlPolicyConfig,
+        action_safety: ActionSafetyConfig,
     ) -> Result<Self> {
         let dir = data_dir.as_ref();
         policy.edge_floor.expected_policy_version = policy.policy_version;
@@ -139,6 +158,8 @@ impl ControlService {
             db: Mutex::new(db),
             key,
             policy,
+            action_safety,
+            operator_keys: Mutex::new(VerifyingKeyStore::new()),
             bundle_updates: watch::channel(()).0,
         })))
     }
@@ -497,6 +518,29 @@ impl ControlService {
             AdminRequest::ListIncidents => Ok(AdminResponse::Incidents {
                 incidents: list_incidents(db)?,
             }),
+            AdminRequest::ListActions {
+                host_id,
+                incident_id,
+            } => {
+                let response = AdminResponse::Actions {
+                    actions: actions::list_actions(db, host_id.as_deref(), incident_id.as_deref())?,
+                };
+                if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
+                    return Err(ControlError::invalid(
+                        "action list exceeds the frame limit; filter by host or incident",
+                    ));
+                }
+                Ok(response)
+            }
+            AdminRequest::GetActionIntent { intent_id } => {
+                actions::get_action_intent(db, &intent_id)
+            }
+            AdminRequest::ApproveAction {
+                intent_id,
+                approver,
+                operator_approval,
+            } => self.approve_action(db, &intent_id, &approver, operator_approval),
+            AdminRequest::RecordActionReceipt { receipt } => actions::record_receipt(db, receipt),
             AdminRequest::VerifyAuditChain => ledger::verify(db),
             AdminRequest::ListAuditEntries { limit } => {
                 let cap = limit.unwrap_or(100).clamp(1, 500) as i64;

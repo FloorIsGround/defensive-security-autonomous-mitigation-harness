@@ -23,6 +23,10 @@ pub enum AuditEventType {
     RunCompleted,
     FindingRecorded,
     CapabilityMinted,
+    ActionProposed,
+    ActionApproved,
+    ActionReceiptRecorded,
+    ActionRolledBack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

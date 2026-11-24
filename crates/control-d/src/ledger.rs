@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::service::{ControlError, Result};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("schema_v2.sql")];
 
 /// Opens the local writer and applies pending migrations atomically.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection> {

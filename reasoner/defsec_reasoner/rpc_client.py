@@ -27,7 +27,15 @@ from typing import Any, Callable
 from defsec_reasoner.canonical import sha256_hex
 from defsec_reasoner.wire import MAX_FRAME_BYTES, FrameError, FrameTooLargeError, read_frame, send_frame
 
-__all__ = ["ControlRpcClient", "RpcError", "RpcTransportError", "PROBE_OP"]
+__all__ = [
+    "ControlRpcClient",
+    "RpcError",
+    "RpcTransportError",
+    "PROBE_OP",
+    "ACTION_VERB_KINDS",
+    "TRAFFIC_DIRECTIONS",
+    "normalize_action_verb",
+]
 
 logger = logging.getLogger("defsec.reasoner.rpc")
 
@@ -47,11 +55,86 @@ _KNOWN_RESULTS = frozenset(
         "finding_recorded",
         "trigger_leased",
         "lease_updated",
+        "action_proposal_evaluated",
+        "actions",
     }
 )
 
 #: The investigation interface exposes exactly this closed operation set.
 PROBE_OP = "list_hosts"
+
+#: Phase 8's closed action-verb catalog (`ActionVerbKind` in
+#: ``crates/protocol/src/action.rs``). No shell/script verb can exist.
+ACTION_VERB_KINDS: tuple[str, ...] = ("nft_block_ip", "systemd_stop_unit", "host_isolate")
+TRAFFIC_DIRECTIONS: tuple[str, ...] = ("inbound", "outbound", "both")
+
+#: Exact field sets per verb (Rust uses ``#[serde(deny_unknown_fields)]``).
+_ACTION_VERB_FIELDS: dict[str, frozenset[str]] = {
+    "nft_block_ip": frozenset({"verb", "ip", "direction", "ttl_seconds"}),
+    "systemd_stop_unit": frozenset({"verb", "unit", "ttl_seconds"}),
+    "host_isolate": frozenset({"verb", "preserve_mgmt_cidrs", "ttl_seconds"}),
+}
+
+
+def _require_nonempty_str(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _require_ttl(value: Any, *, optional: bool) -> int | None:
+    if value is None:
+        if optional:
+            return None
+        raise ValueError("ttl_seconds is required for this verb")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("ttl_seconds must be a positive integer")
+    return value
+
+
+def normalize_action_verb(verb: dict[str, Any]) -> dict[str, Any]:
+    """Validate and canonicalize one ``ActionVerb`` wire object.
+
+    Mirrors ``crates/protocol/src/action.rs``: an internally tagged, closed
+    enum (``verb``) with ``deny_unknown_fields``. Returns the exact JSON shape
+    Rust's ``serde_json`` serializes, or raises :class:`ValueError`.
+    """
+    if not isinstance(verb, dict):
+        raise ValueError("verb must be an object")
+    kind = verb.get("verb")
+    if kind not in _ACTION_VERB_FIELDS:
+        raise ValueError(f"verb must be one of {', '.join(ACTION_VERB_KINDS)}")
+    unknown = set(verb) - _ACTION_VERB_FIELDS[str(kind)]
+    if unknown:
+        raise ValueError(
+            f"unknown fields for {kind}: {', '.join(sorted(str(field) for field in unknown))}"
+        )
+    if kind == "nft_block_ip":
+        direction = verb.get("direction")
+        if direction not in TRAFFIC_DIRECTIONS:
+            raise ValueError(f"direction must be one of {', '.join(TRAFFIC_DIRECTIONS)}")
+        return {
+            "verb": kind,
+            "ip": _require_nonempty_str(verb.get("ip"), "ip"),
+            "direction": direction,
+            "ttl_seconds": _require_ttl(verb.get("ttl_seconds"), optional=False),
+        }
+    if kind == "systemd_stop_unit":
+        return {
+            "verb": kind,
+            "unit": _require_nonempty_str(verb.get("unit"), "unit"),
+            "ttl_seconds": _require_ttl(verb.get("ttl_seconds"), optional=True),
+        }
+    cidrs = verb.get("preserve_mgmt_cidrs")
+    if not isinstance(cidrs, list) or not cidrs:
+        raise ValueError("preserve_mgmt_cidrs must be a non-empty array of CIDR strings")
+    return {
+        "verb": kind,
+        "preserve_mgmt_cidrs": [
+            _require_nonempty_str(cidr, "preserve_mgmt_cidrs[]") for cidr in cidrs
+        ],
+        "ttl_seconds": _require_ttl(verb.get("ttl_seconds"), optional=False),
+    }
 
 
 class RpcError(Exception):
@@ -261,6 +344,58 @@ class ControlRpcClient:
                 "escalation_requested": bool(escalation_requested),
             }
         )
+
+    # ------------------------------------------------- phase 8 typed actions
+
+    def propose_action(
+        self,
+        run_id: str,
+        incident_id: str,
+        idempotency_key: str,
+        verb: dict[str, Any],
+        evidence_observation_ids: list[int],
+        expected_effect: str,
+        blast_radius: str,
+        rollback_plan: str,
+    ) -> dict[str, Any]:
+        """Submit one typed mitigation proposal (``propose_action``).
+
+        ``verb`` is a closed-catalog ``ActionVerb`` object (see
+        :func:`normalize_action_verb`); arbitrary shell/script intents are
+        rejected locally and structurally. At least one verified
+        ``observation_id`` must be cited, and a concrete rollback plan is
+        mandatory. Returns the ``action_proposal_evaluated`` payload (decision,
+        proposal/intent IDs, auth mode, status, optional authorized intent).
+        """
+        normalized_verb = normalize_action_verb(verb)
+        if not isinstance(evidence_observation_ids, list) or not evidence_observation_ids:
+            raise ValueError("evidence_observation_ids must cite at least one verified observation")
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in evidence_observation_ids):
+            raise ValueError("evidence_observation_ids must be integers")
+        return self.call(
+            {
+                "op": "propose_action",
+                "run_id": str(run_id),
+                "incident_id": str(incident_id),
+                "idempotency_key": str(idempotency_key),
+                "verb": normalized_verb,
+                "evidence_observation_ids": [int(i) for i in evidence_observation_ids],
+                "expected_effect": _require_nonempty_str(expected_effect, "expected_effect"),
+                "blast_radius": _require_nonempty_str(blast_radius, "blast_radius"),
+                "rollback_plan": _require_nonempty_str(rollback_plan, "rollback_plan"),
+            }
+        )
+
+    def list_actions(
+        self, host_id: str | None = None, incident_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Bounded read-only action summary query (``list_actions``)."""
+        request: dict[str, Any] = {"op": "list_actions"}
+        if host_id is not None:
+            request["host_id"] = host_id
+        if incident_id is not None:
+            request["incident_id"] = incident_id
+        return self.call(request)["actions"]
 
     # --------------------------------------------------------- trigger leases
 

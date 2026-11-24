@@ -18,7 +18,7 @@ reasoner/
 │   ├── __init__.py                 # package + PROMPT_SCHEMA_VERSION
 │   ├── wire.py                     # u32-BE length-prefixed JSON framing (2 MiB cap)
 │   ├── canonical.py                # RFC 8785 canonical JSON + SHA-256 (matches Rust ledger hashes)
-│   ├── rpc_client.py               # ControlRpcClient: 13 typed Investigation ops, token-safe
+│   ├── rpc_client.py               # ControlRpcClient: 15 typed Investigation ops, token-safe
 │   ├── admin_client.py             # operator-side Admin RPC (enroll/baseline/mint/audit-verify)
 │   ├── provenance.py               # §7.5: <untrusted_telemetry> envelopes + system prompt
 │   ├── models.py                   # ModelAdapter ABC + OpenAI / Anthropic / ScriptedMock adapters
@@ -32,8 +32,12 @@ reasoner/
 ## Safety model (what the worker can never do)
 
 * The worker's only action surface is the **typed Investigation RPC** on
-  `investigate.sock`. No shell, no filesystem, no direct database access, no
-  remediation verbs exist anywhere in the package.
+  `investigate.sock`. No shell, no filesystem, no direct database access, and
+  no arbitrary remediation verbs exist anywhere in the package. Phase 8 typed
+  mitigation proposals (`propose_action` / `list_actions`) are **opt-in and
+  disabled by default**; when enabled, the grammar is the closed catalog
+  `nft_block_ip` / `systemd_stop_unit` / `host_isolate` only, with per-run caps,
+  mandatory verified `observation_id` evidence, and a mandatory rollback plan.
 * All monitored host data (observations, journal lines, socket fields,
   baselines, trigger outcomes) is wrapped in explicit
   `<untrusted_telemetry source="…" host_id="…" observation_id="…" state_hash="…">`
@@ -46,9 +50,11 @@ reasoner/
   (`/etc/shadow`, host keys) are denied, sub-floor polling intervals are
   rejected, and every decision is durably audited.
 * Runs are bounded by `RunBudgets` (default: 6 turns, 45 s wall, 16 000
-  tokens, $0.25, 3 proposals, 32 KiB context, 120 s lease). Provider failure
-  requeues with bounded backoff (5 attempts → dead-letter); expired leases
-  are fenced so stale workers can never commit results.
+  tokens, $0.25, 3 proposals, 32 KiB context, 120 s lease). Typed mitigation
+  actions are off by default; when enabled they are separately capped at
+  `max_action_proposals_per_run=1` with local rejection of any excess.
+  Provider failure requeues with bounded backoff (5 attempts → dead-letter);
+  expired leases are fenced so stale workers can never commit results.
 
 ## Quick start
 
@@ -105,6 +111,9 @@ Markdown summary table and exits non-zero if any assertion fails.
   (tool calls, usage, retryable/non-retryable provider errors).
 * `test_worker.py` — bounded loop against an in-process fake control server:
   turn/proposal/token/cost/wall caps, outage requeue → dead-letter, fencing.
+* `test_actions.py` — Phase 8 action contract: exact `ActionVerb` wire shapes,
+  disabled-by-default local rejection, per-run action caps, policy-bounded vs.
+  dual-signed responses, and adversarial invalid-verb/shell-smuggling attempts.
 * `test_live_integration.py` — **LIVE** against compiled `control-d`:
   lease → run → propose ephemeral watch → evidence-bound finding → complete →
   audit-chain verification; expired-lease fencing + requeue; observer-role

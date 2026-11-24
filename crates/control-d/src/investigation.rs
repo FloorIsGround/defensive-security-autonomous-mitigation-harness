@@ -17,9 +17,10 @@ use serde_json::{Value, json};
 use crate::{
     ledger::{audit, json_column, rows},
     service::{
-        ControlError, ControlService, Result, active_watches, get_incident, insert_watch,
-        latest_spec, list_hosts, list_incidents, parse_stamp, record_decision, require_host, stamp,
-        uuid,
+        ControlError, ControlService, Result,
+        actions::{ActionProposal, list_actions},
+        active_watches, get_incident, insert_watch, latest_spec, list_hosts, list_incidents,
+        parse_stamp, record_decision, require_host, stamp, uuid,
     },
 };
 
@@ -309,15 +310,13 @@ impl ControlService {
                         "invalid finding evidence or uncertainty bounds",
                     ));
                 }
-                let mut evidence = BTreeMap::new();
-                for id in evidence_observation_ids {
-                    let state_hash: String = db.query_row("SELECT o.state_hash FROM observations o JOIN watch_specs w USING (host_id,watch_id,spec_version)
-                        WHERE o.observation_id=?1 AND o.host_id=?2 AND o.collector_type IN (SELECT value FROM json_each(?3))
-                        AND (w.incident_id IS NULL OR w.incident_id=?4)",
-                        params![id,incident.host_id,collector_scope_json(&capability)?,incident_id], |r|r.get(0)).optional()?
-                        .ok_or_else(|| ControlError::invalid("observation evidence is missing or outside incident scope"))?;
-                    evidence.insert(id, state_hash);
-                }
+                let evidence =
+                    scoped_evidence(db, &capability, &incident, &evidence_observation_ids)?
+                        .ok_or_else(|| {
+                            ControlError::invalid(
+                                "observation evidence is missing or outside incident scope",
+                            )
+                        })?;
                 let finding = json!({"kind":kind,"severity":severity,"summary":summary,"uncertainty":uncertainty,"escalation_requested":escalation_requested,"evidence_observation_ids":evidence.keys().collect::<Vec<_>>()});
                 db.execute("INSERT INTO findings (run_id,incident_id,finding_json,created_at) VALUES (?1,?2,?3,?4)",
                     params![run_id,incident_id,finding.to_string(),stamp(now)])?;
@@ -338,6 +337,55 @@ impl ControlService {
                 InvestigationResponse::FindingRecorded {
                     finding_id,
                     verified_evidence_count: evidence.len(),
+                }
+            }
+            InvestigationRequest::ProposeAction {
+                run_id,
+                incident_id,
+                idempotency_key,
+                verb,
+                evidence_observation_ids,
+                expected_effect,
+                blast_radius,
+                rollback_plan,
+            } => {
+                require_investigator(&capability)?;
+                let incident = authorize_run(db, &capability, &run_id)?;
+                if incident.incident_id != incident_id {
+                    return Err(ControlError::denied("action incident does not match run"));
+                }
+                self.propose_action(
+                    db,
+                    ActionProposal {
+                        capability: &capability,
+                        request_id,
+                        incident: &incident,
+                        run_id: &run_id,
+                        idempotency_key: &idempotency_key,
+                        verb,
+                        evidence_observation_ids,
+                        expected_effect: &expected_effect,
+                        blast_radius: &blast_radius,
+                        rollback_plan: &rollback_plan,
+                        now,
+                    },
+                )?
+            }
+            InvestigationRequest::ListActions {
+                host_id,
+                incident_id,
+            } => {
+                if let Some(host) = &host_id {
+                    authorize_host(&capability, host)?;
+                }
+                let scoped_id = capability.incident_id.as_deref().ok_or_else(|| {
+                    ControlError::denied("action listing requires an incident scope")
+                })?;
+                if incident_id.as_deref().is_some_and(|id| id != scoped_id) {
+                    return Err(ControlError::denied("incident is outside capability scope"));
+                }
+                InvestigationResponse::Actions {
+                    actions: list_actions(db, host_id.as_deref(), Some(scoped_id))?,
                 }
             }
             InvestigationRequest::LeaseNextTrigger {
@@ -688,7 +736,7 @@ struct Proposal<'a> {
     now: DateTime<Utc>,
 }
 
-fn require_text(value: &str, name: &str, max: usize) -> Result<()> {
+pub(crate) fn require_text(value: &str, name: &str, max: usize) -> Result<()> {
     if value.trim().is_empty() || value.len() > max {
         return Err(ControlError::invalid(format!(
             "{name} must contain 1 to {max} bytes"
@@ -763,6 +811,32 @@ fn authorize_run(
     let incident = authorize_incident(db, capability, id)?;
     require_open(&incident)?;
     Ok(incident)
+}
+
+pub(crate) fn scoped_evidence(
+    db: &Connection,
+    capability: &ScopedCapability,
+    incident: &IncidentSummary,
+    ids: &[i64],
+) -> Result<Option<BTreeMap<i64, String>>> {
+    let mut evidence = BTreeMap::new();
+    let collectors = collector_scope_json(capability)?;
+    let mut query = db.prepare(
+        "SELECT o.state_hash FROM observations o JOIN watch_specs w USING (host_id,watch_id,spec_version)
+         WHERE o.observation_id=?1 AND o.host_id=?2 AND o.collector_type IN (SELECT value FROM json_each(?3))
+           AND (w.incident_id IS NULL OR w.incident_id=?4)",
+    )?;
+    for id in ids {
+        let hash = query
+            .query_row(
+                params![id, incident.host_id, collectors, incident.incident_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(hash) = hash else { return Ok(None) };
+        evidence.insert(*id, hash);
+    }
+    Ok(Some(evidence))
 }
 
 fn collector_scope_json(cap: &ScopedCapability) -> Result<String> {

@@ -5,6 +5,7 @@ use control_d::{
     ControlService,
     server::{SocketPolicy, UnixServer},
 };
+use defsec_policy::{action_gate::ActionSafetyConfig, control_gate::ControlPolicyConfig};
 
 #[derive(Parser)]
 #[command(about = "DefSecAutMit control daemon")]
@@ -21,6 +22,15 @@ struct Args {
     key_id: String,
     #[arg(long, default_value_t = 1)]
     policy_version: u32,
+    /// Enable reversible, time-bounded autonomous containment.
+    #[arg(long)]
+    enable_autonomous_containment: bool,
+    /// Trusted operator signing key ID.
+    #[arg(long, requires = "operator_pub_hex")]
+    operator_key_id: Option<String>,
+    /// Trusted operator Ed25519 public key in hex.
+    #[arg(long, requires = "operator_key_id")]
+    operator_pub_hex: Option<String>,
     /// Octal filesystem mode applied to the local sockets.
     #[arg(long, default_value = "0600", value_parser = parse_socket_mode)]
     socket_mode: u32,
@@ -58,7 +68,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let service = ControlService::open(&args.data_dir, args.key_id, args.policy_version)?;
+    let policy = ControlPolicyConfig {
+        policy_version: args.policy_version,
+        ..Default::default()
+    };
+    let mut action_safety = if args.enable_autonomous_containment {
+        ActionSafetyConfig::with_bounded_autonomous_containment()
+    } else {
+        ActionSafetyConfig::default()
+    };
+    action_safety.expected_policy_version = args.policy_version;
+    let service =
+        ControlService::open_with_policies(&args.data_dir, args.key_id, policy, action_safety)?;
+    if let (Some(id), Some(public_hex)) = (args.operator_key_id, args.operator_pub_hex) {
+        service.register_operator_key(id, &public_hex)?;
+    }
     let agent = UnixServer::bind(
         args.agent_sock
             .unwrap_or_else(|| args.data_dir.join("agent.sock")),
