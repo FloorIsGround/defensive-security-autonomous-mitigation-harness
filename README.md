@@ -1,62 +1,70 @@
 <img src="assets/icon.svg" width="64" height="64" alt="">
 
-# DefSecAutMit — Adaptive Defensive Monitoring Harness
+# DefSecAutMit
 
-A persistent, event-driven defensive monitoring harness for Linux hosts that separates **deterministic telemetry collection and policy enforcement** from **episodic, evidence-backed reasoning**.
+DefSecAutMit is a Linux defensive monitoring harness with a deterministic collection and policy core, episodic reasoning that proposes bounded follow-up watches, and opt-in, constrained containment with independent operator approval where required. Monitoring continues when the model is unavailable.
 
-See [adaptive_defensive_monitoring_harness_design_v0.2.md](docs/adaptive_defensive_monitoring_harness_design_v0.2.md) for the full system design.
+```mermaid
+flowchart LR
+  subgraph Edge[Edge trust domain]
+    A[agent-d]
+  end
+  subgraph Control[Control trust domain]
+    C[control-d + SQLite]
+  end
+  subgraph Clients[Reasoning and operator domain]
+    R[reasoner-d]
+    M[mcp-adapter]
+    W[Operator Console]
+  end
+  subgraph Execution[Isolated execution domain]
+    E[action-exec-d]
+  end
+  A <-->|local UDS| C
+  R & M & W <-->|scoped local UDS| C
+  C -. signed intent .-> E
+```
 
-## Workspace Layout
+## Status
 
-| Crate | Purpose |
+| Area | Status |
 |---|---|
-| `crates/protocol` | Zero-I/O domain schemas, non-Turing-complete Watch DSL (`deny_unknown_fields`), RFC 8785 Canonical JSON + domain-separated Ed25519 signing, wire framing, Investigation/Admin RPC contracts, and hash-chained audit records |
-| `crates/policy` | Deterministic `edge_floor` (agent-local safety ceilings & sensitive path/unit denylists), `control_gate` (baseline protection, ephemeral quotas, wake circuit breaker), and predicate evaluation (`field_changed`, `set_diff`, `threshold_sustained`, `collector_stale_or_error`) |
-| `crates/agent-d` | Lightweight Linux edge daemon (`tokio` single-threaded runtime), 4 built-in collectors (`sockets.listening`, `systemd.unit_state` via `zbus`, `files.metadata` via `openat2`, `journal.unit_events`), `FakeHost` test simulator, edge-lite diffing, and `minimal` (RAM) / `durable` (disk) spools |
-| `crates/control-d` | Authoritative control server: SQLite WAL ledger (`synchronous=FULL`), three-state baseline engine, Ed25519 bundle signer, hash-chained `audit_outbox`, and `SO_PEERCRED`-authenticated UDS servers (`agent.sock`, `admin.sock`, `investigate.sock`) |
-| `crates/admin-cli` | Operator CLI for host enrollment, baseline watch management, attributable baseline promotion, scoped capability token minting, incident closure, and audit chain verification |
-| `crates/mcp-adapter` | Thin Rust stdio MCP server (`--mode read-only` default or `--mode investigator`) bridging external agent clients (T3 Code, Codex, Claude) to `control-d`'s `investigate.sock` |
-| `crates/action-exec-d` | Isolated privileged mitigation executor (`--mode dry-run` default or `enforce`) verifying Ed25519 control + independent operator dual signatures, local protected-asset denylists, atomic nonce replay protection, and automatic TTL rollback (`nft_block_ip`, `systemd_stop_unit`, `host_isolate`) |
-| `reasoner/` | Zero-dependency Python 3.12 episodic reasoning worker (`reasoner-d`), replaceable model adapters (OpenAI-compatible/Ollama/vLLM, Anthropic, ScriptedMock), provenance envelopes, optional bounded mitigation proposals, and 4-scenario adaptive-vs-static benchmark suite |
-| `console/` | Zero-dependency Node 24 localhost BFF + responsive Operator Web Console (`--demo` or live `control-d` UDS mode) with three-state baseline inspector, guided watch proposal composer, and independent audit-chain verifier |
+| Phases 1–5: protocol, control, edge, investigation and reasoning | Implemented for local use |
+| Phase 8: bounded mitigation | Implemented, opt-in; executor defaults to dry-run |
+| Operator Web Console | Implemented, demo and local live modes |
+| Phase 6: fleet mTLS and PKI | Planned |
+| Phase 7: external telemetry adapters | Planned |
 
-## Build & Test
+Use it to track service, listening socket, file metadata and journal changes, preserve evidence, and investigate drift with controlled follow-up collection. It is not a replacement for an eBPF syscall EDR, a comprehensive SIEM, or a production multi-host WAN deployment. The current transport is local Unix sockets; fleet identity, rotation and mTLS remain future work.
 
-```bash
-# Rust workspace (all 6 crates: unit, collector, control-plane, MCP, and E2E adversarial tests)
+The Python reasoner and Node console have no third-party runtime dependencies. Resource use depends on workload and system configuration; benchmark a deployment before setting service limits.
+
+## Quick start
+
+Requires Rust, Python 3.12 and Node 24. From the repository root:
+
+```sh
+cargo build --workspace
 cargo test --workspace
-
-# Python reasoner-d & adaptive-vs-static benchmark suite
 PYTHONPATH=reasoner python3 -m unittest discover -s reasoner/tests -v
-
-# Node 24 Operator Web Console suite
 node --test console/test/server.test.mjs
-
-# Try the Operator Web Console immediately in demo mode
 node console/server.mjs --demo
+# In another terminal, run the synthetic four-scenario benchmark:
+PYTHONPATH=reasoner python3 -m defsec_reasoner benchmark --json-out bench.json --markdown-out bench.md
+```
 
-# Build release binaries
+For a local single-host setup, build release binaries and run control and agent in separate terminals:
+
+```sh
 cargo build --release --workspace
-```
-
-## Quick Single-Host Smoke Flow
-
-```bash
-# 1. Start control-d
 ./target/release/control-d --data-dir ./run-data
-
-# 2. Enroll a host (returns control signing key ID + public hex)
+# another terminal
 ./target/release/admin-cli --admin-sock ./run-data/admin.sock enroll edge-01
-
-# 3. Start agent-d pointing at control-d's agent.sock
-./target/release/agent-d \
-  --host-id edge-01 \
-  --state-dir ./run-agent \
-  --control-sock ./run-data/agent.sock \
-  --control-key-id control-key-01 \
+./target/release/agent-d --host-id edge-01 --state-dir ./run-agent \
+  --control-sock ./run-data/agent.sock --control-key-id control-key-01 \
   --control-pub-hex <CONTROL_PUBLIC_KEY_HEX>
-
-# 4. Apply a baseline watch & verify the hash-chained audit log
-./target/release/admin-cli --admin-sock ./run-data/admin.sock apply-watch watch.json --actor ops --rationale "initial baseline"
-./target/release/admin-cli --admin-sock ./run-data/admin.sock verify-audit
 ```
+
+Replace the placeholder with the public key returned by enrollment; omit the angle brackets. Socket permissions and peer UID policy must also permit the agent. See the [operator guide](docs/operations-and-deployment.md) for watches and lifecycle operations.
+
+Read the [architecture](docs/architecture.md), [security model](docs/security-model.md), and [design document](docs/adaptive_defensive_monitoring_harness_design_v0.2.md). See [security reporting](SECURITY.md) and [contributing](CONTRIBUTING.md).
