@@ -1,4 +1,4 @@
-// DefSecAutMit Operator Console: browser application.
+// Defensive Security Autonomous Mitigation Harness: operator console (browser).
 // All untrusted strings are rendered through dom.js (Text nodes only).
 
 import { el, append, clear, replace, icon, hydrateIcons } from './dom.js';
@@ -18,6 +18,10 @@ const state = {
   expanded: new Set(),
   baselines: { host: null, watch: '', limit: 50 },
   audit: { tab: 'decisions', ruleFilter: null, verdict: 'all', newestFirst: true },
+  auth: null, // { auth_mode, authenticated, user }
+  actions: { list: [], denied: null, source: null, admin_sock: null, error: null, loaded: false },
+  mit: { filter: 'all', host: '', incident: null },
+  approval: { approver: '', keyFile: '~/.config/defsec/operator.key', keyId: 'operator-01', note: '', envelope: '' },
   lastRefresh: null,
 };
 
@@ -47,11 +51,18 @@ async function api(path, { method = 'GET', body } = {}) {
   } catch {
     /* non-JSON */
   }
-  if (!res.ok) throw new HttpError(res.status, data?.error?.code ?? 'http_error', data?.error?.message ?? res.statusText);
+  if (!res.ok) {
+    const err = new HttpError(res.status, data?.error?.code ?? 'http_error', data?.error?.message ?? res.statusText);
+    if (res.status === 401 && !path.startsWith('/api/auth/')) sessionLost(err);
+    throw err;
+  }
   return data;
 }
 
-const adminEnabled = () => Boolean(state.status?.admin_enabled);
+const roleAdmin = () => !state.auth || state.auth.auth_mode === 'none' || state.auth.user?.role === 'admin';
+/** Admin interface on AND the signed-in user may use it. */
+const adminEnabled = () => Boolean(state.status?.admin_enabled) && roleAdmin();
+const canMutate = () => roleAdmin();
 const isDemo = () => state.status?.mode === 'demo';
 
 // ---------------------------------------------------------------------------
@@ -241,7 +252,7 @@ function renderShell() {
     ),
     sockLine('investigate.sock', inv),
     sockLine('admin.sock', adm, Boolean(s?.admin_enabled)),
-    el('div', { class: 'rail-row' }, el('span', null, 'Admin role'), el('span', { class: ['badge', s?.admin_enabled ? 'warn' : ''] }, s?.admin_enabled ? 'enabled' : 'off')),
+    el('div', { class: 'rail-row' }, el('span', null, 'Admin interface'), el('span', { class: ['badge', s?.admin_enabled ? 'warn' : ''] }, s?.admin_enabled ? 'enabled' : 'off')),
   );
 
   const pill = document.getElementById('chain-pill');
@@ -256,6 +267,9 @@ function renderShell() {
 
   const open = state.incidents.filter((i) => i.status === 'open').length;
   document.getElementById('nav-incidents').textContent = open ? String(open) : '';
+  const pending = awaitingApproval().length;
+  document.getElementById('nav-mitigations').textContent = pending ? String(pending) : '';
+  renderUserSlot();
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +279,7 @@ function renderShell() {
 const VIEWS = {
   fleet: { title: 'Fleet & Posture', sub: 'Edge agent liveness, bundle state and audit integrity', render: renderFleet },
   investigations: { title: 'Investigations', sub: 'Observed facts, model hypotheses and verified findings', render: renderInvestigations },
+  mitigations: { title: 'Mitigations', sub: 'Typed, TTL-bounded containment: autonomous within policy, dual-signed beyond it', render: renderMitigations },
   baselines: { title: 'Baselines & Telemetry', sub: 'Accepted baseline vs. last observed vs. current observed', render: renderBaselines },
   audit: { title: 'Policy Gate & Audit', sub: 'Deterministic policy decisions and the tamper-evident audit chain', render: renderAudit },
 };
@@ -304,9 +319,18 @@ async function refreshAll() {
 }
 
 async function loadCore() {
-  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents')]);
+  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions()]);
   if (h.status === 'fulfilled') state.hosts = h.value.hosts;
   if (i.status === 'fulfilled') state.incidents = i.value.incidents;
+}
+
+async function loadActions() {
+  try {
+    const r = await api('/api/actions');
+    state.actions = { list: r.actions, denied: r.denied, source: r.source, admin_sock: r.admin_sock ?? null, error: null, loaded: true };
+  } catch (err) {
+    state.actions = { ...state.actions, list: [], denied: null, error: err, loaded: true };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,11 +388,7 @@ async function renderFleet() {
     kpi('Agents online', [String(online), el('small', null, ` / ${hosts.length}`)], hosts.length ? `${Math.round((online / hosts.length) * 100)}% of enrolled fleet` : 'no hosts enrolled'),
     kpi('Degraded or offline', String(degraded.length), degraded.length ? degraded.map((h) => el('span', { class: 'mono' }, h.host_id)) : 'all agents heart-beating'),
     kpi('Open incidents', String(open.length), sevCounts.length ? sevCounts.map(([s, n]) => el('span', null, `${n} ${s}`)) : 'quiet'),
-    kpi(
-      'Audit entries',
-      state.status?.audit ? String(state.status.audit.entries_checked) : '—',
-      state.status?.audit ? (state.status.audit.valid ? 'hash chain verified' : 'VERIFICATION FAILED') : 'admin interface off',
-    ),
+    mitigationKpi(),
   );
 
   const enroll = adminEnabled() ? el('button', { class: 'btn btn-sm', type: 'button', on: { click: openEnrollDrawer } }, icon('plus'), 'Enroll host') : null;
@@ -381,6 +401,7 @@ async function renderFleet() {
     'div',
     null,
     integrityBanner(state.status?.audit),
+    approvalBanner(),
     kpis,
     el('div', { class: 'section-title' }, el('h2', null, 'Edge fleet'), el('div', { class: 'row' }, el('span', { class: 'muted' }, `${hosts.length} enrolled`), enroll)),
     grid,
@@ -551,8 +572,22 @@ function workspaceView(ctx, caps) {
   const selected = evidenceFor(inc.incident_id);
   const findingComposer = findingComposerView(inc, ctx.run, obsMap);
 
+  const incActions = state.actions.list.filter((a) => a.incident_id === inc.incident_id);
+  const incPending = incActions.filter(isAwaiting).length;
+  const mitChip = incActions.length
+    ? el(
+        'a',
+        { class: 'chip', href: '#/mitigations', title: 'Mitigation intents for this incident', on: { click: () => { state.mit = { filter: 'all', host: '', incident: inc.incident_id }; } } },
+        icon('bolt'),
+        `${incActions.length} mitigation${incActions.length === 1 ? '' : 's'}`,
+        incPending ? el('span', { class: 'badge warn' }, `${incPending} awaiting`) : null,
+      )
+    : null;
+
   const runControls = !isOpen
     ? el('span', { class: 'badge' }, 'closed · runs ended')
+    : !canMutate()
+      ? el('span', { class: 'badge', title: 'Observer accounts are read-only' }, icon('eye'), 'read-only')
     : ctx.run
       ? el('span', { class: 'run-chip', title: `Run ${ctx.run.run_id}` }, el('span', { class: 'dot eph' }), 'Run ', el('span', { class: 'mono' }, ctx.run.run_id.slice(0, 8)), ' · ', relTime(ctx.run.expires_at, { until: true }))
       : el('button', { class: 'btn btn-primary btn-sm', type: 'button', on: { click: () => startRun(inc.incident_id) } }, icon('flask'), 'Start investigation run');
@@ -569,6 +604,7 @@ function workspaceView(ctx, caps) {
       el('span', { class: 'muted' }, 'on'),
       el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(inc.host_id)}` }, inc.host_id),
       el('span', { class: 'spacer' }),
+      mitChip,
       runControls,
       isOpen && adminEnabled() ? el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => openCloseDrawer(inc) } }, 'Close incident') : null,
     ),
@@ -616,8 +652,11 @@ function workspaceView(ctx, caps) {
     el(
       'div',
       { class: 'ws-compose' },
-      isOpen ? proposalComposer(inc, ctx.run, caps) : card('Ephemeral watch proposals', null, el('div', { class: 'card-body muted' }, 'Incident closed. Its ephemeral watches were retired; no new proposals are accepted.')),
-      isOpen ? findingComposer.node : null,
+      !isOpen
+        ? card('Ephemeral watch proposals', null, el('div', { class: 'card-body muted' }, 'Incident closed. Its ephemeral watches were retired; no new proposals are accepted.'))
+        : !canMutate()
+          ? card('Read-only access', null, el('div', { class: 'card-body muted' }, 'Observer accounts can review evidence, findings and mitigations, but cannot start runs, propose watches or record findings.'))
+          : [proposalComposer(inc, ctx.run, caps), findingComposer.node],
     ),
   );
 
@@ -1495,6 +1534,19 @@ function triRow(host, r) {
 // ---------------------------------------------------------------------------
 
 async function renderAudit(_arg, stale) {
+  if (state.status?.admin_enabled && !roleAdmin()) {
+    return el(
+      'div',
+      { class: 'card' },
+      el(
+        'div',
+        { class: 'locked-panel' },
+        icon('lock'),
+        el('h2', null, 'Admin role required'),
+        el('p', { class: 'muted' }, `Signed in as ${state.auth?.user?.username ?? 'unknown'} (observer). Policy decisions and the audit log are restricted to admin accounts.`),
+      ),
+    );
+  }
   if (!adminEnabled()) {
     return el(
       'div',
@@ -1819,6 +1871,647 @@ function openEnrollDrawer() {
 }
 
 // ---------------------------------------------------------------------------
+// Access gate: sign-in, proxy identity, session loss, user badge
+// ---------------------------------------------------------------------------
+
+const PRODUCT = 'Defensive Security Autonomous Mitigation Harness';
+
+function brandMark() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 32 32');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('class', 'brand-mark');
+  for (const d of ['M16 2.5 4.5 7v8.2c0 7.1 4.9 12.6 11.5 14.3 6.6-1.7 11.5-7.2 11.5-14.3V7L16 2.5Z', 'M10.5 16.2 14.4 20l7.1-8']) {
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', d);
+    p.setAttribute('fill', 'none');
+    p.setAttribute('stroke', 'currentColor');
+    p.setAttribute('stroke-width', '1.8');
+    p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+    svg.append(p);
+  }
+  return svg;
+}
+
+/** Replace the dashboard with a focused gate. No telemetry is fetched or kept while it shows. */
+function showGate({ kind, message = null }) {
+  const shell = document.getElementById('shell');
+  shell.hidden = true;
+  clear(document.getElementById('main'));
+  if (drawer().open) drawer().close();
+  clear(drawer());
+  state.hosts = [];
+  state.incidents = [];
+  state.actions = { list: [], denied: null, source: null, admin_sock: null, error: null, loaded: false };
+  state.status = null;
+  const gate = document.getElementById('gate');
+  const head = el('div', { class: 'gate-head' }, brandMark(), el('div', null, el('h1', null, PRODUCT), el('p', { class: 'muted' }, 'Operator Console')));
+  let body;
+  if (kind === 'login') {
+    const form = { username: '', password: '' };
+    const err = el('div', { class: 'gate-err', attrs: { role: 'alert', 'aria-live': 'assertive' } }, message ?? '');
+    const user = el('input', { type: 'text', id: 'gate-user', attrs: { autocomplete: 'username', autocapitalize: 'none', spellcheck: 'false', required: true } });
+    const pass = el('input', { type: 'password', id: 'gate-pass', attrs: { autocomplete: 'current-password', required: true } });
+    const submit = el('button', { class: 'btn btn-primary gate-submit', type: 'submit' }, 'Sign in');
+    user.addEventListener('input', () => (form.username = user.value));
+    pass.addEventListener('input', () => (form.password = pass.value));
+    const node = el(
+      'form',
+      { class: 'form', attrs: { novalidate: true } },
+      el('div', { class: 'field' }, el('label', { htmlFor: 'gate-user' }, 'Username'), user),
+      el('div', { class: 'field' }, el('label', { htmlFor: 'gate-pass' }, 'Password'), pass),
+      err,
+      submit,
+    );
+    node.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!form.username || !form.password) {
+        err.textContent = 'Enter your username and password.';
+        return;
+      }
+      submit.disabled = true;
+      err.textContent = '';
+      try {
+        state.auth = await api('/api/auth/login', { method: 'POST', body: { username: form.username, password: form.password } });
+        pass.value = '';
+        startDashboard();
+      } catch (ex) {
+        pass.value = '';
+        form.password = '';
+        err.textContent = ex.status === 429 ? 'Too many failed attempts. Wait a few minutes and try again.' : ex.status === 401 ? 'Invalid username or password.' : `${ex.code}: ${ex.message}`;
+        submit.disabled = false;
+        pass.focus();
+      }
+    });
+    body = [node, el('p', { class: 'gate-foot' }, icon('lock'), 'Local account · HttpOnly, SameSite=Strict session')];
+    replace(gate, el('main', { class: 'gate-card', attrs: { 'aria-labelledby': 'gate-title' } }, head, el('h2', { id: 'gate-title', class: 'gate-title' }, 'Sign in'), body));
+    gate.hidden = false;
+    user.focus();
+    return;
+  }
+  const title = kind === 'blocked' ? 'Access refused' : 'Identity required';
+  const text =
+    kind === 'blocked'
+      ? message ?? 'This console only accepts requests through its trusted identity proxy.'
+      : 'This console takes your identity from the single sign-on proxy in front of it, and none was provided. Sign in through your SSO portal, then retry.';
+  body = [
+    el('p', { class: 'dim' }, text),
+    kind === 'blocked' ? null : el('button', { class: 'btn btn-primary gate-submit', type: 'button', on: { click: () => location.reload() } }, 'Retry'),
+  ];
+  replace(gate, el('main', { class: 'gate-card' }, head, el('h2', { class: 'gate-title' }, title), body));
+  gate.hidden = false;
+}
+
+let losing = false;
+function sessionLost(err) {
+  if (losing || !state.auth || state.auth.auth_mode === 'none') return;
+  losing = true;
+  setTimeout(() => {
+    losing = false;
+    state.auth = { ...state.auth, authenticated: false, user: null };
+    showGate({ kind: state.auth.auth_mode === 'local' ? 'login' : 'proxy', message: err.code === 'session_revoked' ? 'Your account changed. Sign in again.' : 'Your session ended. Sign in again.' });
+  }, 0);
+}
+
+async function signOut() {
+  try {
+    await api('/api/auth/logout', { method: 'POST', body: {} });
+  } catch {
+    /* the cookie is cleared server-side either way */
+  }
+  location.reload();
+}
+
+function renderUserSlot() {
+  const slot = document.getElementById('user-slot');
+  const a = state.auth;
+  if (!a || a.auth_mode === 'none' || !a.user) return replace(slot);
+  replace(
+    slot,
+    el(
+      'span',
+      { class: 'user-badge', title: a.auth_mode === 'proxy-header' ? 'Identity asserted by the trusted reverse proxy' : 'Local account' },
+      icon('user'),
+      el('span', { class: 'mono' }, a.user.username),
+      el('span', { class: 'sep' }, '·'),
+      el('span', { class: ['role', a.user.role === 'admin' ? 'is-admin' : ''] }, a.user.role),
+    ),
+    a.auth_mode === 'local' ? el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: signOut } }, icon('logout'), 'Sign out') : null,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Mitigations (Phase 8): typed, TTL-bounded action intents
+// ---------------------------------------------------------------------------
+
+const VERB_LABEL = { nft_block_ip: 'Block IP', systemd_stop_unit: 'Stop unit', host_isolate: 'Isolate host' };
+const ACTION_STATUS = {
+  pending_approval: ['warn', 'pending approval'],
+  authorized: ['eph', 'authorized'],
+  executed: ['ok', 'executed'],
+  dry_run_simulated: ['eph', 'dry run'],
+  rolled_back: ['', 'rolled back'],
+  rejected: ['bad', 'rejected'],
+  verification_failed: ['bad', 'verification failed'],
+  expired: ['', 'expired'],
+};
+const ACTIVE_STATUSES = new Set(['authorized', 'executed', 'dry_run_simulated']);
+
+function verbTarget(v) {
+  switch (v?.verb) {
+    case 'nft_block_ip':
+      return `${v.ip} · ${v.direction}`;
+    case 'systemd_stop_unit':
+      return v.unit;
+    case 'host_isolate':
+      return `keep ${v.preserve_mgmt_cidrs.join(', ')}`;
+    default:
+      return '—';
+  }
+}
+
+function ttlText(seconds) {
+  if (seconds == null) return 'no TTL';
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h${seconds % 3600 ? ` ${Math.round((seconds % 3600) / 60)}m` : ''}`;
+}
+
+/** issued_at + TTL (control-d issues 900 s intents for TTL-less verbs). */
+const actionDeadline = (a) => new Date(Date.parse(a.created_at) + (a.verb?.ttl_seconds ?? 900) * 1000).toISOString();
+const lapsed = (a) => Date.parse(actionDeadline(a)) <= Date.now();
+const isAwaiting = (a) => a.status === 'pending_approval' && !lapsed(a);
+const awaitingApproval = () => state.actions.list.filter(isAwaiting);
+
+function actionStatusBadge(status, a = null) {
+  if (a && status === 'pending_approval' && lapsed(a)) return el('span', { class: 'badge', title: 'Approval window elapsed' }, 'approval lapsed');
+  const [cls, label] = ACTION_STATUS[status] ?? ['', status];
+  return el('span', { class: ['badge', cls], title: status }, el('span', { class: ['dot', cls] }), label);
+}
+
+function authModeBadge(mode) {
+  return mode === 'dual_signed_operator'
+    ? el('span', { class: 'badge solid', title: 'Requires control-d signature AND an independent operator Ed25519 approval' }, icon('key'), 'Dual-signed')
+    : el('span', { class: 'badge eph', title: 'Pre-authorised by human-owned, bounded auto-mitigation policy' }, icon('clock'), 'Autonomous · bounded');
+}
+
+function scopeLinks(a) {
+  return el(
+    'div',
+    { class: 'act-scope' },
+    el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(a.host_id)}` }, a.host_id),
+    el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}` }, a.incident_id),
+  );
+}
+
+function windowCell(a) {
+  const ttl = el('span', { class: 'num dim' }, `TTL ${ttlText(a.verb?.ttl_seconds ?? null)}`);
+  if (a.status === 'pending_approval') {
+    return el('div', { class: 'act-window' }, ttl, lapsed(a) ? el('span', { class: 'muted' }, 'window closed') : el('span', { class: 'warn-text' }, relTime(actionDeadline(a), { until: true })));
+  }
+  if (ACTIVE_STATUSES.has(a.status) && a.verb?.ttl_seconds) {
+    return el('div', { class: 'act-window' }, ttl, el('span', null, 'lifts ', relTime(actionDeadline(a))));
+  }
+  return el('div', { class: 'act-window' }, ttl, el('span', { class: 'muted' }, relTime(a.created_at)));
+}
+
+function mitigationKpi() {
+  const a = state.actions;
+  if (a.error) return kpi('Mitigations', '—', el('span', null, a.error.code === 'forbidden' ? 'needs incident scope or admin' : 'unavailable'));
+  const active = a.list.filter((x) => ACTIVE_STATUSES.has(x.status)).length;
+  const pending = awaitingApproval().length;
+  return kpi(
+    'Active containment',
+    String(active),
+    [
+      pending ? el('a', { class: 'warn-text', href: '#/mitigations', on: { click: () => (state.mit = { filter: 'awaiting', host: '', incident: null }) } }, `${pending} awaiting approval`) : el('span', null, 'none awaiting approval'),
+      a.denied ? el('span', null, `${a.denied.length} denied by gate`) : null,
+    ],
+  );
+}
+
+function approvalBanner() {
+  const pending = awaitingApproval();
+  if (!pending.length) return null;
+  return el(
+    'div',
+    { class: 'banner warn' },
+    el('div', { class: 'banner-ico' }, icon('key')),
+    el(
+      'div',
+      null,
+      el('div', { class: 'banner-title' }, `${pending.length} mitigation${pending.length === 1 ? '' : 's'} awaiting dual-signed approval`),
+      el(
+        'div',
+        { class: 'banner-meta' },
+        pending.slice(0, 3).map((a) => el('span', null, el('b', null, VERB_LABEL[a.verb.verb] ?? a.verb.verb), ' ', el('span', { class: 'mono' }, verbTarget(a.verb)), ' on ', el('span', { class: 'mono' }, a.host_id))),
+      ),
+    ),
+    el('span', { class: 'spacer' }),
+    el('a', { class: 'btn btn-sm', href: '#/mitigations', on: { click: () => (state.mit = { filter: 'awaiting', host: '', incident: null }) } }, 'Review'),
+  );
+}
+
+async function renderMitigations(_arg, stale) {
+  if (!state.actions.loaded) await loadActions();
+  if (stale()) return null;
+  const A = state.actions;
+  const m = state.mit;
+  if (A.error) {
+    const scopeHint =
+      A.error.code === 'forbidden'
+        ? "control-d lists actions on the investigation socket only for an incident-scoped capability token. Start the console with --enable-admin --admin-sock for the fleet-wide view."
+        : null;
+    return el('div', { class: 'stack' }, errorBox(A.error), scopeHint ? el('p', { class: 'muted' }, scopeHint) : null);
+  }
+
+  const inScope = (x) => (!m.host || x.host_id === m.host) && (!m.incident || x.incident_id === m.incident);
+  const list = A.list.filter(inScope);
+  const denied = (A.denied ?? []).filter(inScope);
+  const buckets = {
+    awaiting: list.filter(isAwaiting),
+    active: list.filter((a) => ACTIVE_STATUSES.has(a.status)),
+    closed: list.filter((a) => !isAwaiting(a) && !ACTIVE_STATUSES.has(a.status)),
+    denied,
+  };
+  const tile = (id, label, n, cls, note) =>
+    el(
+      'button',
+      { class: ['mit-tile', cls], type: 'button', attrs: { 'aria-pressed': String(m.filter === id) }, on: { click: () => { m.filter = m.filter === id ? 'all' : id; render(); } } },
+      el('span', { class: 'label' }, el('span', { class: ['dot', cls] }), label),
+      el('span', { class: 'value' }, n),
+      el('span', { class: 'note' }, note),
+    );
+  const stats = el(
+    'div',
+    { class: 'mit-tiles' },
+    tile('awaiting', 'Awaiting approval', String(buckets.awaiting.length), 'warn', 'operator co-signature needed'),
+    tile('active', 'Active containment', String(buckets.active.length), 'ok', 'authorized or applied, TTL running'),
+    tile('closed', 'Closed', String(buckets.closed.length), '', 'rolled back, expired or failed'),
+    tile('denied', 'Denied by gate', A.denied ? String(buckets.denied.length) : '—', 'bad', A.denied ? 'never became an intent' : 'needs the admin interface'),
+  );
+
+  const hosts = [...new Set([...A.list, ...(A.denied ?? [])].map((x) => x.host_id))].sort();
+  const hostSel = el('select', { attrs: { 'aria-label': 'Filter by host' } }, el('option', { value: '' }, 'All hosts'), hosts.map((h) => el('option', { value: h, selected: m.host === h }, h)));
+  hostSel.addEventListener('change', () => {
+    m.host = hostSel.value;
+    render();
+  });
+  const toolbar = el(
+    'div',
+    { class: 'mit-toolbar' },
+    el('div', { class: 'row' }, m.filter !== 'all' ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, on: { click: () => { m.filter = 'all'; render(); } } }, `${m.filter} ×`) : null, m.incident ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, title: 'Clear incident filter', on: { click: () => { m.incident = null; render(); } } }, el('span', { class: 'mono' }, m.incident), ' ×') : null),
+    el('span', { class: 'spacer' }),
+    el('span', { class: 'muted src' }, A.source === 'admin' ? 'control-d admin · ListActions' : A.source === 'investigate' ? 'investigation socket · scoped ListActions' : 'demo fixtures'),
+    hostSel,
+  );
+
+  const showIntents = m.filter === 'denied' ? [] : m.filter === 'all' ? list : buckets[m.filter];
+  const order = (a) => (isAwaiting(a) ? 0 : ACTIVE_STATUSES.has(a.status) ? 1 : 2);
+  const rows = [...showIntents].sort((a, b) => order(a) - order(b) || b.proposal_id - a.proposal_id);
+  const intentsCard =
+    m.filter === 'denied'
+      ? null
+      : card(
+          'Action intents',
+          'Closed verb catalog · every intent signed by control-d · executed only by action-exec-d',
+          rows.length ? el('div', { class: 'act-list', attrs: { role: 'list' } }, el('div', { class: 'act-row head', attrs: { 'aria-hidden': 'true' } }, ['Status', 'Action', 'Authorization', 'Host · incident', 'Window', ''].map((t) => el('div', null, t))), rows.map(actionRow)) : el('div', { class: 'card-body' }, emptyState('No intents', m.filter === 'all' ? 'No mitigation has been proposed in this scope.' : 'Nothing in this state.')),
+          el('span', { class: 'badge' }, `${rows.length}`),
+        );
+
+  const deniedCard =
+    m.filter === 'all' || m.filter === 'denied'
+      ? card(
+          'Denied by the action gate',
+          'Protected units and CIDRs, TTL ceilings, rate limits and cooldowns are enforced before any signature exists',
+          A.denied === null
+            ? el('div', { class: 'card-body muted' }, 'Denied proposals are read from the audit log over the admin interface.')
+            : denied.length
+              ? el('div', { class: 'act-list' }, denied.map(deniedRow))
+              : el('div', { class: 'card-body' }, emptyState('No denials', 'Every proposal in this scope passed the gate.')),
+        )
+      : null;
+
+  return el('div', { class: 'mit' }, stats, toolbar, intentsCard, deniedCard);
+}
+
+function rowActivate(node, open) {
+  node.addEventListener('click', (e) => {
+    if (e.target.closest('a, button, select, input')) return;
+    open();
+  });
+}
+
+function actionRow(a) {
+  const open = () => openActionDrawer(a);
+  const node = el(
+    'div',
+    { class: ['act-row', isAwaiting(a) && 'is-awaiting'], attrs: { role: 'listitem' } },
+    el('div', null, actionStatusBadge(a.status, a)),
+    el(
+      'div',
+      { class: 'act-what' },
+      el('button', { class: 'act-open', type: 'button', on: { click: open } }, el('b', null, VERB_LABEL[a.verb?.verb] ?? a.verb?.verb), ' ', el('span', { class: 'mono' }, verbTarget(a.verb))),
+      el('div', { class: 'act-effect' }, a.expected_effect),
+    ),
+    el('div', { class: 'act-auth' }, authModeBadge(a.auth_mode), a.approver ? el('span', { class: 'muted' }, 'approved by ', el('span', { class: 'mono' }, a.approver)) : null),
+    scopeLinks(a),
+    windowCell(a),
+    el('span', { class: 'act-chev', attrs: { 'aria-hidden': 'true' } }, icon('chevron')),
+  );
+  rowActivate(node, open);
+  return node;
+}
+
+function deniedRow(d) {
+  const open = () => openDeniedDrawer(d);
+  const node = el(
+    'div',
+    { class: 'act-row is-denied', attrs: { role: 'listitem' } },
+    el('div', null, actionStatusBadge('rejected')),
+    el(
+      'div',
+      { class: 'act-what' },
+      el('button', { class: 'act-open', type: 'button', on: { click: open } }, el('b', null, VERB_LABEL[d.verb?.verb] ?? d.verb?.verb), ' ', el('span', { class: 'mono' }, verbTarget(d.verb))),
+      el('div', { class: 'act-effect' }, d.decision.reason),
+    ),
+    el('div', { class: 'act-auth' }, rulePill(d.decision)),
+    scopeLinks(d),
+    el('div', { class: 'act-window' }, el('span', { class: 'mono dim' }, d.actor), el('span', { class: 'muted' }, relTime(d.created_at))),
+    el('span', { class: 'act-chev', attrs: { 'aria-hidden': 'true' } }, icon('chevron')),
+  );
+  rowActivate(node, open);
+  return node;
+}
+
+// ----- action drawers -----
+
+function section(title, ...children) {
+  return el('section', { class: 'dsec' }, el('h3', { class: 'eyebrow' }, title), children);
+}
+
+function verbParams(v) {
+  const rows = Object.entries(v ?? {}).filter(([k]) => k !== 'verb');
+  return el(
+    'dl',
+    { class: 'kv' },
+    el('dt', null, 'verb'),
+    el('dd', { class: 'mono' }, v?.verb ?? '—'),
+    rows.map(([k, val]) => [
+      el('dt', null, k),
+      el('dd', { class: 'mono' }, Array.isArray(val) ? val.map((x) => el('span', { class: 'chip-static' }, x)) : val === null ? 'none' : k === 'ttl_seconds' ? `${val} s (${ttlText(val)})` : String(val)),
+    ]),
+  );
+}
+
+function evidenceBadges(ids, incidentId) {
+  if (!ids?.length) return el('span', { class: 'muted' }, 'no evidence cited');
+  return el(
+    'div',
+    { class: 'ev-row' },
+    ids.map((id) => el('a', { class: 'ev-badge', href: `#/investigations/${encodeURIComponent(incidentId)}`, title: `Open ${incidentId} to inspect observation ${id}`, on: { click: () => drawer().close() } }, `obs ${id}`)),
+  );
+}
+
+function justification(a) {
+  return section(
+    'Justification',
+    el('dl', { class: 'kv kv-wide' }, el('dt', null, 'expected effect'), el('dd', null, a.expected_effect || '—'), el('dt', null, 'blast radius'), el('dd', null, a.blast_radius || '—'), el('dt', null, 'rollback plan'), el('dd', null, a.rollback_plan || '—')),
+  );
+}
+
+function openDeniedDrawer(d) {
+  openDrawer(
+    `${VERB_LABEL[d.verb?.verb] ?? 'Action'} · ${verbTarget(d.verb)}`,
+    'Denied by the deterministic action gate. No intent was signed, nothing reached the host.',
+    [
+      el('div', { class: 'row' }, actionStatusBadge('rejected'), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(d.host_id)}` }, d.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(d.incident_id)}` }, d.incident_id)),
+      el('div', { class: 'decision bad' }, el('span', { class: 'verdict' }, 'Denied'), el('span', { class: 'rule' }, d.decision.rule_id), el('span', { class: 'reason' }, d.decision.reason), el('span', { class: 'muted' }, `policy v${d.decision.policy_version} · proposed by `, el('span', { class: 'mono' }, d.actor), ' · ', fmtTime(d.created_at))),
+      section('Proposed verb', verbParams(d.verb)),
+      justification(d),
+      section('Evidence', evidenceBadges(d.evidence_observation_ids, d.incident_id)),
+    ],
+    [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Close')],
+  );
+}
+
+const shq = (v) => (/^[A-Za-z0-9_@%+=:,./~-]+$/.test(v) ? v : `'${String(v).replace(/'/g, `'\\''`)}'`);
+
+function approveCommand(intentId) {
+  const f = state.approval;
+  const sock = state.actions.admin_sock || '/run/defsec/admin.sock';
+  return [
+    `admin-cli --admin-sock ${shq(sock)} \\`,
+    `  approve-action ${shq(intentId)} \\`,
+    `  --approver ${shq(f.approver.trim() || state.auth?.user?.username || '<your-name>')} \\`,
+    `  --operator-key-file ${shq(f.keyFile.trim() || '<operator.key>')} \\`,
+    `  --operator-key-id ${shq(f.keyId.trim() || '<key-id>')}`,
+  ].join('\n');
+}
+
+function approvalPanel(a, detail) {
+  const f = state.approval;
+  const cmd = el('code', null, approveCommand(a.intent_id));
+  const refreshCmd = () => (cmd.textContent = approveCommand(a.intent_id));
+  const keyFile = field('Operator key file', textInput(f, 'keyFile', { mono: true, onInput: refreshCmd }));
+  keyFile.classList.add('span-2');
+  const inputs = el(
+    'div',
+    { class: 'grid-2' },
+    field('Approver', textInput(f, 'approver', { placeholder: state.auth?.user?.username ?? 'your name', onInput: refreshCmd })),
+    field('Operator key ID', textInput(f, 'keyId', { mono: true, onInput: refreshCmd })),
+    keyFile,
+  );
+  const parts = [
+    el(
+      'div',
+      { class: 'approve-head' },
+      icon('key'),
+      el('div', null, el('strong', null, 'Independent operator signature required'), el('div', { class: 'muted' }, 'Approval window ', relTime(detail?.payload?.expires_at ?? actionDeadline(a), { until: true }))),
+    ),
+    el('p', { class: 'dim' }, 'control-d has already signed this intent. action-exec-d runs it only once an operator Ed25519 key co-signs the exact canonical payload. Sign on your own workstation: private keys never reach this console.'),
+    inputs,
+    el('div', { class: 'cmd' }, el('div', { class: 'cmd-head' }, icon('terminal'), el('span', null, 'Run locally'), el('span', { class: 'spacer' }), el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: (e) => copy(cmd.textContent, e.currentTarget) } }, icon('copy'), 'Copy')), el('pre', null, cmd)),
+    detail?.signing ? el('div', { class: 'row sign-line' }, el('span', { class: 'muted' }, 'Signs payload sha256'), hashChip(detail.signing.payload_sha256), el('span', { class: 'muted' }, 'under'), el('span', { class: 'mono dim' }, detail.signing.domain)) : null,
+  ];
+
+  if (!adminEnabled()) {
+    parts.push(el('p', { class: 'muted small' }, state.status?.admin_enabled ? 'Submitting approvals through the console needs an admin account.' : 'Start the console with --enable-admin to submit approvals here, or run the command above.'));
+    return el('section', { class: 'approve-box' }, parts);
+  }
+
+  const errNode = el('div');
+  const done = async (res) => {
+    toast(`Intent authorized · co-signed by ${res.authorized_intent?.operator_approval?.signing_key_id ?? 'operator key'}`, 'ok');
+    await loadActions();
+    renderShell();
+    const updated = state.actions.list.find((x) => x.intent_id === a.intent_id) ?? a;
+    openActionDrawer(updated);
+    if (parseRoute().view === 'mitigations' || parseRoute().view === 'fleet') render();
+    if (isDemo()) setTimeout(() => poll(), 4600);
+  };
+
+  if (isDemo()) {
+    const btn = el('button', { class: 'btn btn-ok', type: 'button' }, icon('check'), 'Approve with demo operator key');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      replace(errNode);
+      try {
+        await done(await api(`/api/admin/actions/${encodeURIComponent(a.intent_id)}/approve`, { method: 'POST', body: { approver: f.approver.trim() || state.auth?.user?.username || 'demo-operator', note: f.note || undefined } }));
+      } catch (err) {
+        replace(errNode, errorBox(err));
+        btn.disabled = false;
+      }
+    });
+    parts.push(
+      el(
+        'div',
+        { class: 'demo-approve' },
+        el('p', { class: 'muted small' }, 'Demo mode: the console holds a simulated operator key (demo-operator-01) so you can walk through the flow. Approvals still pass the real checks: payload binding, independent key, expiry, open incident, rate limit and the 120 s causal cooldown.'),
+        field('Note (optional)', textInput(f, 'note', { placeholder: 'e.g. confirmed with host owner' })),
+        el('div', { class: 'form-actions' }, btn),
+        errNode,
+      ),
+    );
+    return el('section', { class: 'approve-box' }, parts);
+  }
+
+  // Live: accept an envelope that was signed offline.
+  const checks = el('ul', { class: 'env-checks' });
+  const submit = el('button', { class: 'btn btn-ok', type: 'button', disabled: true }, 'Submit signed approval');
+  const area = el('textarea', { class: 'mono-input', rows: 6, placeholder: '{"domain":"defsecautmit.action_approval.v1","signing_key_id":"…","raw_payload":"…","signature_hex":"…"}', value: f.envelope, attrs: { spellcheck: 'false', 'aria-label': 'Offline-signed operator_approval envelope (JSON)' } });
+  let parsed = null;
+  const validate = () => {
+    f.envelope = area.value;
+    parsed = null;
+    const items = [];
+    const ok = (cond, text) => items.push(el('li', { class: cond ? 'ok' : 'bad' }, icon(cond ? 'check' : 'close'), text));
+    if (area.value.trim()) {
+      try {
+        const v = JSON.parse(area.value);
+        const keys = v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v).sort().join(',') : '';
+        ok(keys === 'domain,raw_payload,signature_hex,signing_key_id', 'exact SignedEnvelope fields');
+        ok(v?.domain === 'defsecautmit.action_approval.v1', 'approval signature domain');
+        ok(/^[0-9a-f]{128}$/i.test(v?.signature_hex ?? ''), '64-byte Ed25519 signature');
+        if (detail?.signing) ok(v?.raw_payload === detail.signing.canonical_payload, 'signs this exact intent payload');
+        if (items.every((n) => n.classList.contains('ok'))) parsed = v;
+      } catch {
+        ok(false, 'valid JSON');
+      }
+    }
+    replace(checks, items);
+    submit.disabled = !parsed;
+  };
+  area.addEventListener('input', validate);
+  validate();
+  submit.addEventListener('click', async () => {
+    submit.disabled = true;
+    replace(errNode);
+    try {
+      await done(await api(`/api/admin/actions/${encodeURIComponent(a.intent_id)}/approve`, { method: 'POST', body: { approver: f.approver.trim() || state.auth?.user?.username || '', operator_approval: parsed } }));
+      f.envelope = '';
+    } catch (err) {
+      replace(errNode, errorBox(err));
+      submit.disabled = false;
+    }
+  });
+  const copyPayload = detail?.signing
+    ? el('button', { class: 'btn btn-sm btn-ghost', type: 'button', title: 'RFC 8785 canonical payload, for signing with other offline tooling', on: { click: (e) => copy(detail.signing.canonical_payload, e.currentTarget) } }, icon('copy'), 'Copy canonical payload')
+    : null;
+  parts.push(
+    el(
+      'details',
+      { class: 'env-submit' },
+      el('summary', null, 'Or submit an envelope you already signed offline'),
+      el('p', { class: 'muted small' }, 'Paste the operator_approval SignedEnvelope. control-d verifies the signature against its trusted operator keys and rejects keys that match the control key.'),
+      area,
+      checks,
+      el('div', { class: 'form-actions' }, copyPayload, el('span', { class: 'spacer' }), submit),
+      errNode,
+    ),
+  );
+  return el('section', { class: 'approve-box' }, parts);
+}
+
+function receiptsView(receipts) {
+  if (!receipts?.length) return el('span', { class: 'muted' }, 'No receipts from action-exec-d yet.');
+  return el(
+    'ol',
+    { class: 'receipts' },
+    receipts.map((r) =>
+      el(
+        'li',
+        null,
+        el('div', { class: 'row' }, actionStatusBadge(r.status), r.dry_run ? el('span', { class: 'badge eph' }, 'dry run') : null, el('span', { class: ['badge', r.verification_passed ? 'ok' : 'warn'] }, r.verification_passed ? 'verified' : 'not verified'), el('span', { class: 'spacer' }), el('span', { class: 'num muted', title: r.executed_at }, fmtTime(r.executed_at))),
+        el('div', { class: 'r-detail' }, r.detail),
+        el('dl', { class: 'kv' }, r.rollback_handle ? [el('dt', null, 'rollback handle'), el('dd', { class: 'mono' }, r.rollback_handle)] : null, r.expires_at ? [el('dt', null, 'expires'), el('dd', { class: 'num' }, fmtTime(r.expires_at))] : null),
+      ),
+    ),
+  );
+}
+
+function signaturesView(detail) {
+  const ai = detail.authorized_intent;
+  const p = detail.payload;
+  const sig = (env, label) =>
+    env
+      ? [el('dt', null, label), el('dd', null, el('span', { class: 'mono' }, env.signing_key_id), ' ', hashChip(env.signature_hex, { label: `${env.signature_hex.slice(0, 12)}…` }))]
+      : [el('dt', null, label), el('dd', { class: 'muted' }, p.auth_mode === 'dual_signed_operator' ? 'not yet co-signed' : 'not required (bounded autonomous)')];
+  return el(
+    'dl',
+    { class: 'kv' },
+    el('dt', null, 'intent_id'),
+    el('dd', null, hashChip(p.intent_id, { full: true })),
+    el('dt', null, 'nonce'),
+    el('dd', { class: 'mono' }, p.nonce),
+    el('dt', null, 'issued → expires'),
+    el('dd', { class: 'num' }, `${fmtTime(p.issued_at)} → ${fmtTime(p.expires_at)}`),
+    el('dt', null, 'policy'),
+    el('dd', { class: 'mono' }, `v${p.policy_version} · schema v${p.schema_version} · proposal #${p.proposal_id}`),
+    el('dt', null, 'payload sha256'),
+    el('dd', null, hashChip(detail.signing.payload_sha256)),
+    ai ? sig(ai.control_envelope, 'control-d') : [el('dt', null, 'control-d'), el('dd', { class: 'muted' }, detail.status === 'pending_approval' ? 'signed; envelope released after approval' : 'envelope not released (inactive intent)')],
+    sig(ai?.operator_approval ?? null, 'operator'),
+  );
+}
+
+function openActionDrawer(a) {
+  const detailSlot = el('div', { class: 'stack' }, adminEnabled() ? loading(4) : el('p', { class: 'muted small' }, 'The signed intent, receipts and signatures are read over the admin interface.'));
+  const approveSlot = el('div');
+  const statusSlot = el('span', { class: 'status-slot' }, actionStatusBadge(a.status, a));
+  if (a.status === 'pending_approval' && !lapsed(a)) replace(approveSlot, approvalPanel(a, null));
+  openDrawer(
+    `${VERB_LABEL[a.verb?.verb] ?? 'Action'} · ${verbTarget(a.verb)}`,
+    a.auth_mode === 'dual_signed_operator' ? 'Dual-signed intent: control-d plus an independent operator key' : 'Bounded autonomous intent pre-authorised by human-owned policy',
+    [
+      el('div', { class: 'row' }, statusSlot, authModeBadge(a.auth_mode), a.approver ? el('span', { class: 'muted small' }, 'approved by ', el('span', { class: 'mono' }, a.approver)) : null, el('span', { class: 'spacer' }), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(a.host_id)}`, on: { click: () => drawer().close() } }, a.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}`, on: { click: () => drawer().close() } }, a.incident_id)),
+      approveSlot,
+      section('Typed parameters', verbParams(a.verb)),
+      justification(a),
+      detailSlot,
+    ],
+    [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Close')],
+  );
+  if (!adminEnabled() || !a.intent_id) return;
+  const want = a.intent_id;
+  api(`/api/admin/actions/${encodeURIComponent(a.intent_id)}`)
+    .then((d) => {
+      if (!drawer().open || !detailSlot.isConnected || want !== a.intent_id) return;
+      replace(statusSlot, actionStatusBadge(d.status, { ...a, status: d.status }));
+      if (d.status === 'pending_approval' && !lapsed(a)) replace(approveSlot, approvalPanel(a, d));
+      else if (d.status !== 'pending_approval') replace(approveSlot);
+      replace(
+        detailSlot,
+        section('Evidence', evidenceBadges(d.payload.evidence_observation_ids, d.payload.incident_id)),
+        section('Execution receipts', receiptsView(d.receipts)),
+        section('Signed intent', signaturesView(d)),
+        el('details', { class: 'preview' }, el('summary', null, 'Canonical payload (RFC 8785)'), jsonBlock(d.payload)),
+      );
+    })
+    .catch((err) => replace(detailSlot, errorBox(err)));
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -1838,13 +2531,27 @@ function tick() {
 }
 
 async function poll() {
-  if (document.hidden) return;
+  if (document.hidden || !dashboardStarted) return;
   await Promise.all([loadStatus(), loadCore()]);
   renderShell();
-  if (parseRoute().view === 'fleet') render();
+  const view = parseRoute().view;
+  if (view === 'fleet' || (view === 'mitigations' && !drawer().open)) render();
 }
 
-function boot() {
+let dashboardStarted = false;
+
+function startDashboard() {
+  document.getElementById('gate').hidden = true;
+  clear(document.getElementById('gate'));
+  document.getElementById('shell').hidden = false;
+  refreshAll();
+  if (dashboardStarted) return;
+  dashboardStarted = true;
+  setInterval(tick, 1000);
+  setInterval(poll, 15_000);
+}
+
+async function boot() {
   hydrateIcons();
   document.getElementById('refresh-btn').addEventListener('click', () => refreshAll().then(() => toast('Refreshed')));
   window.addEventListener('hashchange', () => {
@@ -1852,16 +2559,25 @@ function boot() {
     document.getElementById('main').focus({ preventScroll: true });
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'r' && !e.metaKey && !e.ctrlKey && !e.altKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? '') && !drawer().open) {
+    if (e.key === 'r' && dashboardStarted && !document.getElementById('shell').hidden && !e.metaKey && !e.ctrlKey && !e.altKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? '') && !drawer().open) {
       refreshAll();
     }
   });
   drawer().addEventListener('click', (e) => {
     if (e.target === drawer()) drawer().close();
   });
-  refreshAll();
-  setInterval(tick, 1000);
-  setInterval(poll, 15_000);
+  // Lists may have advanced while a detail drawer was open (polls skip re-rendering under it).
+  drawer().addEventListener('close', () => {
+    if (dashboardStarted && parseRoute().view === 'mitigations') render();
+  });
+  try {
+    state.auth = await api('/api/auth/session');
+  } catch (err) {
+    state.auth = null;
+    if (err.code === 'untrusted_proxy') return showGate({ kind: 'blocked', message: err.message });
+  }
+  if (state.auth && !state.auth.authenticated) return showGate({ kind: state.auth.auth_mode === 'local' ? 'login' : 'proxy' });
+  startDashboard();
 }
 
 boot();

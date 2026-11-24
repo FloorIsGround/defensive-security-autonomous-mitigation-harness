@@ -12,7 +12,8 @@
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
-  <div class="shell">
+  <div id="gate" class="gate" hidden></div>
+  <div class="shell" id="shell" hidden>
     <aside class="rail" aria-label="Primary">
       <div class="brand">
         <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
@@ -20,13 +21,14 @@
           <path d="M10.5 16.2 14.4 20l7.1-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
         <div class="brand-text">
-          <span class="brand-name">Defensive Security Harness</span>
+          <span class="brand-name">Defensive Security Autonomous Mitigation Harness</span>
           <span class="brand-sub">Operator Console</span>
         </div>
       </div>
       <nav class="nav" id="nav">
         <a href="#/fleet" data-view="fleet"><span class="nav-ico" data-icon="fleet"></span><span>Fleet &amp; Posture</span></a>
         <a href="#/investigations" data-view="investigations"><span class="nav-ico" data-icon="incident"></span><span>Investigations</span><span class="nav-count" id="nav-incidents"></span></a>
+        <a href="#/mitigations" data-view="mitigations"><span class="nav-ico" data-icon="bolt"></span><span>Mitigations</span><span class="nav-count warn" id="nav-mitigations" title="Awaiting dual-signed approval"></span></a>
         <a href="#/baselines" data-view="baselines"><span class="nav-ico" data-icon="baseline"></span><span>Baselines &amp; Telemetry</span></a>
         <a href="#/audit" data-view="audit"><span class="nav-ico" data-icon="audit"></span><span>Policy &amp; Audit</span></a>
       </nav>
@@ -41,6 +43,7 @@
         </div>
         <div class="topbar-actions">
           <div id="chain-pill"></div>
+          <div id="user-slot" class="user-slot"></div>
           <button type="button" class="btn btn-ghost" id="refresh-btn" title="Refresh (r)">
             <span data-icon="refresh"></span><span>Refresh</span>
           </button>

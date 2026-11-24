@@ -4,6 +4,7 @@
 import { performance } from 'node:perf_hooks';
 import { AdminClient, InvestigationClient } from './uds-client.mjs';
 import { verifyEntries } from './audit-chain.mjs';
+import { parseOperatorApproval, signingInfo } from './demo-actions.mjs';
 import {
   ApiError,
   buildWatchSpec,
@@ -88,6 +89,27 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
     const runId = body?.run_id ?? runs.get(incidentId)?.run_id;
     if (!runId) throw new ApiError(409, 'run_required', 'start an investigation run for this incident first');
     return runId;
+  }
+
+  /** Rejected action proposals never get an intent row; their full context lives in the audit log. */
+  function deniedFromAudit(entries, match) {
+    return entries
+      .filter((e) => e.event_type === 'action_proposed' && e.payload?.decision && e.payload.decision.allowed === false)
+      .map((e) => ({
+        proposal_id: e.payload.proposal_id ?? null,
+        host_id: e.payload.host_id,
+        incident_id: e.payload.incident_id,
+        verb: e.payload.verb,
+        decision: e.payload.decision,
+        expected_effect: e.payload.expected_effect ?? '',
+        blast_radius: e.payload.blast_radius ?? '',
+        rollback_plan: e.payload.rollback_plan ?? '',
+        evidence_observation_ids: e.payload.evidence_observation_ids ?? [],
+        actor: e.actor,
+        created_at: e.timestamp,
+      }))
+      .filter(match)
+      .sort((a, b) => (b.proposal_id ?? 0) - (a.proposal_id ?? 0));
   }
 
   return {
@@ -271,6 +293,74 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       );
       runs.delete(incidentId);
       return { incident_id: r.incident_id, retired_ephemeral_watches: r.retired_ephemeral_watches };
+    },
+
+    // ---- Phase 8 mitigations -------------------------------------------------
+
+    async actions({ host_id = null, incident_id = null } = {}) {
+      const filter = {
+        host_id: host_id === null ? null : requireIdent(host_id, 'host_id'),
+        incident_id: incident_id === null ? null : requireIdent(incident_id, 'incident_id'),
+      };
+      const match = (x) => (!filter.host_id || x.host_id === filter.host_id) && (!filter.incident_id || x.incident_id === filter.incident_id);
+      let actions;
+      let source;
+      if (admin) {
+        // The admin interface sees every intent; the investigation socket only
+        // lists actions for an incident-scoped capability.
+        actions = (await adminCall({ admin_op: 'list_actions', ...filter }, 'actions')).actions;
+        source = 'admin';
+      } else {
+        actions = (await invCall({ op: 'list_actions', ...filter }, 'actions')).actions;
+        source = 'investigate';
+      }
+      let denied = null;
+      if (admin) {
+        try {
+          const list = await adminCall({ admin_op: 'list_audit_entries', limit: 500 }, 'audit_entries');
+          denied = deniedFromAudit(list.entries, match);
+        } catch {
+          denied = null;
+        }
+      }
+      return { source, actions, denied, admin_sock: adminSock };
+    },
+
+    async actionDetail(intentId) {
+      requireIdent(intentId, 'intent_id');
+      const r = await adminCall({ admin_op: 'get_action_intent', intent_id: intentId }, 'action_intent_detail');
+      const [list, audit] = await Promise.allSettled([
+        adminCall({ admin_op: 'list_actions', host_id: r.payload.host_id, incident_id: r.payload.incident_id }, 'actions'),
+        adminCall({ admin_op: 'list_audit_entries', limit: 500 }, 'audit_entries'),
+      ]);
+      const summary = list.status === 'fulfilled' ? list.value.actions.find((a) => a.intent_id === intentId) ?? null : null;
+      const receipts =
+        audit.status === 'fulfilled'
+          ? audit.value.entries
+              .filter((e) => (e.event_type === 'action_receipt_recorded' || e.event_type === 'action_rolled_back') && e.payload?.intent_id === intentId)
+              .sort((a, b) => a.seq_no - b.seq_no)
+              .map((e) => e.payload)
+          : [];
+      return {
+        payload: r.payload,
+        authorized_intent: r.authorized_intent ?? null,
+        status: r.status,
+        summary,
+        receipts,
+        signing: signingInfo(r.payload),
+        admin_sock: adminSock,
+      };
+    },
+
+    async approveAction(intentId, body = {}) {
+      requireIdent(intentId, 'intent_id');
+      const approver = requireText(body.approver, 'approver', 128);
+      if (body.operator_approval === undefined || body.operator_approval === null) {
+        throw new ApiError(400, 'invalid_request', 'operator_approval (an offline-signed SignedEnvelope) is required; private keys never reach the console');
+      }
+      const operator_approval = parseOperatorApproval(body.operator_approval);
+      const r = await adminCall({ admin_op: 'approve_action', intent_id: intentId, approver, operator_approval }, 'action_approved');
+      return { intent_id: r.intent_id, authorized_intent: r.authorized_intent };
     },
 
     async enrollHost(body = {}) {

@@ -1,8 +1,8 @@
 {
   "name": "defsecautmit-console",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Zero-dependency localhost operator console (BFF + UI) for DefSecAutMit control-d",
+  "description": "Zero-dependency operator console (BFF + UI) for the Defensive Security Autonomous Mitigation Harness control-d",
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {

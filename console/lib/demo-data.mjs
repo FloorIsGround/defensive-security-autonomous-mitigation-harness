@@ -1,4 +1,4 @@
-// Offline demo backend: a realistic DefSecAutMit fleet with an open two-stage
+// Offline demo backend: a realistic Defensive Security Autonomous Mitigation Harness fleet with an open two-stage
 // incident, three-state baseline drift, active and expired ephemeral watches,
 // accepted and rejected policy decisions, and a real SHA-256 hash-chained audit
 // log. Mutations (runs, proposals, findings, promotion, closure, enrollment)
@@ -7,6 +7,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
+import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
   COLLECTOR_TYPES,
@@ -135,7 +136,7 @@ const jEvent = (now, ago, cursorN, pid, prio, msg, { redacted = false, truncated
 // State construction
 // ---------------------------------------------------------------------------
 
-function buildState(now) {
+function buildState(now, signer) {
   const iso = (ago) => new Date(now - ago).toISOString();
 
   const hosts = [
@@ -404,6 +405,9 @@ function buildState(now) {
     dec(57, 77, 'operator:t3-mcp-session', 31 * MIN, false, 'spec.safety_floor', "invalid watch 'ephem-0042-sock-fast': interval_seconds 5 is below local floor 15"),
   ];
 
+  // --- Phase 8 mitigations (typed intents, signed envelopes, receipts) -----
+  const actionSet = buildDemoActions({ now, iso, ids, signer });
+
   // --- audit events, chained in timestamp order -----------------------------
   const ev = (ago, event_type, actor, payload) => ({ ago, event_type, actor, payload });
   const events = [
@@ -430,6 +434,7 @@ function buildState(now) {
     ev(32 * MIN - 1000, 'bundle_issued', 'control-d', { host_id: 'edge-vm-07', version: 14, digest: h('bundle-14') }),
     ev(30 * MIN, 'finding_recorded', REASONER, { finding_id: 302, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'verified_finding' }),
     ev(12 * MIN, 'finding_recorded', REASONER, { finding_id: 303, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'hypothesis' }),
+    ...actionSet.events,
   ].sort((a, b) => b.ago - a.ago);
 
   const audit = [];
@@ -443,13 +448,14 @@ function buildState(now) {
     incidents,
     findings,
     proposals,
-    policyDecisions,
+    policyDecisions: [...policyDecisions, ...actionSet.decisions],
+    actions: { intents: actionSet.intents, denied: actionSet.denied, nextProposalId: actionSet.nextProposalId },
     audit,
     runs: new Map(),
     nextObservationId: 9001 + observations.length,
     nextRevisionId: 40,
     nextFindingId: 310,
-    nextDecisionId: 60,
+    nextDecisionId: 70,
     nextProposalId: 80,
     tampered: false,
     createdAt: now,
@@ -477,7 +483,9 @@ function appendAudit(audit, event_type, actor, payload, timestamp = new Date().t
 // ---------------------------------------------------------------------------
 
 export function createDemoBackend({ enableAdmin = true, now = () => Date.now() } = {}) {
-  let S = buildState(now());
+  const signer = createDemoSigner();
+  let S = buildState(now(), signer);
+  const advance = () => advanceDemoActions(S, now(), appendAudit);
 
   const host = (id) => {
     requireIdent(id, 'host_id');
@@ -533,6 +541,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     adminEnabled: enableAdmin,
 
     async status() {
+      advance();
       return {
         mode: 'demo',
         admin_enabled: enableAdmin,
@@ -726,6 +735,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
 
     async audit({ limit = 200 } = {}) {
       requireAdmin();
+      advance();
       const lim = int(limit, 'limit', { min: 1, max: 500 });
       const entries = S.audit.slice(-lim);
       return { chain: chainStatus(), independent: verifyEntries(entries), entries };
@@ -819,6 +829,53 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       return { host_id: hostId, control_signing_key_id: 'control-key-01', control_public_key_hex: h('demo-control-signing-key') };
     },
 
+    // ---- Phase 8 mitigations ---------------------------------------------------
+    async actions({ host_id = null, incident_id = null } = {}) {
+      if (host_id !== null) requireIdent(host_id, 'host_id');
+      if (incident_id !== null) requireIdent(incident_id, 'incident_id');
+      advance();
+      const match = (x) => (!host_id || x.host_id === host_id) && (!incident_id || x.incident_id === incident_id);
+      return {
+        source: 'demo',
+        actions: S.actions.intents.map(summaryOf).filter(match).sort((a, b) => b.proposal_id - a.proposal_id),
+        denied: S.actions.denied.filter(match).sort((a, b) => b.proposal_id - a.proposal_id),
+        admin_sock: './control-data/admin.sock',
+      };
+    },
+
+    async actionDetail(intentId) {
+      requireAdmin();
+      requireIdent(intentId, 'intent_id');
+      advance();
+      const rec = S.actions.intents.find((r) => r.payload.intent_id === intentId);
+      if (!rec) throw new ApiError(404, 'not_found', 'action intent not found');
+      const live = rec.status === 'authorized' && Date.parse(rec.payload.expires_at) > now();
+      return {
+        payload: rec.payload,
+        authorized_intent: live || ['executed', 'rolled_back'].includes(rec.status)
+          ? { control_envelope: rec.control_envelope, operator_approval: rec.operator_approval }
+          : null,
+        status: rec.status,
+        summary: summaryOf(rec),
+        receipts: rec.receipts,
+        signing: signingInfo(rec.payload),
+        admin_sock: './control-data/admin.sock',
+      };
+    },
+
+    async approveAction(intentId, body = {}) {
+      requireAdmin();
+      advance();
+      return approveDemoAction(S, {
+        intentId,
+        body,
+        signer,
+        nowMs: now(),
+        incidentOpen: (id) => S.incidents.find((i) => i.incident_id === id)?.status === 'open',
+        appendAudit,
+      });
+    },
+
     // ---- demo-only helpers ---------------------------------------------------
     async demoTamper() {
       const target = S.audit[Math.floor(S.audit.length / 2)];
@@ -828,7 +885,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     },
 
     async demoReset() {
-      S = buildState(now());
+      S = buildState(now(), signer);
       return { reset: true };
     },
 
