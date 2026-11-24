@@ -145,7 +145,18 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
         "name": "propose_ephemeral_watch",
         "description": (
             "Submit a typed ephemeral WatchSpec for the incident. The central "
-            "policy gate validates it deterministically; a rejection is final. "
+            "policy gate validates it deterministically; unknown fields are rejected. "
+            "Exact WatchSpec JSON shape: "
+            "{id: str, version: 1, host_id: str, class: 'ephemeral', incident_id: str, "
+            "collector: {type: 'systemd.unit_state', parameters: {unit: 'name.service', hash_unit_files: true}} "
+            "| {type: 'journal.unit_events', parameters: {unit: 'name.service', min_priority: 6, max_events_per_batch: 50, max_message_bytes: 512}} "
+            "| {type: 'files.metadata', parameters: {paths: ['/etc/...'], compute_hash: true, max_file_bytes: 65536}} "
+            "| {type: 'sockets.listening', parameters: {include_tcp: true, include_udp: false, include_ipv6: true, resolve_process: true}}, "
+            "schedule: {interval_seconds: >=15, timeout_seconds: 5}, "
+            "trigger: {type: 'field_changed', compare_against: 'last_observed', fields: ['active_state']} "
+            "| {type: 'set_diff', compare_against: 'last_observed', set_field: 'sockets', identity_key: 'socket_key'}, "
+            "wake_policy: {cooldown_seconds: 120, max_wakeups_per_hour: 4}, "
+            "lifecycle: {enabled: true, expires_at: '<RFC3339 UTC within 4h>', max_runs: 120}}. "
             "Arguments: spec (WatchSpec object), rationale (string)."
         ),
         "parameters": {
@@ -427,16 +438,17 @@ class ReasonerWorker:
                 outcome.estimated_cost_usd += turn.estimated_cost_usd
 
                 if turn.tool_calls:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": turn.final_text or "",
-                            "tool_calls": [
-                                {"id": call.id, "name": call.name, "arguments": call.arguments}
-                                for call in turn.tool_calls
-                            ],
-                        }
-                    )
+                    assistant_msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": turn.final_text or "",
+                        "tool_calls": [
+                            {"id": call.id, "name": call.name, "arguments": call.arguments}
+                            for call in turn.tool_calls
+                        ],
+                    }
+                    if turn.reasoning_content is not None:
+                        assistant_msg["reasoning_content"] = turn.reasoning_content
+                    messages.append(assistant_msg)
                     for call in turn.tool_calls:
                         outcome.tool_calls += 1
                         result, stop = self._execute_tool(
@@ -702,6 +714,20 @@ class ReasonerWorker:
                         {"error": exc.code, "detail": exc.message, "_proposal_attempted": True},
                         False,
                     )
+                except RpcTransportError as exc:
+                    if "unexpected EOF" in str(exc):
+                        return (
+                            {
+                                "error": "schema_rejected",
+                                "detail": (
+                                    "control-d rejected the WatchSpec JSON schema (deny_unknown_fields or missing required field); "
+                                    "verify exact WatchSpec structure"
+                                ),
+                                "_proposal_attempted": True,
+                            },
+                            False,
+                        )
+                    raise
                 decision = reply.get("decision") or {}
                 result = {
                     "decision": decision,

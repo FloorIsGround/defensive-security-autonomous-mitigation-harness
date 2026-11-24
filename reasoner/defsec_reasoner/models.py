@@ -56,6 +56,7 @@ class ModelTurnResult:
     output_tokens: int
     estimated_cost_usd: float
     finish_reason: str  # "tool_calls" | "stop" | "length" | "script_exhausted" | ...
+    reasoning_content: str | None = None
 
 
 class ProviderError(Exception):
@@ -210,11 +211,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
             output_tokens=output_tokens,
             estimated_cost_usd=cost,
             finish_reason=finish,
+            reasoning_content=message.get("reasoning_content"),
         )
 
     @staticmethod
     def _encode_message(message: dict[str, Any]) -> dict[str, Any]:
         out = {"role": message.get("role", "user"), "content": message.get("content") or ""}
+        if message.get("reasoning_content") is not None:
+            out["reasoning_content"] = message["reasoning_content"]
         if message.get("tool_calls"):
             out["tool_calls"] = [
                 {
