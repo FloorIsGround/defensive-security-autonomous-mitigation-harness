@@ -861,6 +861,7 @@ fn scoped_watches(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observations(
     db: &Connection,
     cap: &ScopedCapability,

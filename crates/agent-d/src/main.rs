@@ -75,7 +75,7 @@ fn reconnect_jitter(session_id: &str, attempt: u64) -> Duration {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(session_id.as_bytes());
-    hasher.update(&attempt.to_be_bytes());
+    hasher.update(attempt.to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let n = u64::from_be_bytes(digest[0..8].try_into().unwrap());
     Duration::from_millis(n % MAX_RECONNECT_JITTER)
@@ -217,12 +217,12 @@ async fn main_loop(
                 // Run scheduled watches — also while disconnected: pending
                 // observations accumulate in the bounded spool.
                 let outgoing = engine.run_due_watches(now).await;
-                if let Some(conn) = connection.as_mut() {
-                    if let Err(e) = send_messages(&mut conn.writer, outgoing).await {
-                        tracing::warn!(error = %e, "socket write failed; reconnecting");
-                        connection = None;
-                        next_reconnect_at = Some(Instant::now() + backoff);
-                    }
+                if let Some(conn) = connection.as_mut()
+                    && let Err(e) = send_messages(&mut conn.writer, outgoing).await
+                {
+                    tracing::warn!(error = %e, "socket write failed; reconnecting");
+                    connection = None;
+                    next_reconnect_at = Some(Instant::now() + backoff);
                 }
                 // Periodic heartbeat with per-watch run summaries + RSS.
                 if Instant::now() >= next_heartbeat {
@@ -252,12 +252,12 @@ async fn main_loop(
             Ok(Some(msg)) => {
                 let now = chrono::Utc::now();
                 let replies = engine.handle_control(msg, now).await;
-                if let Some(conn) = connection.as_mut() {
-                    if let Err(e) = send_messages(&mut conn.writer, replies).await {
-                        tracing::warn!(error = %e, "reply write failed; reconnecting");
-                        connection = None;
-                        next_reconnect_at = Some(Instant::now() + backoff);
-                    }
+                if let Some(conn) = connection.as_mut()
+                    && let Err(e) = send_messages(&mut conn.writer, replies).await
+                {
+                    tracing::warn!(error = %e, "reply write failed; reconnecting");
+                    connection = None;
+                    next_reconnect_at = Some(Instant::now() + backoff);
                 }
             }
             Ok(None) => {

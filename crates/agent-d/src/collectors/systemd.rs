@@ -69,7 +69,7 @@ pub fn hash_unit_file(path: &str, max_bytes: u64) -> UnitFileHashEntry {
             return entry;
         }
     };
-    if (stat.st_mode & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
         let _ = close(fd);
         entry.status = ObservationStatus::Error;
         return entry;

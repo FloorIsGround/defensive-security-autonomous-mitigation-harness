@@ -209,7 +209,7 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
         }
     };
 
-    if (stat.st_mode & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
         let _ = close(fd);
         entry.status = ObservationStatus::Error;
         entry.detail =
@@ -344,8 +344,10 @@ mod tests {
     use super::*;
 
     fn test_cfg(root: &Path) -> EdgeSafetyConfig {
-        let mut cfg = EdgeSafetyConfig::default();
-        cfg.approved_file_roots = vec![root.to_path_buf()];
+        let mut cfg = EdgeSafetyConfig {
+            approved_file_roots: vec![root.to_path_buf()],
+            ..Default::default()
+        };
         // Some test runners place TMPDIR under /home; allow the test root itself
         // while keeping all other default denylists active.
         cfg.denied_path_prefixes.retain(|p| !root.starts_with(p));

@@ -40,6 +40,7 @@ impl SustainedCounterState {
 
     /// Advance counter with one actual completed sample.
     /// Returns `true` if `active` transitioned (false->true or true->false).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_sample(
         &mut self,
         spec_version: u32,
@@ -79,6 +80,7 @@ impl SustainedCounterState {
 
 /// Evaluate a watch trigger predicate against `current`, `last_observed`, and
 /// `accepted_baseline`.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_predicate(
     predicate: &TriggerPredicate,
     status: ObservationStatus,

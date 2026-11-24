@@ -1,7 +1,7 @@
 //! End-to-end CLI tests: sign an intent, invoke the `action-exec-d` binary
 //! with `--intent-file`, and assert the printed `ActionReceipt` JSON.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::{Duration, Utc};
@@ -46,7 +46,7 @@ fn payload(host_id: &str, verb: ActionVerb, auth_mode: ActionAuthMode) -> Action
 }
 
 fn write_intent(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     intent: &AuthorizedActionIntent,
 ) -> PathBuf {
@@ -56,11 +56,11 @@ fn write_intent(
 }
 
 fn run_cli(
-    state_dir: &PathBuf,
+    state_dir: &Path,
     control: &SigningKeyPair,
     operator: &SigningKeyPair,
     extra_args: &[&str],
-    intent_file: &PathBuf,
+    intent_file: &Path,
 ) -> (bool, String) {
     let output = Command::new(bin())
         .arg("--host-id")

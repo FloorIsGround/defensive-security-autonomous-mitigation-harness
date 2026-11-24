@@ -226,6 +226,7 @@ pub enum WakeDecision {
     Suppress { reason: String },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn check_wake_budget(
     now: DateTime<Utc>,
     is_health_priority: bool,

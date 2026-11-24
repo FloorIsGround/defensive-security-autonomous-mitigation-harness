@@ -623,7 +623,7 @@ async fn durable_spool_drains_prior_session_observations_after_restart() {
     let profile = DurabilityProfile::Durable {
         max_disk_bytes: 512 * 1024,
     };
-    let mut h = E2eHarness::new("edge-durable", profile.clone());
+    let mut h = E2eHarness::new("edge-durable", profile);
     let t0 = Utc::now();
 
     assert!(matches!(

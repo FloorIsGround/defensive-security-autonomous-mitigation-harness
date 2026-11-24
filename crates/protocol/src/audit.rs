@@ -115,9 +115,8 @@ pub fn verify_audit_chain(
     expected_prev_hash: &str,
 ) -> Result<Option<String>, String> {
     let mut prev_hash = expected_prev_hash.to_string();
-    let mut next_seq = expected_start_seq;
 
-    for entry in entries {
+    for (next_seq, entry) in (expected_start_seq..).zip(entries.iter()) {
         if entry.seq_no != next_seq {
             return Err(format!(
                 "sequence gap or mismatch: expected {}, got {}",
@@ -140,7 +139,6 @@ pub fn verify_audit_chain(
             ));
         }
         prev_hash = entry.entry_hash.clone();
-        next_seq += 1;
     }
 
     if entries.is_empty() {

@@ -387,6 +387,7 @@ pub enum AdminRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "admin_result", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum AdminResponse {
     HostEnrolled {
         host_id: String,
