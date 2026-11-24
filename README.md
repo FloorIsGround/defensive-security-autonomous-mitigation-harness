@@ -1,8 +1,8 @@
 <img src="assets/icon.svg" width="64" height="64" alt="">
 
-# DefSecAutMit
+# Defensive Security Autonomous Mitigation Harness
 
-DefSecAutMit is a Linux defensive monitoring harness with a deterministic collection and policy core, episodic reasoning that proposes bounded follow-up watches, and opt-in, constrained containment with independent operator approval where required. Monitoring continues when the model is unavailable.
+A Linux defensive monitoring harness with a deterministic collection and policy core, episodic reasoning that proposes bounded follow-up watches, and opt-in, constrained containment with independent operator approval where required. Monitoring continues when the model is unavailable.
 
 ```mermaid
 flowchart LR

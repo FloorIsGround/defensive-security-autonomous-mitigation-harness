@@ -1,6 +1,6 @@
-# DefSecAutMit Reasoning Plane (`reasoner/`)
+# Reasoning Plane (`reasoner/`)
 
-Phase 5 of the DefSecAutMit adaptive defensive monitoring harness: the
+Phase 5 of the Defensive Security Autonomous Mitigation Harness: the
 **optional automated episodic reasoning worker** (`reasoner-d`), replaceable
 model adapters, and the **synthetic adaptive-vs-static benchmark suite**
 (Design doc §6.5, §7.1, §7.2, §7.4, §7.5, §9).

@@ -1,6 +1,6 @@
-# Contributing to DefSecAutMit
+# Contributing to Defensive Security Autonomous Mitigation Harness
 
-Thank you for your interest in contributing to DefSecAutMit!
+Thank you for your interest in contributing to the Defensive Security Autonomous Mitigation Harness!
 
 ## Repository Layout
 

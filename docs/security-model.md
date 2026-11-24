@@ -1,6 +1,6 @@
 # Security model
 
-DefSecAutMit is a defense-in-depth monitoring system, not a guarantee against a compromised host. Trust in signing keys, local control, host identity and the operating system remains essential.
+The Defensive Security Autonomous Mitigation Harness is a defense-in-depth monitoring system, not a guarantee against a compromised host. Trust in signing keys, local control, host identity and the operating system remains essential.
 
 ## Boundaries
 

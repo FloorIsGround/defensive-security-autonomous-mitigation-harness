@@ -1,6 +1,6 @@
-# DefSecAutMit Operator Console
+# Operator Console
 
-A localhost operator console for DefSecAutMit: a small Node 24 backend-for-frontend (BFF) plus a hand-built, responsive security-operations UI.
+A localhost operator console for the Defensive Security Autonomous Mitigation Harness: a small Node 24 backend-for-frontend (BFF) plus a hand-built, responsive security-operations UI.
 
 It has **zero dependencies**. It uses only Node built-ins (`node:http`, `node:net`, `node:fs`, `node:path`, `node:crypto`, `node:test`, `node:assert`) and vanilla HTML/CSS/ES modules. Nothing to `npm install`, and it runs and tests fully offline.
 

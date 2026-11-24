@@ -1,6 +1,6 @@
 # Architecture
 
-DefSecAutMit separates continuous deterministic monitoring from episodic model-assisted investigation. The model has typed investigation operations, not a shell or direct access to the database. Local IPC is the present deployment boundary.
+The Defensive Security Autonomous Mitigation Harness separates continuous deterministic monitoring from episodic model-assisted investigation. The model has typed investigation operations, not a shell or direct access to the database. Local IPC is the present deployment boundary.
 
 ## Components
 

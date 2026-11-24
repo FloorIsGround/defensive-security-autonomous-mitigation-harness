@@ -2,7 +2,7 @@
 
 ## Scope & Operational Posture
 
-DefSecAutMit is an active defensive monitoring and policy-bounded mitigation harness. It is designed around **physical trust-domain separation**, **read-only-first defaults**, and **deterministic policy enforcement** rather than prompt-only guardrails.
+The Defensive Security Autonomous Mitigation Harness is an active defensive monitoring and policy-bounded mitigation harness. It is designed around **physical trust-domain separation**, **read-only-first defaults**, and **deterministic policy enforcement** rather than prompt-only guardrails.
 
 Important safety defaults to preserve in any deployment:
 - **`agent-d`** runs unprivileged with zero Linux capabilities (`CapEff=0`) and enforces its own local safety floor (`crates/policy/src/edge_floor.rs`) independently of `control-d`.
