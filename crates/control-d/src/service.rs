@@ -15,7 +15,7 @@ use defsec_policy::{
 use defsec_protocol::{
     audit::AuditEventType::{
         BaselinePromoted, BundleIssued, CapabilityMinted, HostEnrolled, IncidentClosed,
-        PolicyDecision as PolicyDecisionAudited, RunCompleted,
+        IncidentOpened, PolicyDecision as PolicyDecisionAudited, RunCompleted,
     },
     canonical::sha256_hex,
     rpc::*,
@@ -29,6 +29,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::ledger::{self, audit, json_column, rows};
+use crate::server::Registry;
 
 #[path = "actions.rs"]
 pub(crate) mod actions;
@@ -94,6 +95,7 @@ struct State {
     action_safety: ActionSafetyConfig,
     operator_keys: Mutex<VerifyingKeyStore>,
     bundle_updates: watch::Sender<()>,
+    agent_registry: Registry,
 }
 
 impl ControlService {
@@ -161,6 +163,7 @@ impl ControlService {
             action_safety,
             operator_keys: Mutex::new(VerifyingKeyStore::new()),
             bundle_updates: watch::channel(()).0,
+            agent_registry: Registry::default(),
         })))
     }
 
@@ -182,6 +185,72 @@ impl ControlService {
 
     pub(crate) fn subscribe_bundles(&self) -> watch::Receiver<()> {
         self.0.bundle_updates.subscribe()
+    }
+
+    pub(crate) fn agent_registry(&self) -> Registry {
+        self.0.agent_registry.clone()
+    }
+
+    /// Mark hosts offline when their last contact is strictly older than the grace window.
+    pub fn sweep_stale_hosts(&self, now: DateTime<Utc>, grace_seconds: u64) -> Result<Vec<String>> {
+        let Some(cutoff) = i64::try_from(grace_seconds)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .and_then(|grace| now.checked_sub_signed(grace))
+        else {
+            return Ok(vec![]);
+        };
+        self.transaction(|db| {
+            let stale: Vec<(String, String)> = rows(
+                db,
+                "SELECT host_id,last_heartbeat_at FROM hosts
+                 WHERE liveness_status='online' AND last_heartbeat_at<?1 ORDER BY host_id",
+                [stamp(cutoff)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mut offline = Vec::with_capacity(stale.len());
+            for (host, last_heartbeat) in stale {
+                db.execute("UPDATE hosts SET liveness_status='offline' WHERE host_id=?1", [&host])?;
+                let existing: Option<String> = db.query_row(
+                    "SELECT incident_id FROM incidents WHERE host_id=?1 AND status='open' AND is_liveness=1",
+                    [&host],
+                    |row| row.get(0),
+                ).optional()?;
+                let (incident, event) = if let Some(incident) = existing {
+                    db.execute(
+                        "UPDATE incidents SET updated_at=?2 WHERE incident_id=?1",
+                        params![incident, stamp(now)],
+                    )?;
+                    (incident, PolicyDecisionAudited)
+                } else {
+                    let incident = uuid();
+                    let summary = format!("Host {host} missed heartbeats beyond the {grace_seconds}-second grace window");
+                    db.execute(
+                        "INSERT INTO incidents
+                         (incident_id,host_id,status,priority_json,summary,created_at,updated_at,is_liveness)
+                         VALUES (?1,?2,'open',?3,?4,?5,?5,1)",
+                        params![incident, host, serde_json::to_string(&Severity::High)?, summary, stamp(now)],
+                    )?;
+                    (incident, IncidentOpened)
+                };
+                audit(
+                    db,
+                    event,
+                    "control",
+                    &uuid(),
+                    json!({
+                        "action": "host_liveness_offline",
+                        "host_id": host,
+                        "incident_id": incident,
+                        "last_heartbeat_at": last_heartbeat,
+                        "grace_seconds": grace_seconds,
+                        "swept_at": now,
+                    }),
+                )?;
+                offline.push(host);
+            }
+            Ok(offline)
+        })
     }
 
     pub(crate) fn bundle_changed(&self) {

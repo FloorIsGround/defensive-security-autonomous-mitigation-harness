@@ -65,6 +65,50 @@ For a first local test as the same user, start `control-d --data-dir ./run-data`
 
 Use the returned public key in place of `CONTROL_PUBLIC_KEY_HEX`. Enrollment and peer UID permissions are separate controls. Do not use a production control key or state directory for a disposable test.
 
+## Multi-host mTLS transport and PKI
+
+For remote edge hosts, `agent-d` initiates an outbound TLS 1.3 mTLS connection to `control-d` (zero inbound ports on edge hosts). Each host certificate embeds a `spiffe://defsecautmit/host/<host_id>` URI SAN, and `control-d` rejects any `Register` frame whose `host_id` does not match the peer certificate. TLS session resumption is disabled so serial revocations take effect immediately on the next connection without restarting `control-d`.
+
+Issue an internal ECDSA P-256 CA, control server certificate, and host client certificate with `admin-cli pki` (private keys are written with mode `0600`):
+
+```sh
+admin-cli pki init-ca --out-dir ./pki --common-name "defsec-internal-ca"
+admin-cli pki issue-server --ca-cert ./pki/ca.crt --ca-key ./pki/ca.key \
+  --out-dir ./pki --common-name "control.internal" --dns control.internal --ip 10.0.0.10
+admin-cli pki issue-host edge-01 --ca-cert ./pki/ca.crt --ca-key ./pki/ca.key --out-dir ./pki
+```
+
+Start `control-d` with the optional mTLS listener and off-host heartbeat liveness watchdog (default `--liveness-grace-seconds 90` marks silent hosts `offline`, opens a single `high`-priority liveness incident per host, and records `host_liveness_offline` in the hash-chained audit log):
+
+```sh
+control-d --data-dir ./run-data \
+  --agent-mtls-addr 0.0.0.0:7443 \
+  --tls-ca-cert ./pki/ca.crt \
+  --tls-server-cert ./pki/server.crt \
+  --tls-server-key ./pki/server.key \
+  --tls-revoked-file ./pki/revoked_serials.json \
+  --liveness-grace-seconds 90
+```
+
+Start `agent-d` pointing at the mTLS listener:
+
+```sh
+agent-d --host-id edge-01 --state-dir ./run-agent \
+  --control-mtls-addr control.internal:7443 \
+  --tls-server-name control.internal \
+  --tls-ca-cert ./pki/ca.crt \
+  --tls-client-cert ./pki/edge-01.crt \
+  --tls-client-key ./pki/edge-01.key \
+  --control-key-id control-key-01 \
+  --control-pub-hex CONTROL_PUBLIC_KEY_HEX
+```
+
+To revoke a compromised host certificate immediately for new connections:
+
+```sh
+admin-cli pki revoke <SERIAL_HEX> --revoked-file ./pki/revoked_serials.json --reason "host decommissioned"
+```
+
 A baseline watch file has this shape. Collector parameters are a closed schema; replace the `collector` object with one of the four examples below and use a unique `id` per watch. Check local policy floors and choose paths and units appropriate to the host.
 
 ```json

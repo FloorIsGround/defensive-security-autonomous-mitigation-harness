@@ -1,5 +1,5 @@
 //! `agent-d` binary entrypoint: single-threaded Tokio runtime, clap CLI,
-//! UDS connection to `control-d`'s `agent.sock` with bounded exponential
+//! Outbound UDS or mTLS connection to `control-d` with bounded exponential
 //! reconnect jitter, and a unified select loop that runs scheduled watches,
 //! pumps spooled observations, and handles incoming control frames —
 //! including while disconnected (observations spool for later delivery).
@@ -8,11 +8,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use defsec_mtls::MtlsConnector;
 use defsec_policy::edge_floor::EdgeSafetyConfig;
 use defsec_protocol::signing::VerifyingKeyStore;
-use defsec_protocol::wire::{read_frame, write_frame, AgentToControl, ControlToAgent, WireError};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::time::{Instant, MissedTickBehavior};
+use defsec_protocol::wire::{AgentToControl, ControlToAgent, WireError, read_frame, write_frame};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, WriteHalf},
+    net::UnixStream,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior, timeout},
+};
 
 use agent_d::collectors::RealLinuxCollectors;
 use agent_d::engine::AgentEngine;
@@ -22,6 +28,7 @@ const MIN_HEARTBEAT_SECONDS: u64 = 5;
 const RECONNECT_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_CEILING: Duration = Duration::from_secs(30);
 const MAX_RECONNECT_JITTER: u64 = 1500; // milliseconds
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DurabilityArg {
@@ -40,9 +47,21 @@ struct Args {
     #[arg(long, default_value = "/var/lib/defsecautmit/agent-d")]
     state_dir: PathBuf,
 
-    /// Path to `control-d`'s agent socket.
-    #[arg(long, default_value = "/run/defsecautmit/control-d/agent.sock")]
-    control_sock: PathBuf,
+    /// Path to `control-d`'s agent socket (defaults to ./control-data/agent.sock for UDS).
+    #[arg(long, conflicts_with = "control_mtls_addr")]
+    control_sock: Option<PathBuf>,
+
+    /// Address of the mTLS agent listener (host:port).
+    #[arg(long, requires_all = ["tls_server_name", "tls_ca_cert", "tls_client_cert", "tls_client_key"])]
+    control_mtls_addr: Option<String>,
+    #[arg(long, requires = "control_mtls_addr")]
+    tls_server_name: Option<String>,
+    #[arg(long, requires = "control_mtls_addr")]
+    tls_ca_cert: Option<PathBuf>,
+    #[arg(long, requires = "control_mtls_addr")]
+    tls_client_cert: Option<PathBuf>,
+    #[arg(long, requires = "control_mtls_addr")]
+    tls_client_key: Option<PathBuf>,
 
     /// Signing key id the control plane uses for watch bundles.
     #[arg(long)]
@@ -69,6 +88,97 @@ struct Args {
     max_disk_bytes: usize,
 }
 
+enum ControlTransport {
+    Unix(PathBuf),
+    Mtls {
+        addr: String,
+        server_name: String,
+        connector: MtlsConnector,
+    },
+}
+
+impl ControlTransport {
+    fn from_args(args: &Args) -> Result<Self, defsec_mtls::MtlsError> {
+        if let Some(addr) = &args.control_mtls_addr {
+            Ok(Self::Mtls {
+                addr: addr.clone(),
+                server_name: args
+                    .tls_server_name
+                    .clone()
+                    .expect("clap requires --tls-server-name"),
+                connector: MtlsConnector::from_pem_files(
+                    args.tls_ca_cert
+                        .as_ref()
+                        .expect("clap requires --tls-ca-cert"),
+                    args.tls_client_cert
+                        .as_ref()
+                        .expect("clap requires --tls-client-cert"),
+                    args.tls_client_key
+                        .as_ref()
+                        .expect("clap requires --tls-client-key"),
+                )?,
+            })
+        } else {
+            Ok(Self::Unix(
+                args.control_sock
+                    .clone()
+                    .unwrap_or_else(|| "./control-data/agent.sock".into()),
+            ))
+        }
+    }
+
+    async fn connect(&self) -> Result<Connection, Box<dyn std::error::Error>> {
+        let stream: Box<dyn AgentIo> = match self {
+            Self::Unix(path) => Box::new(UnixStream::connect(path).await?),
+            Self::Mtls {
+                addr,
+                server_name,
+                connector,
+            } => Box::new(connector.connect(addr.as_str(), server_name).await?),
+        };
+        Ok(Connection::new(stream))
+    }
+}
+
+trait AgentIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AgentIo for T {}
+
+type IncomingFrame = Result<Option<ControlToAgent>, WireError>;
+
+struct Connection {
+    incoming: mpsc::Receiver<IncomingFrame>,
+    reader_task: JoinHandle<()>,
+    writer: WriteHalf<Box<dyn AgentIo>>,
+}
+
+impl Connection {
+    fn new(stream: Box<dyn AgentIo>) -> Self {
+        let (mut reader, writer) = tokio::io::split(stream);
+        let (tx, incoming) = mpsc::channel(8);
+        // Keep partial reads alive when the watch/heartbeat ticker fires.
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let frame = read_frame(&mut reader).await;
+                let finished = !matches!(frame, Ok(Some(_)));
+                if tx.send(frame).await.is_err() || finished {
+                    break;
+                }
+            }
+        });
+        Self {
+            incoming,
+            reader_task,
+            writer,
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
+}
+
 /// Bounded, deterministic reconnect jitter derived from the session id and
 /// the attempt counter (no RNG dependency on constrained edge nodes).
 fn reconnect_jitter(session_id: &str, attempt: u64) -> Duration {
@@ -81,12 +191,42 @@ fn reconnect_jitter(session_id: &str, attempt: u64) -> Duration {
     Duration::from_millis(n % MAX_RECONNECT_JITTER)
 }
 
+struct Reconnect {
+    backoff: Duration,
+    attempts: u64,
+    next: Instant,
+}
+
+impl Reconnect {
+    fn new() -> Self {
+        Self {
+            backoff: RECONNECT_BACKOFF_FLOOR,
+            attempts: 0,
+            next: Instant::now(),
+        }
+    }
+
+    fn failed(&mut self, session_id: &str) {
+        self.attempts += 1;
+        let delay = self.backoff + reconnect_jitter(session_id, self.attempts);
+        self.next = Instant::now() + delay;
+        self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_CEILING);
+        tracing::debug!(
+            retry_ms = delay.as_millis() as u64,
+            attempt = self.attempts,
+            "scheduled control reconnect"
+        );
+    }
+}
+
 async fn send_messages(
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
     msgs: Vec<AgentToControl>,
 ) -> Result<(), WireError> {
     for msg in msgs {
-        write_frame(writer, &msg).await?;
+        timeout(IO_TIMEOUT, write_frame(writer, &msg))
+            .await
+            .map_err(std::io::Error::from)??;
     }
     Ok(())
 }
@@ -125,6 +265,7 @@ async fn setup(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let transport = ControlTransport::from_args(&args)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -144,22 +285,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let heartbeat_dur = Duration::from_secs(args.heartbeat_seconds.max(MIN_HEARTBEAT_SECONDS));
-    main_loop(&mut engine, &args, heartbeat_dur).await
+    main_loop(&mut engine, &transport, heartbeat_dur).await
 }
 
 async fn main_loop(
     engine: &mut AgentEngine<RealLinuxCollectors>,
-    args: &Args,
+    transport: &ControlTransport,
     heartbeat_dur: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    struct Connection {
-        reader: OwnedReadHalf,
-        writer: OwnedWriteHalf,
-    }
-
-    let mut backoff = RECONNECT_BACKOFF_FLOOR;
-    let mut reconnect_attempts: u64 = 0;
-    let mut next_reconnect_at: Option<Instant> = None;
+) -> ! {
+    let mut reconnect = Reconnect::new();
     let mut connection: Option<Connection> = None;
     let mut next_heartbeat = Instant::now() + heartbeat_dur;
 
@@ -169,44 +303,43 @@ async fn main_loop(
 
     loop {
         // (Re)connect when due.
-        if connection.is_none()
-            && next_reconnect_at
-                .map(|t| Instant::now() >= t)
-                .unwrap_or(true)
-        {
-            match tokio::net::UnixStream::connect(&args.control_sock).await {
-                Ok(stream) => {
-                    let (reader, mut writer) = stream.into_split();
-                    tracing::info!(sock = %args.control_sock.display(), "connected to control-d");
-                    let register = engine.make_register(chrono::Utc::now());
-                    send_messages(&mut writer, vec![register]).await?;
-                    // Retransmit pending spooled observations until durable
-                    // acknowledgment.
-                    let pending: Vec<AgentToControl> = engine
-                        .pending_observations()
-                        .into_iter()
-                        .map(|o| AgentToControl::PushObservationDelta { observation: o })
-                        .collect();
-                    if !pending.is_empty() {
-                        tracing::info!(count = pending.len(), "flushing spooled observations");
+        if connection.is_none() && Instant::now() >= reconnect.next {
+            let connecting = timeout(IO_TIMEOUT, transport.connect());
+            tokio::pin!(connecting);
+            let connected = loop {
+                tokio::select! {
+                    result = &mut connecting => break result,
+                    _ = ticker.tick() => {
+                        engine.run_due_watches(chrono::Utc::now()).await;
                     }
-                    send_messages(&mut writer, pending).await?;
-                    connection = Some(Connection { reader, writer });
-                    backoff = RECONNECT_BACKOFF_FLOOR;
-                    reconnect_attempts = 0;
+                }
+            };
+            let registered = async {
+                let mut conn = connected??;
+                let register = engine.make_register(chrono::Utc::now());
+                send_messages(&mut conn.writer, vec![register]).await?;
+                // Retransmit pending spooled observations until durable acknowledgment.
+                let pending: Vec<AgentToControl> = engine
+                    .pending_observations()
+                    .into_iter()
+                    .map(|observation| AgentToControl::PushObservationDelta { observation })
+                    .collect();
+                if !pending.is_empty() {
+                    tracing::info!(count = pending.len(), "flushing spooled observations");
+                }
+                send_messages(&mut conn.writer, pending).await?;
+                Ok::<_, Box<dyn std::error::Error>>(conn)
+            }
+            .await;
+            match registered {
+                Ok(conn) => {
+                    tracing::info!("connected to control-d");
+                    connection = Some(conn);
                     next_heartbeat = Instant::now() + heartbeat_dur;
                 }
                 Err(e) => {
-                    reconnect_attempts += 1;
-                    let jitter = reconnect_jitter(engine.session_id(), reconnect_attempts);
-                    next_reconnect_at = Some(Instant::now() + backoff + jitter);
-                    tracing::warn!(
-                        error = %e,
-                        backoff_ms = (backoff + jitter).as_millis() as u64,
-                        attempt = reconnect_attempts,
-                        "control socket connect failed; will retry"
-                    );
-                    backoff = std::cmp::min(backoff * 2, RECONNECT_BACKOFF_CEILING);
+                    tracing::warn!(error = %e, "control connection failed; will retry");
+                    reconnect.failed(engine.session_id());
                 }
             }
         }
@@ -222,7 +355,7 @@ async fn main_loop(
                 {
                     tracing::warn!(error = %e, "socket write failed; reconnecting");
                     connection = None;
-                    next_reconnect_at = Some(Instant::now() + backoff);
+                    reconnect.failed(engine.session_id());
                 }
                 // Periodic heartbeat with per-watch run summaries + RSS.
                 if Instant::now() >= next_heartbeat {
@@ -233,7 +366,7 @@ async fn main_loop(
                             Err(e) => {
                                 tracing::warn!(error = %e, "heartbeat write failed; reconnecting");
                                 connection = None;
-                                next_reconnect_at = Some(Instant::now() + backoff);
+                                reconnect.failed(engine.session_id());
                             }
                         }
                     }
@@ -242,14 +375,26 @@ async fn main_loop(
             }
             frame = async {
                 match connection.as_mut() {
-                    Some(conn) => read_frame::<_, ControlToAgent>(&mut conn.reader).await,
-                    None => std::future::pending::<Result<Option<ControlToAgent>, WireError>>().await,
+                    Some(conn) => conn.incoming.recv().await.unwrap_or(Err(WireError::ChannelClosed)),
+                    None => std::future::pending::<IncomingFrame>().await,
                 }
             } => frame,
         };
 
         match read_result {
+            Ok(Some(ControlToAgent::RegisterAck {
+                accepted: false,
+                reason,
+                ..
+            })) => {
+                tracing::warn!(?reason, "control-d rejected registration");
+                connection = None;
+                reconnect.failed(engine.session_id());
+            }
             Ok(Some(msg)) => {
+                if matches!(msg, ControlToAgent::RegisterAck { accepted: true, .. }) {
+                    reconnect = Reconnect::new();
+                }
                 let now = chrono::Utc::now();
                 let replies = engine.handle_control(msg, now).await;
                 if let Some(conn) = connection.as_mut()
@@ -257,18 +402,18 @@ async fn main_loop(
                 {
                     tracing::warn!(error = %e, "reply write failed; reconnecting");
                     connection = None;
-                    next_reconnect_at = Some(Instant::now() + backoff);
+                    reconnect.failed(engine.session_id());
                 }
             }
             Ok(None) => {
                 tracing::warn!("control-d closed the connection");
                 connection = None;
-                next_reconnect_at = Some(Instant::now() + backoff);
+                reconnect.failed(engine.session_id());
             }
             Err(e) => {
                 tracing::warn!(error = %e, "socket read failed; reconnecting");
                 connection = None;
-                next_reconnect_at = Some(Instant::now() + backoff);
+                reconnect.failed(engine.session_id());
             }
         }
     }
@@ -279,14 +424,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_transport_flags_require_one_complete_configuration() {
+        let parse = |extra: &[&str]| {
+            Args::try_parse_from(
+                [
+                    "agent-d",
+                    "--host-id",
+                    "edge-01",
+                    "--control-key-id",
+                    "key",
+                    "--control-pub-hex",
+                    "hex",
+                ]
+                .into_iter()
+                .chain(extra.iter().copied()),
+            )
+        };
+        let args = parse(&[]).unwrap();
+        assert!(matches!(
+            ControlTransport::from_args(&args).unwrap(),
+            ControlTransport::Unix(path) if path == std::path::Path::new("./control-data/agent.sock")
+        ));
+        let mut tls = vec![
+            "--control-mtls-addr",
+            "localhost:8443",
+            "--tls-server-name",
+            "localhost",
+            "--tls-ca-cert",
+            "ca.crt",
+            "--tls-client-cert",
+            "edge.crt",
+        ];
+        assert!(parse(&tls).is_err());
+        tls.extend(["--tls-client-key", "edge.key"]);
+        assert!(parse(&tls).is_ok());
+        tls.extend(["--control-sock", "agent.sock"]);
+        assert!(parse(&tls).is_err());
+    }
+
+    #[test]
     fn reconnect_jitter_is_bounded_and_deterministic() {
         let a = reconnect_jitter("sess-1", 1);
         assert_eq!(a, reconnect_jitter("sess-1", 1));
         assert!(a < Duration::from_millis(MAX_RECONNECT_JITTER));
         // Different attempts produce (deterministically) different spread.
-        let values: Vec<Duration> = (0..16)
-            .map(|i| reconnect_jitter("sess-1", i))
-            .collect();
+        let values: Vec<Duration> = (0..16).map(|i| reconnect_jitter("sess-1", i)).collect();
         assert!(values.iter().any(|v| *v != values[0]));
     }
 }
