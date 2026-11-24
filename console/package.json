@@ -1,0 +1,13 @@
+{
+  "name": "defsecautmit-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-dependency localhost operator console (BFF + UI) for DefSecAutMit control-d",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node server.mjs",
+    "demo": "node server.mjs --demo",
+    "test": "node --test test/server.test.mjs"
+  }
+}

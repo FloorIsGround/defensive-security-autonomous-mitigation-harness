@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
@@ -128,6 +129,51 @@ pub enum InvestigationRequest {
         evidence_observation_ids: Vec<i64>,
         escalation_requested: bool,
     },
+    LeaseNextTrigger {
+        lease_owner: String,
+        lease_seconds: u64,
+    },
+    CompleteTriggerLease {
+        event_id: i64,
+        lease_token: String,
+        #[serde(default)]
+        run_id: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+    },
+    FailTriggerLease {
+        event_id: i64,
+        lease_token: String,
+        error: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeasedTrigger {
+    pub event_id: i64,
+    pub incident_id: String,
+    pub host_id: String,
+    pub watch_id: String,
+    pub spec_version: u32,
+    pub lease_token: String,
+    pub lease_expires_at: DateTime<Utc>,
+    pub retry_count: u32,
+    pub outcome: serde_json::Value,
+    pub evidence_observation_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDecisionRecord {
+    pub decision_id: i64,
+    #[serde(default)]
+    pub proposal_id: Option<i64>,
+    pub actor: String,
+    pub request_id: String,
+    pub decision: PolicyDecision,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +268,14 @@ pub enum InvestigationResponse {
         finding_id: i64,
         verified_evidence_count: usize,
     },
+    TriggerLeased {
+        #[serde(default)]
+        lease: Option<LeasedTrigger>,
+    },
+    LeaseUpdated {
+        event_id: i64,
+        status: String,
+    },
     Error {
         code: String,
         message: String,
@@ -267,6 +321,14 @@ pub enum AdminRequest {
     ListHosts,
     ListIncidents,
     VerifyAuditChain,
+    ListAuditEntries {
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    ListPolicyDecisions {
+        #[serde(default)]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +370,12 @@ pub enum AdminResponse {
         latest_hash: Option<String>,
         #[serde(default)]
         error: Option<String>,
+    },
+    AuditEntries {
+        entries: Vec<AuditEntry>,
+    },
+    PolicyDecisions {
+        decisions: Vec<PolicyDecisionRecord>,
     },
     Error {
         code: String,

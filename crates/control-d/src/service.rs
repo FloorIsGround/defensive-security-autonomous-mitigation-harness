@@ -498,6 +498,39 @@ impl ControlService {
                 incidents: list_incidents(db)?,
             }),
             AdminRequest::VerifyAuditChain => ledger::verify(db),
+            AdminRequest::ListAuditEntries { limit } => {
+                let cap = limit.unwrap_or(100).clamp(1, 500) as i64;
+                let mut entries: Vec<defsec_protocol::audit::AuditEntry> = rows(
+                    db,
+                    "SELECT entry_json FROM audit_outbox ORDER BY seq_no DESC LIMIT ?1",
+                    [cap],
+                    |r| json_column(r, 0),
+                )?;
+                entries.reverse();
+                Ok(AdminResponse::AuditEntries { entries })
+            }
+            AdminRequest::ListPolicyDecisions { limit } => {
+                let cap = limit.unwrap_or(100).clamp(1, 500) as i64;
+                let decisions = rows(
+                    db,
+                    "SELECT decision_id, proposal_id, actor, request_id, decision_json, created_at
+                     FROM policy_decisions
+                     ORDER BY decision_id DESC
+                     LIMIT ?1",
+                    [cap],
+                    |r| {
+                        Ok(PolicyDecisionRecord {
+                            decision_id: r.get(0)?,
+                            proposal_id: r.get(1)?,
+                            actor: r.get(2)?,
+                            request_id: r.get(3)?,
+                            decision: json_column(r, 4)?,
+                            created_at: parse_stamp(&r.get::<_, String>(5)?, 5)?,
+                        })
+                    },
+                )?;
+                Ok(AdminResponse::PolicyDecisions { decisions })
+            }
         }
     }
 }

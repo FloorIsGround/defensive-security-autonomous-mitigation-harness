@@ -15,12 +15,24 @@ See [adaptive_defensive_monitoring_harness_design_v0.2.md](docs/adaptive_defensi
 | `crates/agent-d` | Lightweight Linux edge daemon (`tokio` single-threaded runtime), 4 built-in collectors (`sockets.listening`, `systemd.unit_state` via `zbus`, `files.metadata` via `openat2`, `journal.unit_events`), `FakeHost` test simulator, edge-lite diffing, and `minimal` (RAM) / `durable` (disk) spools |
 | `crates/control-d` | Authoritative control server: SQLite WAL ledger (`synchronous=FULL`), three-state baseline engine, Ed25519 bundle signer, hash-chained `audit_outbox`, and `SO_PEERCRED`-authenticated UDS servers (`agent.sock`, `admin.sock`, `investigate.sock`) |
 | `crates/admin-cli` | Operator CLI for host enrollment, baseline watch management, attributable baseline promotion, scoped capability token minting, incident closure, and audit chain verification |
+| `crates/mcp-adapter` | Thin Rust stdio MCP server (`--mode read-only` default or `--mode investigator`) bridging external agent clients (T3 Code, Codex, Claude) to `control-d`'s `investigate.sock` |
+| `reasoner/` | Zero-dependency Python 3.12 episodic reasoning worker (`reasoner-d`), replaceable model adapters (OpenAI-compatible/Ollama/vLLM, Anthropic, ScriptedMock), provenance envelopes, and 4-scenario adaptive-vs-static benchmark suite |
+| `console/` | Zero-dependency Node 24 localhost BFF + responsive Operator Web Console (`--demo` or live `control-d` UDS mode) with three-state baseline inspector, guided watch proposal composer, and independent audit-chain verifier |
 
 ## Build & Test
 
 ```bash
-# Run all unit, collector, control-plane, and end-to-end adversarial tests
+# Rust workspace (all 6 crates: unit, collector, control-plane, MCP, and E2E adversarial tests)
 cargo test --workspace
+
+# Python reasoner-d & adaptive-vs-static benchmark suite
+PYTHONPATH=reasoner python3 -m unittest discover -s reasoner/tests -v
+
+# Node 24 Operator Web Console suite
+node --test console/test/server.test.mjs
+
+# Try the Operator Web Console immediately in demo mode
+node console/server.mjs --demo
 
 # Build release binaries
 cargo build --release --workspace

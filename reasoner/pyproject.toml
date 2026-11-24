@@ -1,0 +1,24 @@
+[project]
+name = "defsec-reasoner"
+version = "0.1.0"
+description = "DefSecAutMit Phase 5: optional automated episodic reasoning worker (reasoner-d), model adapters, and the adaptive-vs-static synthetic benchmark harness."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "DefSecAutMit contributors" }]
+keywords = ["security", "monitoring", "llm", "agent", "benchmark"]
+# Zero runtime dependencies: Python 3.12 standard library only.
+dependencies = []
+
+[project.scripts]
+defsec-reasoner = "defsec_reasoner.cli:main"
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["defsec_reasoner"]

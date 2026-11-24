@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use defsec_policy::control_gate::{
     ProposalContext, evaluate_watch_proposal, watch_target_fingerprint,
 };
 use defsec_protocol::{
-    audit::AuditEventType::{FindingRecorded, RunStarted, WatchProposed},
+    audit::AuditEventType::{FindingRecorded, RunCompleted, RunStarted, WatchProposed},
     canonical::sha256_hex,
     rpc::*,
     watch::{CollectorCapability, CollectorType, DataClassification, WatchClass, WatchSpec},
@@ -338,6 +338,208 @@ impl ControlService {
                 InvestigationResponse::FindingRecorded {
                     finding_id,
                     verified_evidence_count: evidence.len(),
+                }
+            }
+            InvestigationRequest::LeaseNextTrigger {
+                lease_owner,
+                lease_seconds,
+            } => {
+                require_investigator(&capability)?;
+                require_text(&lease_owner, "lease_owner", 128)?;
+                if lease_seconds == 0 || lease_seconds > 900 {
+                    return Err(ControlError::invalid(
+                        "lease_seconds must be within 1..=900",
+                    ));
+                }
+                const MAX_RETRIES: u32 = 5;
+                // Reclaim expired leases first (requeue or dead-letter if retries exhausted).
+                db.execute(
+                    "UPDATE trigger_events
+                     SET status = CASE WHEN retry_count + 1 >= ?2 THEN 'dead_letter' ELSE 'pending' END,
+                         retry_count = retry_count + 1,
+                         lease_owner = NULL,
+                         lease_token = NULL,
+                         lease_expires_at = NULL,
+                         updated_at = ?1
+                     WHERE status = 'leased' AND lease_expires_at <= ?1",
+                    params![stamp(now), MAX_RETRIES],
+                )?;
+
+                let host_scope = serde_json::to_string(&capability.allowed_hosts)?;
+                let candidate: Option<(i64, String, String, String, u32, u32, Value)> = db
+                    .query_row(
+                        "SELECT t.event_id, t.incident_id, t.host_id, t.watch_id, t.spec_version, t.retry_count, t.outcome_json
+                         FROM trigger_events t
+                         JOIN incidents i ON i.incident_id = t.incident_id
+                         WHERE t.status = 'pending'
+                           AND i.status = 'open'
+                           AND t.host_id IN (SELECT value FROM json_each(?1))
+                           AND (?2 IS NULL OR t.incident_id = ?2)
+                         ORDER BY t.event_id ASC
+                         LIMIT 1",
+                        params![host_scope, capability.incident_id],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                                json_column(r, 6)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+
+                let lease = if let Some((
+                    event_id,
+                    incident_id,
+                    host_id,
+                    watch_id,
+                    spec_version,
+                    retry_count,
+                    outcome,
+                )) = candidate
+                {
+                    let lease_token = uuid();
+                    let lease_expires_at = now + Duration::seconds(lease_seconds as i64);
+                    db.execute(
+                        "UPDATE trigger_events
+                         SET status = 'leased',
+                             lease_owner = ?2,
+                             lease_token = ?3,
+                             lease_expires_at = ?4,
+                             updated_at = ?5
+                         WHERE event_id = ?1 AND status = 'pending'",
+                        params![
+                            event_id,
+                            lease_owner,
+                            lease_token,
+                            stamp(lease_expires_at),
+                            stamp(now)
+                        ],
+                    )?;
+                    let evidence_observation_ids = rows(
+                        db,
+                        "SELECT observation_id FROM trigger_evidence WHERE event_id = ?1 ORDER BY observation_id ASC",
+                        [event_id],
+                        |r| r.get(0),
+                    )?;
+                    Some(LeasedTrigger {
+                        event_id,
+                        incident_id,
+                        host_id,
+                        watch_id,
+                        spec_version,
+                        lease_token,
+                        lease_expires_at,
+                        retry_count,
+                        outcome,
+                        evidence_observation_ids,
+                    })
+                } else {
+                    None
+                };
+                InvestigationResponse::TriggerLeased { lease }
+            }
+            InvestigationRequest::CompleteTriggerLease {
+                event_id,
+                lease_token,
+                run_id,
+                summary,
+            } => {
+                require_investigator(&capability)?;
+                require_text(&lease_token, "lease_token", 128)?;
+                let incident_id: Option<String> = db
+                    .query_row(
+                        "SELECT incident_id FROM trigger_events
+                         WHERE event_id = ?1 AND status = 'leased' AND lease_token = ?2 AND lease_expires_at > ?3",
+                        params![event_id, lease_token, stamp(now)],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(incident_id) = incident_id else {
+                    return Err(ControlError::denied(
+                        "lease expired, already completed, or fencing token mismatch",
+                    ));
+                };
+                authorize_incident(db, &capability, &incident_id)?;
+                db.execute(
+                    "UPDATE trigger_events
+                     SET status = 'done', lease_expires_at = NULL, updated_at = ?2
+                     WHERE event_id = ?1",
+                    params![event_id, stamp(now)],
+                )?;
+                if let Some(ref rid) = run_id {
+                    db.execute(
+                        "UPDATE agent_runs SET status = 'completed' WHERE run_id = ?1 AND incident_id = ?2",
+                        params![rid, incident_id],
+                    )?;
+                    audit(
+                        db,
+                        RunCompleted,
+                        &capability.principal_id,
+                        request_id,
+                        json!({"run_id": rid, "event_id": event_id, "incident_id": incident_id, "outcome": "completed", "summary": summary}),
+                    )?;
+                }
+                InvestigationResponse::LeaseUpdated {
+                    event_id,
+                    status: "done".into(),
+                }
+            }
+            InvestigationRequest::FailTriggerLease {
+                event_id,
+                lease_token,
+                error,
+                retryable,
+            } => {
+                require_investigator(&capability)?;
+                require_text(&lease_token, "lease_token", 128)?;
+                require_text(&error, "error", 2048)?;
+                const MAX_RETRIES: u32 = 5;
+                let row: Option<(String, u32)> = db
+                    .query_row(
+                        "SELECT incident_id, retry_count FROM trigger_events
+                         WHERE event_id = ?1 AND status = 'leased' AND lease_token = ?2",
+                        params![event_id, lease_token],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((incident_id, retry_count)) = row else {
+                    return Err(ControlError::denied(
+                        "lease not found or fencing token mismatch",
+                    ));
+                };
+                authorize_incident(db, &capability, &incident_id)?;
+                let next_retry = retry_count.saturating_add(1);
+                let next_status = if retryable && next_retry < MAX_RETRIES {
+                    "pending"
+                } else {
+                    "dead_letter"
+                };
+                db.execute(
+                    "UPDATE trigger_events
+                     SET status = ?2,
+                         retry_count = ?3,
+                         lease_owner = NULL,
+                         lease_token = NULL,
+                         lease_expires_at = NULL,
+                         updated_at = ?4
+                     WHERE event_id = ?1",
+                    params![event_id, next_status, next_retry, stamp(now)],
+                )?;
+                audit(
+                    db,
+                    RunCompleted,
+                    &capability.principal_id,
+                    request_id,
+                    json!({"event_id": event_id, "incident_id": incident_id, "outcome": next_status, "retry_count": next_retry, "error": error}),
+                )?;
+                InvestigationResponse::LeaseUpdated {
+                    event_id,
+                    status: next_status.into(),
                 }
             }
         };

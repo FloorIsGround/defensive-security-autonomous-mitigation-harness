@@ -5,3 +5,7 @@
 *.sqlite-shm
 *.sock
 .DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+
