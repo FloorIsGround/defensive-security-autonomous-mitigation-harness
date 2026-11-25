@@ -471,3 +471,120 @@ export function automationSummary(entries) {
       : null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Reasoner activity (Phase 9): investigation runs, run events, trigger queue
+// ---------------------------------------------------------------------------
+
+export const RUN_STATUSES = Object.freeze(['active', 'expired', 'completed', 'budget_exhausted', 'failed', 'cancelled']);
+export const TERMINAL_RUN_STATUSES = Object.freeze(['expired', 'completed', 'budget_exhausted', 'failed', 'cancelled']);
+export const RUN_EVENT_KINDS = Object.freeze(['turn_started', 'tool_call', 'tool_result', 'model_text', 'budget_warning', 'note']);
+export const TRIGGER_STATUSES = Object.freeze(['pending', 'leased', 'done', 'dead_letter']);
+export const REASONER_UNSUPPORTED_MESSAGE = 'reasoner activity requires control-d ≥ Phase 9';
+/** How long a trigger may sit pending with no active automated run before the UI says reasoner-d looks stopped. */
+export const STALL_SECONDS = 120;
+
+const CONSOLE_PRINCIPAL = /^console[-:]/;
+
+/** Operator sessions are opened by this console (or another human frontend); everything else is reasoner-d. */
+export function runOrigin(run) {
+  const backend = String(run?.backend_id ?? '');
+  const principal = String(run?.principal_id ?? '');
+  if (CONSOLE_BACKENDS.has(backend) || CONSOLE_PRINCIPAL.test(principal) || principal === 'console-operator' || run?.model_id === 'human-operator') return 'operator';
+  return 'automated';
+}
+
+// Secrets must never reach the browser even if a future control-d adds them
+// to a free-form object: drop token-ish keys anywhere in the tree. Counters such
+// as `tokens`, `input_tokens` and `output_tokens` are kept.
+const SECRET_KEY = /^(token|lease_token|capability_token|run_token|api_key|secret|password|authorization)$|(^|_)(secret|password)$/i;
+
+export function redactSecrets(value, depth = 0) {
+  if (depth > 8) return null;
+  if (Array.isArray(value)) return value.slice(0, 200).map((v) => redactSecrets(v, depth + 1));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (SECRET_KEY.test(k)) continue;
+      out[k] = redactSecrets(v, depth + 1);
+    }
+    return out;
+  }
+  if (typeof value === 'string' && value.length > 8192) return `${value.slice(0, 8192)}…`;
+  return value;
+}
+
+export function parseRunsQuery({ incident_id = null, host_id = null, limit = null } = {}) {
+  return {
+    incident_id: incident_id ? requireIdent(incident_id, 'incident_id') : null,
+    host_id: host_id ? requireIdent(host_id, 'host_id') : null,
+    limit: int(limit, 'limit', { min: 1, max: 500, optional: true }) ?? 50,
+  };
+}
+
+export function parseEventsQuery(runId, { after_seq = null, limit = null } = {}) {
+  return {
+    run_id: requireIdent(runId, 'run_id'),
+    after_seq: int(after_seq, 'after_seq', { min: -1, optional: true }),
+    limit: int(limit, 'limit', { min: 1, max: 1000, optional: true }) ?? 200,
+  };
+}
+
+export function parseTriggersQuery({ incident_id = null, host_id = null, status = null, limit = null } = {}) {
+  const statuses = status
+    ? [...new Set(String(status).split(',').map((s) => s.trim()).filter(Boolean))].map((s) => requireEnum(s, TRIGGER_STATUSES, 'status'))
+    : null;
+  return {
+    incident_id: incident_id ? requireIdent(incident_id, 'incident_id') : null,
+    host_id: host_id ? requireIdent(host_id, 'host_id') : null,
+    statuses,
+    limit: int(limit, 'limit', { min: 1, max: 500, optional: true }) ?? 100,
+  };
+}
+
+/** Browser-safe RunSummary: the contract's fields plus `origin`, never a token. */
+export function publicRunSummary(r) {
+  const s = redactSecrets(r ?? {});
+  return {
+    run_id: s.run_id,
+    incident_id: s.incident_id,
+    host_id: s.host_id,
+    principal_id: s.principal_id ?? null,
+    backend_id: s.backend_id ?? null,
+    model_id: s.model_id ?? null,
+    status: s.status,
+    started_at: s.started_at ?? null,
+    expires_at: s.expires_at ?? null,
+    ended_at: s.ended_at ?? null,
+    outcome: s.outcome ?? null,
+    last_event: s.last_event ? publicRunEvent(s.last_event) : null,
+    event_count: s.event_count ?? 0,
+    findings_count: s.findings_count ?? 0,
+    proposals_count: s.proposals_count ?? 0,
+    origin: runOrigin(s),
+  };
+}
+
+export function publicRunEvent(e) {
+  const s = redactSecrets(e ?? {});
+  const detail = s.detail && typeof s.detail === 'object' && !Array.isArray(s.detail) ? s.detail : s.detail == null ? {} : { text: String(s.detail) };
+  return { event_seq: s.event_seq, kind: s.kind, detail, created_at: s.created_at ?? null };
+}
+
+/** TriggerSummary without lease tokens (the contract has none; this is defence in depth). */
+export function publicTrigger(t) {
+  const s = redactSecrets(t ?? {});
+  return {
+    event_id: s.event_id,
+    incident_id: s.incident_id ?? null,
+    host_id: s.host_id ?? null,
+    watch_id: s.watch_id ?? null,
+    status: s.status,
+    created_at: s.created_at ?? null,
+    updated_at: s.updated_at ?? null,
+    lease_owner: s.lease_owner ?? null,
+    lease_expires_at: s.lease_expires_at ?? null,
+    retry_count: s.retry_count ?? 0,
+    reason: s.reason ?? null,
+  };
+}
