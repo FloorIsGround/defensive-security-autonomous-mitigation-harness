@@ -26,8 +26,13 @@ const state = {
   auth: null, // { auth_mode, authenticated, user }
   actions: { list: [], denied: null, source: null, admin_sock: null, error: null, loaded: false },
   mit: { filter: 'all', host: '', incident: null },
-  approval: { approver: '', keyFile: '~/.config/defsec/operator.key', keyId: 'operator-01', note: '', envelope: '' },
+  approval: { approver: '', keyFile: null, keyId: null, note: '', envelope: '' },
   changeIndex: new Map(), // `${incident_id}:${observation_id}` -> { addedKeys, removed } from "What changed"
+  reasoner: { loaded: false, available: false, reason: null, message: null, runs: [], triggers: [] },
+  runEvents: new Map(), // run_id -> { events, after, loaded } (fetched incrementally with after_seq)
+  runOpen: new Set(), // run timelines the operator expanded
+  runClosed: new Set(), // active run timelines the operator collapsed
+  rq: { status: 'open', host: '', incident: '' }, // trigger queue / runs filters
   lastRefresh: null,
 };
 
@@ -70,6 +75,8 @@ function applyTheme(theme) {
   for (const b of document.querySelectorAll('[data-theme-choice]')) b.setAttribute('aria-pressed', String(b.dataset.themeChoice === t));
 }
 applyTheme(stored('defsec.theme', 'dark'));
+state.approval.keyFile = stored('defsec.keyFile', '~/.config/defsec/operator.key');
+state.approval.keyId = stored('defsec.keyId', 'operator-01');
 class HttpError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -327,6 +334,7 @@ function renderShell() {
   document.getElementById('nav-incidents').textContent = open ? String(open) : '';
   const pending = awaitingApproval().length;
   document.getElementById('nav-mitigations').textContent = pending ? String(pending) : '';
+  refreshNavReasoner();
   renderUserSlot();
 }
 
@@ -337,6 +345,7 @@ function renderShell() {
 const VIEWS = {
   fleet: { title: 'Fleet & posture', sub: 'Edge agent liveness, automation and audit integrity', render: renderFleet },
   investigations: { title: 'Investigations', sub: 'Observed facts, model hypotheses and verified findings', render: renderInvestigations },
+  reasoner: { title: 'Reasoner activity', sub: 'Automated reasoner-d runs, operator sessions and the trigger queue', render: renderReasoner },
   mitigations: { title: 'Mitigations', sub: 'Typed, TTL-bounded containment: autonomous within policy, dual-signed beyond it', render: renderMitigations },
   baselines: { title: 'Baselines & telemetry', sub: 'Accepted baseline against last and current observed state', render: renderBaselines },
   audit: { title: 'Policy & audit', sub: 'Deterministic policy decisions and the tamper-evident audit chain', render: renderAudit },
@@ -391,7 +400,7 @@ async function refreshAll() {
 }
 
 async function loadCore() {
-  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions(), loadAutomation()]);
+  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions(), loadAutomation(), loadReasoner()]);
   if (h.status === 'fulfilled') state.hosts = h.value.hosts;
   if (i.status === 'fulfilled') state.incidents = i.value.incidents;
 }
@@ -487,43 +496,56 @@ function automationCard() {
   const hosts = state.hosts;
   const watches = sum(hosts, hostWatchCount);
   const cell = (k, dotCls, v, s) => el('div', { class: 'auto-cell' }, el('div', { class: 'k' }, el('span', { class: ['dot', dotCls] }), k), el('div', { class: 'v' }, v), el('div', { class: 's' }, s));
+  const incLink = (id) => el('a', { class: 'mono', href: `#/investigations/${encodeURIComponent(id)}` }, shortId(id));
   const monitoring = cell(
     'Deterministic monitoring',
     hosts.some((h) => h.liveness_status === 'online') ? 'ok' : 'warn',
     hosts.some((h) => h.liveness_status === 'online') ? 'Active' : 'No agent online',
     `${watches} watch${watches === 1 ? '' : 'es'} on ${hosts.length} host${hosts.length === 1 ? '' : 's'}. control-d evaluates triggers and opens incidents without any model.`,
   );
+  const health = reasonerHealth();
   let reasoner;
-  let proposals;
-  if (!a?.available) {
-    reasoner = cell('reasoner-d worker', '', 'Not visible', 'Worker runs are read from the audit log over the admin interface. Start the console with --enable-admin to see them.');
-    proposals = cell('Model-proposed actions', '', '—', 'Needs the admin interface.');
-  } else if (!a.reasoner_runs) {
-    reasoner = cell(
-      'reasoner-d worker',
-      '',
-      'No automated runs seen yet',
-      `Deterministic monitoring is active, but no reasoner-d run appears in the last ${a.window_entries} audit entries. Incidents wait for an operator until reasoner-d is started.`,
+  let queue = null;
+  if (health.state !== 'unavailable' && health.state !== 'loading') {
+    // Live view from control-d's run and trigger tables (Phase 9).
+    const r = health.active[0];
+    const last = health.lastRun;
+    if (health.state === 'working') {
+      reasoner = cell('reasoner-d worker', 'accent', r ? ['Investigating ', incLink(r.incident_id)] : 'Working', r ? [`${plain(r.model_id)} · started `, relTime(r.started_at), health.active.length > 1 ? ` · ${health.active.length} active runs` : ''] : `${plural(health.leased.length, 'trigger')} leased`);
+    } else if (health.state === 'stalled') {
+      reasoner = cell('reasoner-d worker', 'warn', 'Not running?', [`${plural(health.pending.length, 'trigger')} waiting (oldest queued `, relTime(health.oldest), ') with no active run. Start reasoner-d, or work incidents with an operator session.']);
+    } else {
+      reasoner = cell(
+        'reasoner-d worker',
+        last ? 'ok' : '',
+        health.state === 'queued' ? 'Queued' : last ? 'Idle' : 'No automated runs yet',
+        last ? ['Last run ', relTime(last.started_at), ' on ', incLink(last.incident_id), ` · ${plain(last.model_id)}`] : 'No reasoner-d run has been recorded. Incidents wait for an operator until reasoner-d is started.',
+      );
+    }
+    queue = cell(
+      'Trigger queue',
+      health.state === 'stalled' ? 'warn' : health.pending.length || health.leased.length ? 'accent' : '',
+      el('a', { class: 'text-link', href: '#/reasoner' }, `${health.pending.length} pending · ${health.leased.length} leased`),
+      health.dead.length ? el('span', { class: 'warn-text' }, `${plural(health.dead.length, 'trigger')} dead-lettered after retries`) : 'Watch triggers waiting for or held by reasoner-d.',
     );
-    proposals = cell('Model-proposed actions', '', '0', 'Operators can propose mitigations from any active investigation run.');
+  } else if (!a?.available) {
+    reasoner = cell('reasoner-d worker', '', 'Not visible', health.message ? `${health.message}. Worker runs are otherwise read from the audit log, which needs --enable-admin.` : 'Worker runs are read from the audit log over the admin interface. Start the console with --enable-admin to see them.');
+  } else if (!a.reasoner_runs) {
+    reasoner = cell('reasoner-d worker', '', 'No automated runs seen yet', `Deterministic monitoring is active, but no reasoner-d run appears in the last ${a.window_entries} audit entries. Incidents wait for an operator until reasoner-d is started.`);
   } else {
     const last = a.last_run;
-    reasoner = cell(
-      'reasoner-d worker',
-      'ok',
-      ['Last run ', relTime(last.at)],
-      [`${a.reasoner_runs} run${a.reasoner_runs === 1 ? '' : 's'} in window · `, el('span', { class: 'mono' }, last.model_id ?? 'model'), ` via ${last.backend_id ?? 'backend'}`, last.incident_id ? [' on ', el('a', { class: 'mono', href: `#/investigations/${encodeURIComponent(last.incident_id)}` }, shortId(last.incident_id))] : null],
-    );
-    proposals = cell(
-      'Model-proposed actions',
-      a.action_proposals ? 'accent' : '',
-      `${a.action_proposals} proposed`,
-      a.action_proposals
-        ? `${a.watch_proposals} watch proposals and ${a.findings} findings from reasoner-d in the same window.`
-        : 'reasoner-d proposes mitigations only when action proposals are enabled in its run budgets (off by default).',
-    );
+    reasoner = cell('reasoner-d worker', 'ok', ['Last run ', relTime(last.at)], [`${a.reasoner_runs} run${a.reasoner_runs === 1 ? '' : 's'} in window · `, el('span', { class: 'mono' }, last.model_id ?? 'model'), ` via ${last.backend_id ?? 'backend'}`, last.incident_id ? [' on ', incLink(last.incident_id)] : null]);
   }
-  return card('Automation', null, el('div', { class: 'auto-grid' }, monitoring, reasoner, proposals), state.automation?.available ? el('span', { class: 'muted small' }, 'From the audit log') : null);
+  let proposals;
+  if (!a?.available) proposals = cell('Model-proposed actions', '', '—', 'Counted from the audit log, which needs the admin interface.');
+  else if (!a.action_proposals) proposals = cell('Model-proposed actions', '', '0', a.reasoner_runs ? 'reasoner-d proposes mitigations only when action proposals are enabled in its run budgets (off by default).' : 'Operators can propose mitigations from an operator session on any open incident.');
+  else proposals = cell('Model-proposed actions', 'accent', `${a.action_proposals} proposed`, `${a.watch_proposals} watch proposals and ${a.findings} findings from reasoner-d in the audit window.`);
+  return card(
+    'Automation',
+    null,
+    el('div', { class: ['auto-grid', queue && 'has-queue'] }, monitoring, reasoner, queue, proposals),
+    el('a', { class: 'btn btn-sm btn-ghost', href: '#/reasoner' }, 'Reasoner activity', icon('arrow')),
+  );
 }
 
 function hostCard(h, incidents) {
@@ -599,6 +621,7 @@ function incidentItem(i, current) {
     'a',
     { class: ['inc-item', i.status !== 'open' && 'closed'], href: `#/investigations/${encodeURIComponent(i.incident_id)}`, title: i.incident_id, attrs: { 'aria-current': i.incident_id === current ? 'true' : null } },
     el('div', { class: 'top' }, sevBadge(i.priority), el('span', { class: 'id' }, shortId(i.incident_id)), el('span', { class: 'spacer' }), i.status !== 'open' ? el('span', { class: 'badge ghost' }, cap(i.status)) : null),
+    i.status === 'open' ? el('div', { class: 'inc-marker', dataset: { reasonerSlot: i.incident_id } }, incidentReasonerBadge(i.incident_id)) : null,
     el('div', { class: 'summary' }, i.summary),
     el('div', { class: 'meta' }, el('span', { class: 'mono' }, i.host_id), el('span', null, 'updated ', relTime(i.updated_at))),
   );
@@ -748,12 +771,12 @@ function workspaceView(ctx, caps) {
     : null;
 
   const runControls = !isOpen
-    ? el('span', { class: 'badge ghost' }, 'Closed · runs ended')
+    ? el('span', { class: 'badge ghost' }, 'Closed · sessions ended')
     : !canMutate()
       ? el('span', { class: 'badge ghost', title: 'Observer accounts are read-only' }, icon('eye'), 'Read-only')
       : ctx.run
-        ? el('span', { class: 'run-chip', title: `Run ${ctx.run.run_id}` }, el('span', { class: 'dot accent' }), 'Run ', el('span', { class: 'mono' }, ctx.run.run_id.slice(0, 8)), el('span', { class: 'muted' }, '·'), relTime(ctx.run.expires_at, { until: true }))
-        : el('button', { class: 'btn btn-primary btn-sm', type: 'button', on: { click: (e) => startRun(inc.incident_id, e.currentTarget) } }, icon('flask'), 'Start investigation run');
+        ? el('span', { class: 'run-chip', title: `Your operator session ${ctx.run.run_id}: a manual session, separate from automated reasoner-d runs` }, el('span', { class: 'dot accent' }), 'Operator session ', el('span', { class: 'mono' }, String(ctx.run.run_id).slice(0, 8)), el('span', { class: 'muted' }, '·'), relTime(ctx.run.expires_at, { until: true }))
+        : startSessionButton(inc.incident_id);
 
   const head = el(
     'header',
@@ -799,6 +822,7 @@ function workspaceView(ctx, caps) {
   const main = el(
     'div',
     { class: 'ws-main' },
+    reasonerCard(inc),
     changesSlot,
     el('div', { class: 'assess' }, lane('Model hypotheses', 'hyp', hyps, 'Unverified model or operator assertions appear here.'), lane('Verified findings', 'ver', vers, 'Evidence-bound conclusions appear here.')),
     card(
@@ -816,8 +840,8 @@ function workspaceView(ctx, caps) {
   const evidenceCtx = { selected, obs, obsMap, listeners: evidenceListeners };
   const buildPanel = (id) => {
     if (id === 'watches') return watchesPanel(ctx.active_watches, ctx.watch_runtime ?? {}, inc);
-    if (!isOpen) return tabPanel('Incident closed. Its ephemeral watches were retired; runs, proposals and findings are no longer accepted.', null);
-    if (!canMutate()) return tabPanel('Observer accounts can review evidence, findings and mitigations, but cannot start runs, propose watches or actions, or record findings.', null);
+    if (!isOpen) return tabPanel('Incident closed. Its ephemeral watches were retired; operator sessions, proposals and findings are no longer accepted.', null);
+    if (!canMutate()) return tabPanel('Observer accounts can review evidence, findings, reasoner runs and mitigations, but cannot start operator sessions, propose watches or actions, or record findings.', null);
     if (id === 'propose') return proposalComposer(inc, ctx.run, caps);
     if (id === 'finding') return findingComposerView(inc, ctx.run, obsMap, evidenceCtx);
     return actionComposer(inc, ctx.run, evidenceCtx);
@@ -1234,6 +1258,13 @@ function watchRow(w, rt) {
 
 // ----- run lifecycle -----
 
+const SESSION_HELP =
+  'Opens a manual session for you, the human operator, so you can propose watches, record findings and propose mitigations yourself. It does not start the model: automated reasoner-d runs begin on their own when a trigger is leased from the queue (see Reasoner activity).';
+
+function startSessionButton(incidentId) {
+  return el('button', { class: 'btn btn-primary btn-sm', type: 'button', title: SESSION_HELP, on: { click: (e) => startRun(incidentId, e.currentTarget) } }, icon('user'), 'Start operator session');
+}
+
 async function startRun(incidentId, btn = null) {
   if (btn) btn.disabled = true;
   try {
@@ -1241,7 +1272,7 @@ async function startRun(incidentId, btn = null) {
       method: 'POST',
       body: { backend_id: 'operator-console', model_id: 'human-operator', prompt_schema_version: 'console.v1' },
     });
-    toast(`Investigation run ${run.run_id.slice(0, 8)} started`, 'ok');
+    toast(`Operator session ${String(run.run_id).slice(0, 8)} started`, 'ok');
     reloadWorkspace(incidentId);
     return null;
   } catch (err) {
@@ -1253,7 +1284,7 @@ async function startRun(incidentId, btn = null) {
 
 function runLock(inc, label) {
   const errSlot = el('div');
-  const btn = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, icon('flask'), 'Start investigation run');
+  const btn = el('button', { class: 'btn btn-primary btn-sm', type: 'button', title: SESSION_HELP }, icon('user'), 'Start operator session');
   btn.addEventListener('click', async () => {
     replace(errSlot);
     const err = await startRun(inc.incident_id, btn);
@@ -1263,7 +1294,7 @@ function runLock(inc, label) {
     'div',
     { class: 'lock-overlay' },
     icon('lock'),
-    el('p', null, `${label} needs an active investigation run. Each run gets its own token scoped to this incident and host, and expires automatically.`),
+    el('p', null, `${label} needs an operator session: a manual, time-limited session for you, separate from automated reasoner-d runs. It gets its own token scoped to this incident and host and expires on its own.`),
     btn,
     errSlot,
   );
@@ -1330,6 +1361,30 @@ function check(obj, key, label) {
 function field(label, control, hint = null) {
   return el('div', { class: 'field' }, el('label', null, label), control, hint);
 }
+
+/**
+ * Keep a submit button disabled, with the reason beside it, until the form has
+ * the input the backend genuinely requires. Server-side validation still runs.
+ */
+function guardSubmit(form, btn, note, missing, idle = 'control-d decides') {
+  const check = () => {
+    const m = missing();
+    btn.disabled = Boolean(m);
+    note.textContent = m ?? idle;
+    note.classList.toggle('warn-text', Boolean(m));
+  };
+  form.addEventListener('input', check);
+  form.addEventListener('change', check);
+  check();
+  return check;
+}
+
+const watchTargetText = (d) => {
+  const p = d.parameters;
+  if (d.collector_type === 'files.metadata') return String(p.paths ?? '').split(/[\n,]/).map((x) => x.trim()).filter(Boolean).join(', ');
+  if (d.collector_type === 'sockets.listening') return 'listening sockets';
+  return String(p.unit ?? '').trim();
+};
 
 function proposalComposer(inc, run, caps) {
   const d = draftsFor(inc.incident_id).proposal;
@@ -1514,6 +1569,12 @@ function proposalComposer(inc, run, caps) {
     const ttl = numInput(d, 'ttl_minutes', { min: 1, onInput: updateHints });
     const mr = numInput(d, 'max_runs', { min: 1, onInput: updateHints });
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to policy gate');
+    const note = el('span', { class: 'form-note' });
+    // A sensible rationale is generated from the target until the operator edits it.
+    const autoRationale = () => `Temporary ${d.collector_type} watch on ${watchTargetText(d) || 'the target'} while ${shortId(inc.incident_id)} is investigated.`;
+    if (!d.rationaleEdited) d.rationale = autoRationale();
+    const rationale = textArea(d, 'rationale', { placeholder: 'Why this temporary watch is needed for the investigation…', rows: 2 });
+    rationale.addEventListener('input', () => (d.rationaleEdited = Boolean(rationale.value.trim())));
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1523,13 +1584,23 @@ function proposalComposer(inc, run, caps) {
       triggerFields(),
       el('div', { class: 'grid-2' }, field('Interval (s)', iv), field('Timeout (s)', to), field('TTL (min)', ttl), field('Max runs', mr)),
       hintNode,
-      field('Rationale', textArea(d, 'rationale', { placeholder: 'Why this temporary watch is needed for the investigation…', rows: 2 })),
+      field('Rationale', rationale, el('span', { class: 'hint' }, 'Pre-filled from the target; edit it if there is more to say.')),
       el('details', { class: 'preview' }, el('summary', null, 'Request preview'), jsonBlock({ ...requestBody(), run_id: run?.run_id ? `${run.run_id.slice(0, 8)}…` : null })),
-      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
+      el('div', { class: 'form-actions' }, note, submitBtn),
     );
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('input', (e) => {
+      if (e.target !== rationale && !d.rationaleEdited) rationale.value = d.rationale = autoRationale();
+    });
+    const recheck = guardSubmit(form, submitBtn, note, () => {
+      if ((d.collector_type === 'systemd.unit_state' || d.collector_type === 'journal.unit_events') && !String(d.parameters.unit ?? '').trim()) return 'Enter the unit to watch.';
+      if (d.collector_type === 'files.metadata' && !watchTargetText(d)) return 'Enter at least one path.';
+      if (!String(d.rationale ?? '').trim()) return 'Add a rationale.';
+      return null;
+    });
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      submit(submitBtn);
+      await submit(submitBtn);
+      recheck();
     });
     replace(body, form, result);
     updateHints();
@@ -1593,6 +1664,7 @@ function findingComposerView(inc, run, obsMap, ev) {
       el('button', { type: 'button', attrs: { 'aria-pressed': String(d.kind === 'verified_finding') }, on: { click: () => { d.kind = 'verified_finding'; draw(); } } }, 'Verified finding'),
     );
     const btn = el('button', { class: 'btn btn-primary', type: 'submit' }, d.kind === 'verified_finding' ? 'Record verified finding' : 'Record hypothesis');
+    const note = el('span', { class: 'form-note' });
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1601,8 +1673,10 @@ function findingComposerView(inc, run, obsMap, ev) {
       field('Uncertainty', textArea(d, 'uncertainty', { placeholder: 'What is not yet established, alternative explanations…', rows: 2 })),
       el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence observations'), evNode, evHint),
       el('div', { class: 'checks' }, check(d, 'escalation_requested', 'Request escalation to operator')),
-      el('div', { class: 'form-actions' }, btn),
+      el('div', { class: 'form-actions' }, note, btn),
     );
+    const recheck = guardSubmit(form, btn, note, () => (!d.summary.trim() ? 'Write a summary.' : d.kind === 'verified_finding' && !selected.size ? 'Cite at least one observation.' : null), 'Bound to the cited evidence');
+    ev.listeners.add(recheck);
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       btn.disabled = true;
@@ -1619,7 +1693,7 @@ function findingComposerView(inc, run, obsMap, ev) {
         reloadWorkspace(inc.incident_id);
       } catch (err) {
         toast(`${err.code}: ${err.message}`, 'bad');
-        btn.disabled = false;
+        recheck();
       }
     });
     replace(body, form);
@@ -1875,6 +1949,7 @@ function actionComposer(inc, run, ev) {
       ),
     );
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to action gate');
+    const note = el('span', { class: 'form-note' });
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1882,7 +1957,10 @@ function actionComposer(inc, run, ev) {
       verbFields(),
       el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence', citeLatest), evNode, evHint),
       justification,
-      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
+      el('div', { class: 'form-actions' }, note, submitBtn),
+    );
+    const recheck = guardSubmit(form, submitBtn, note, () =>
+      d.verb === 'nft_block_ip' && !d.ip.trim() ? 'Enter the IP address to block.' : d.verb === 'systemd_stop_unit' && !d.unit.trim() ? 'Enter the unit to stop.' : null,
     );
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1899,7 +1977,7 @@ function actionComposer(inc, run, ev) {
       } catch (err) {
         toast(`${err.code}: ${err.message}`, 'bad');
       } finally {
-        submitBtn.disabled = false;
+        recheck();
       }
     });
     replace(body, form, result);
@@ -1989,6 +2067,714 @@ function changesCard(inc, r) {
       'changes',
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoner activity: automated reasoner-d runs, operator sessions, trigger queue
+// ---------------------------------------------------------------------------
+
+const RUN_STATUS = {
+  active: ['live', 'Active'],
+  completed: ['ok', 'Completed'],
+  budget_exhausted: ['warn', 'Budget exhausted'],
+  failed: ['bad', 'Failed'],
+  cancelled: ['ghost', 'Cancelled'],
+  expired: ['ghost', 'Expired'],
+};
+const TRIGGER_STATUS = { pending: ['warn', 'Pending'], leased: ['live', 'Leased'], done: ['ok', 'Done'], dead_letter: ['bad', 'Dead letter'] };
+const EVENT_KINDS = { turn_started: 'Turn', tool_call: 'Tool call', tool_result: 'Result', model_text: 'Model', budget_warning: 'Budget', note: 'Note' };
+const STALL_MS = 120_000;
+const QUEUE_FILTERS = [
+  ['open', 'Open', 'pending,leased'],
+  ['pending', 'Pending', 'pending'],
+  ['leased', 'Leased', 'leased'],
+  ['dead_letter', 'Dead letter', 'dead_letter'],
+  ['done', 'Done', 'done'],
+  ['all', 'All', ''],
+];
+
+const enc = encodeURIComponent;
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** Any free-form value as readable text: never "undefined", "null" or "[object Object]". */
+function plain(v, max = 400) {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'number') return Number.isFinite(v) ? v.toLocaleString() : '—';
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  let s;
+  try {
+    s = typeof v === 'string' ? v : JSON.stringify(v);
+  } catch {
+    s = '—';
+  }
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+const detailText = (d) =>
+  Object.entries(d ?? {})
+    .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${plain(v, 160)}`)
+    .join(' · ') || '—';
+
+function fmtTokens(n) {
+  if (!Number.isFinite(n)) return '—';
+  return n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+function duration(fromIso, toIso) {
+  const s = Math.max(0, Math.round((Date.parse(toIso) - Date.parse(fromIso)) / 1000));
+  if (!Number.isFinite(s)) return '—';
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60 ? `${s % 60}s` : ''}`.trim();
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+function runStatusBadge(status) {
+  const [cls, label] = RUN_STATUS[status] ?? ['', cap(String(status ?? 'unknown').replace(/_/g, ' '))];
+  return el('span', { class: ['badge', cls] }, cls === 'live' ? el('span', { class: 'dot accent pulse' }) : null, label);
+}
+
+function triggerStatusBadge(status) {
+  const [cls, label] = TRIGGER_STATUS[status] ?? ['', cap(String(status ?? 'unknown').replace(/_/g, ' '))];
+  return el('span', { class: ['badge', cls] }, cls === 'live' ? el('span', { class: 'dot accent pulse' }) : null, label);
+}
+
+function originBadge(run) {
+  return run.origin === 'operator'
+    ? el('span', { class: 'badge ghost', title: `Manual session opened by ${plain(run.principal_id)} from an operator console` }, icon('user'), 'Operator session')
+    : el('span', { class: 'badge solid', title: `Automated run by ${plain(run.principal_id)} via ${plain(run.backend_id)}` }, icon('cpu'), 'reasoner-d');
+}
+
+async function loadReasoner() {
+  try {
+    const [r, t] = await Promise.all([api('/api/runs?limit=100'), api('/api/triggers?status=pending,leased,dead_letter&limit=200')]);
+    const off = r.available === false ? r : t.available === false ? t : null;
+    state.reasoner = { loaded: true, available: !off, reason: off?.reason ?? null, message: off?.message ?? null, runs: r.runs ?? [], triggers: t.triggers ?? [] };
+  } catch (err) {
+    state.reasoner = { loaded: true, available: false, reason: err.code, message: err.message, runs: [], triggers: [] };
+  }
+}
+
+/** Is reasoner-d doing anything? `stalled` = triggers waiting > 2 min with no active run or lease. */
+function reasonerHealth(now = Date.now()) {
+  const R = state.reasoner;
+  if (!R.loaded) return { state: 'loading' };
+  if (!R.available) return { state: 'unavailable', message: R.message };
+  const auto = R.runs.filter((r) => r.origin === 'automated');
+  const active = auto.filter((r) => r.status === 'active');
+  const pending = R.triggers.filter((t) => t.status === 'pending');
+  const leased = R.triggers.filter((t) => t.status === 'leased');
+  const dead = R.triggers.filter((t) => t.status === 'dead_letter');
+  const oldestMs = pending.reduce((m, t) => Math.min(m, Date.parse(t.created_at) || Infinity), Infinity);
+  const lastActivity = auto.reduce((m, r) => Math.max(m, Date.parse(r.ended_at ?? r.started_at) || 0), 0);
+  const quiet = !active.length && !leased.length && now - lastActivity > STALL_MS;
+  const stalled = pending.length > 0 && quiet && now - oldestMs > STALL_MS;
+  return {
+    state: active.length || leased.length ? 'working' : stalled ? 'stalled' : pending.length ? 'queued' : 'idle',
+    active,
+    pending,
+    leased,
+    dead,
+    quiet,
+    oldest: Number.isFinite(oldestMs) ? new Date(oldestMs).toISOString() : null,
+    lastRun: auto.reduce((m, r) => (!m || Date.parse(r.started_at) > Date.parse(m.started_at) ? r : m), null),
+  };
+}
+
+const pendingStalled = (t, health) => t.status === 'pending' && health.quiet && Date.now() - Date.parse(t.created_at) > STALL_MS;
+
+/** "Queued for reasoner" / "Reasoner working" marker for an incident (list rows and the workspace head). */
+function incidentReasonerBadge(incidentId) {
+  const R = state.reasoner;
+  if (!R.available) return null;
+  const trig = R.triggers.filter((t) => t.incident_id === incidentId);
+  const working = trig.some((t) => t.status === 'leased') || R.runs.some((r) => r.incident_id === incidentId && r.origin === 'automated' && r.status === 'active');
+  if (working) return el('span', { class: 'badge live', title: 'reasoner-d is investigating this incident now' }, el('span', { class: 'dot accent pulse' }), 'Reasoner working');
+  const pending = trig.filter((t) => t.status === 'pending');
+  if (!pending.length) return null;
+  const stuck = pending.some((t) => pendingStalled(t, reasonerHealth()));
+  return el(
+    'span',
+    { class: ['badge', 'warn'], title: stuck ? 'Waiting for reasoner-d for more than 2 minutes; it may not be running' : `${plural(pending.length, 'trigger')} waiting for reasoner-d` },
+    icon('clock'),
+    stuck ? 'Queued · reasoner idle' : 'Queued for reasoner',
+  );
+}
+
+/** Update incident-list markers in place after a background refresh (the list itself is not re-rendered). */
+function refreshIncidentMarkers() {
+  for (const slot of document.querySelectorAll('[data-reasoner-slot]')) replace(slot, incidentReasonerBadge(slot.dataset.reasonerSlot));
+}
+
+// ----- live polling with backoff -----
+
+const pollers = new Set();
+
+/**
+ * Re-run `fn` while `node` stays in the document: every `fast` ms while
+ * `busy()` (an active run), otherwise every `slow` ms. While the tab is hidden
+ * the delay doubles each round (up to 2 min); it snaps back when visible.
+ */
+function livePoll(node, fn, { fast = 4000, slow = 20_000, busy = () => false } = {}) {
+  let timer = null;
+  let hidden = 0;
+  let first = true;
+  let stopped = false;
+  const p = {
+    async run() {
+      clearTimeout(timer);
+      if (stopped) return;
+      if (!first && !node.isConnected) return p.stop();
+      first = false;
+      try {
+        await fn();
+      } catch {
+        /* fn renders its own errors */
+      }
+      if (stopped || !node.isConnected) return p.stop();
+      const base = busy() ? fast : slow;
+      const delay = document.hidden ? Math.min(120_000, base * 2 ** Math.min(5, ++hidden)) : ((hidden = 0), base);
+      timer = setTimeout(p.run, delay);
+    },
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
+      pollers.delete(p);
+    },
+    kick() {
+      if (!stopped && !document.hidden) p.run();
+    },
+  };
+  pollers.add(p);
+  return p;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) for (const p of pollers) p.kick();
+});
+
+// ----- one run: summary + expandable timeline -----
+
+function eventSummary(e) {
+  const d = e.detail ?? {};
+  switch (e.kind) {
+    case 'turn_started':
+      return `Turn ${plain(d.turn)} started${d.tokens != null ? ` · ${plain(d.tokens)} tokens` : ''}`;
+    case 'tool_call':
+      return `Calling ${plain(d.tool)}`;
+    case 'tool_result':
+      return `${plain(d.tool)} ${d.ok === false ? 'failed' : d.accepted === false ? `denied${d.code ? ` (${plain(d.code)})` : ''}` : d.accepted ? 'accepted' : 'returned'}`;
+    case 'model_text':
+      return plain(d.text, 160);
+    case 'budget_warning':
+      return `${plain(d.budget)} budget${d.used != null ? ` ${plain(d.used)} of ${plain(d.limit)}` : ''}${d.stop ? ' · stopped' : ''}`;
+    case 'note':
+      return plain(d.text ?? detailText(d), 160);
+    default:
+      return detailText(d);
+  }
+}
+
+function eventRow(e) {
+  const d = e.detail ?? {};
+  let main;
+  switch (e.kind) {
+    case 'turn_started':
+      main = [el('b', null, `Turn ${plain(d.turn)}`), d.tokens != null ? el('span', { class: 'muted' }, ` · ${plain(d.tokens)} tokens in context`) : null];
+      break;
+    case 'tool_call':
+      main = [el('span', { class: 'mono tl-tool' }, plain(d.tool)), d.args_preview ? el('code', { class: 'tl-args' }, plain(d.args_preview, 600)) : null];
+      break;
+    case 'tool_result': {
+      const failed = d.ok === false;
+      const verdict = failed ? ['bad', 'error'] : d.accepted === false ? ['warn', 'denied'] : d.accepted === true ? ['ok', 'accepted'] : ['', 'ok'];
+      main = el(
+        'div',
+        { class: 'row' },
+        el('span', { class: 'mono tl-tool' }, plain(d.tool)),
+        el('span', { class: ['badge', verdict[0]] }, verdict[1]),
+        d.code ? el('span', { class: ['rule-pill', failed || d.accepted === false ? 'bad' : 'ok'], title: 'Gate rule or error code' }, plain(d.code, 120)) : null,
+      );
+      break;
+    }
+    case 'model_text':
+      main = el('p', { class: 'tl-text' }, plain(d.text, 4000));
+      break;
+    case 'budget_warning':
+      main = el(
+        'div',
+        { class: 'row' },
+        el('b', null, `${cap(plain(d.budget).replace(/_/g, ' '))} budget`),
+        d.used != null ? el('span', { class: 'num' }, `${plain(d.used)} of ${plain(d.limit)} used`) : null,
+        d.stop ? el('span', { class: 'badge warn' }, 'Run stopped') : null,
+      );
+      break;
+    case 'note':
+      main = el('span', null, plain(d.text ?? detailText(d), 2000));
+      break;
+    default:
+      main = el('span', { class: 'dim' }, detailText(d));
+  }
+  const known = Object.hasOwn(EVENT_KINDS, e.kind);
+  return el(
+    'li',
+    { class: ['tl-item', known && `k-${e.kind}`] },
+    el('span', { class: 'tl-time num', title: e.created_at ? fullFmt.format(new Date(e.created_at)) : '' }, fmtTime(e.created_at)),
+    el('span', { class: 'tl-kind' }, known ? EVENT_KINDS[e.kind] : plain(e.kind, 24)),
+    el('div', { class: 'tl-main' }, main),
+  );
+}
+
+function runStats(run, events) {
+  const o = run.outcome;
+  if (run.origin === 'operator') {
+    // A human session has no turns or tokens: show what the operator submitted.
+    const steps = events.length ? events.filter((e) => e.kind === 'tool_call').length : null;
+    const chip = (label, value) => el('span', { class: 'stat-chip' }, el('b', { class: 'num' }, value), ` ${label}`);
+    return el(
+      'div',
+      { class: 'run-stats' },
+      steps !== null ? chip(steps === 1 ? 'submission' : 'submissions', String(steps)) : null,
+      chip(run.findings_count === 1 ? 'finding' : 'findings', String(run.findings_count ?? 0)),
+      chip(run.proposals_count === 1 ? 'proposal' : 'proposals', String(run.proposals_count ?? 0)),
+    );
+  }
+  const derived = !o && events.length
+    ? {
+        turns: events.filter((e) => e.kind === 'turn_started').length,
+        tool_calls: events.filter((e) => e.kind === 'tool_call').length,
+      }
+    : null;
+  const s = o ?? derived;
+  const chip = (label, value, title = null) => el('span', { class: 'stat-chip', title }, el('b', { class: 'num' }, value), ` ${label}`);
+  return el(
+    'div',
+    { class: 'run-stats' },
+    s ? chip(s.turns === 1 ? 'turn' : 'turns', String(s.turns)) : null,
+    s ? chip(s.tool_calls === 1 ? 'tool call' : 'tool calls', String(s.tool_calls)) : null,
+    o ? chip('tokens', `${fmtTokens(o.input_tokens)} in · ${fmtTokens(o.output_tokens)} out`, `${plain(o.input_tokens)} input / ${plain(o.output_tokens)} output tokens`) : null,
+    !s ? chip(run.event_count === 1 ? 'event' : 'events', String(run.event_count ?? 0)) : null,
+    chip(run.findings_count === 1 ? 'finding' : 'findings', String(run.findings_count ?? 0)),
+    chip(
+      run.proposals_count === 1 ? 'proposal' : 'proposals',
+      o && o.proposals ? `${o.proposals_accepted}/${o.proposals}` : String(run.proposals_count ?? 0),
+      o && o.proposals ? `${o.proposals_accepted} of ${o.proposals} proposals accepted by the gate` : null,
+    ),
+  );
+}
+
+/**
+ * A run card with live state. `update(run)` redraws the summary in place;
+ * `pull()` fetches only events after the last seen event_seq.
+ */
+function runItem(initial, { showIncident = false } = {}) {
+  let run = initial;
+  if (!state.runEvents.has(run.run_id)) state.runEvents.set(run.run_id, { events: [], after: null, loaded: false, loading: false });
+  const cache = state.runEvents.get(run.run_id);
+  const head = el('div', { class: 'run-head' });
+  const summary = el('div', { class: 'run-summary' });
+  const list = el('ol', { class: 'timeline', attrs: { 'aria-label': 'Run events, newest first' } });
+  const tlNote = el('div', { class: 'tl-note' });
+  const toggle = el('button', { class: 'toggle run-toggle', type: 'button', attrs: { 'aria-expanded': 'false' } }, icon('chevron'), el('span', null, 'Timeline'));
+  const timeline = el('div', { class: 'run-timeline', hidden: true }, tlNote, list);
+  // Automated runs in progress open on their live timeline; operator sessions stay compact.
+  let expanded = state.runOpen.has(run.run_id) || (run.status === 'active' && run.origin === 'automated' && !state.runClosed.has(run.run_id));
+
+  function drawTimeline() {
+    replace(list, [...cache.events].reverse().map(eventRow));
+    replace(
+      tlNote,
+      !cache.loaded
+        ? el('span', { class: 'muted small' }, 'Loading events…')
+        : cache.error
+          ? errorBox(cache.error)
+          : !cache.events.length
+            ? el('span', { class: 'muted small' }, run.status === 'active' ? 'No events yet. They appear here as the run works.' : 'This run recorded no events.')
+            : run.status === 'active'
+              ? el('span', { class: 'muted small live-note' }, el('span', { class: 'dot accent pulse' }), 'Live · newest first · refreshes every few seconds')
+              : el('span', { class: 'muted small' }, `${plural(cache.events.length, 'event')} · newest first`),
+    );
+  }
+
+  async function pull() {
+    if (cache.loading) return;
+    cache.loading = true;
+    try {
+      for (let page = 0; page < 10; page++) {
+        const qs = new URLSearchParams({ limit: '200' });
+        if (cache.after !== null && cache.after !== undefined) qs.set('after_seq', String(cache.after));
+        const r = await api(`/api/runs/${enc(run.run_id)}/events?${qs}`);
+        if (r.available === false) {
+          cache.error = { code: r.reason ?? 'unavailable', message: r.message ?? 'run events are not available' };
+          break;
+        }
+        cache.error = null;
+        const fresh = (r.events ?? []).filter((e) => cache.after === null || e.event_seq > cache.after);
+        cache.events.push(...fresh);
+        if (fresh.length) cache.after = fresh.at(-1).event_seq;
+        if ((r.events ?? []).length < 200) break;
+      }
+    } catch (err) {
+      cache.error = err;
+    } finally {
+      cache.loaded = true;
+      cache.loading = false;
+    }
+    if (expanded) drawTimeline();
+    drawSummary();
+  }
+
+  function setExpanded(open) {
+    expanded = open;
+    toggle.setAttribute('aria-expanded', String(open));
+    timeline.hidden = !open;
+    if (open) {
+      state.runOpen.add(run.run_id);
+      state.runClosed.delete(run.run_id);
+      drawTimeline();
+      if (!cache.loaded || run.status === 'active') pull();
+    } else {
+      state.runOpen.delete(run.run_id);
+      state.runClosed.add(run.run_id);
+    }
+    drawSummary();
+  }
+  toggle.addEventListener('click', () => setExpanded(!expanded));
+
+  function drawHead() {
+    const ended = run.ended_at;
+    replace(
+      head,
+      el(
+        'div',
+        { class: 'row' },
+        runStatusBadge(run.status),
+        originBadge(run),
+        idChip(run.run_id, { title: 'Run' }),
+        showIncident && run.incident_id ? el('a', { class: 'mono small', href: `#/investigations/${enc(run.incident_id)}`, title: `Open incident ${run.incident_id}` }, shortId(run.incident_id)) : null,
+        el('span', { class: 'spacer' }),
+        toggle,
+      ),
+      el(
+        'div',
+        { class: 'run-meta' },
+        run.origin === 'automated'
+          ? el('span', { class: 'mono' }, plain(run.model_id))
+          : el('span', null, 'by ', el('span', { class: 'mono' }, plain(run.principal_id))),
+        run.origin === 'automated' && run.backend_id ? el('span', null, 'via ', el('span', { class: 'mono' }, run.backend_id)) : null,
+        showIncident && run.host_id ? el('span', { class: 'mono' }, run.host_id) : null,
+        el('span', null, 'started ', relTime(run.started_at)),
+        ended
+          ? el('span', null, `ran ${duration(run.started_at, ended)}`)
+          : run.status === 'active' && run.expires_at
+            ? el('span', null, 'expires ', relTime(run.expires_at, { until: true }))
+            : null,
+      ),
+    );
+  }
+
+  function drawSummary() {
+    const latest = cache.events.at(-1) ?? run.last_event;
+    replace(
+      summary,
+      runStats(run, cache.events),
+      run.outcome?.summary ? el('p', { class: 'run-outcome' }, run.outcome.summary) : null,
+      run.outcome?.budget_stop_reason ? el('div', { class: 'small warn-text' }, 'Stopped on budget: ', el('span', { class: 'mono' }, run.outcome.budget_stop_reason)) : null,
+      !expanded && run.status === 'active' && latest
+        ? el('div', { class: 'run-latest' }, el('span', { class: 'dot accent pulse' }), el('span', { class: 'muted' }, 'Latest'), el('span', { class: 'txt' }, eventSummary(latest)), relTime(latest.created_at))
+        : null,
+    );
+  }
+
+  const node = el('article', { class: ['run', run.origin === 'operator' && 'is-operator'] }, head, summary, timeline);
+
+  function update(next) {
+    const wasActive = run.status === 'active';
+    run = next;
+    node.classList.toggle('is-operator', run.origin === 'operator');
+    drawHead();
+    drawSummary();
+    // One last fetch when a run finishes, so the timeline ends with its final events.
+    if (expanded && (run.status === 'active' || wasActive)) pull();
+  }
+
+  drawHead();
+  drawSummary();
+  if (expanded) setExpanded(true);
+  return { node, update, get run() { return run; } };
+}
+
+/** Keyed list of runItems that keeps expanded timelines across refreshes. */
+function runList({ showIncident = false, empty }) {
+  const root = el('div', { class: 'run-list' });
+  const items = new Map();
+  let runs = [];
+  return {
+    node: root,
+    get runs() {
+      return runs;
+    },
+    draw(list) {
+      runs = list;
+      if (!list.length) {
+        items.clear();
+        replace(root, empty);
+        return;
+      }
+      const nodes = list.map((r) => {
+        let item = items.get(r.run_id);
+        if (item) item.update(r);
+        else items.set(r.run_id, (item = runItem(r, { showIncident })));
+        return item.node;
+      });
+      for (const id of [...items.keys()]) if (!list.some((r) => r.run_id === id)) items.delete(id);
+      replace(root, nodes);
+    },
+  };
+}
+
+/** Active automated runs first, then active operator sessions, then newest first. */
+const runRank = (r) => (r.status === 'active' ? (r.origin === 'automated' ? 0 : 1) : 2);
+const sortRuns = (list) => [...list].sort((a, b) => runRank(a) - runRank(b) || Date.parse(b.started_at) - Date.parse(a.started_at));
+
+// ----- incident workspace: "Reasoner activity" -----
+
+function queueLines(triggers, health) {
+  return triggers
+    .filter((t) => t.status !== 'done')
+    .sort((a, b) => ['leased', 'pending', 'dead_letter'].indexOf(a.status) - ['leased', 'pending', 'dead_letter'].indexOf(b.status))
+    .map((t) => {
+      const what = [el('span', { class: 'mono' }, `#${t.event_id}`), t.watch_id ? [' from ', el('span', { class: 'mono' }, t.watch_id)] : null];
+      if (t.status === 'leased') {
+        return el('div', { class: 'q-line' }, triggerStatusBadge('leased'), el('span', null, el('span', { class: 'mono' }, plain(t.lease_owner)), ' holds trigger ', what, ' · lease ', relTime(t.lease_expires_at, { until: true })));
+      }
+      if (t.status === 'pending') {
+        if (pendingStalled(t, health)) {
+          return notice('warn', 'alert', [
+            el('strong', null, 'reasoner-d does not appear to be running.'),
+            el('span', null, 'Trigger ', what, ' has waited ', relTime(t.created_at).textContent.replace(/ ago$/, ''), ' and no automated run is active. Start reasoner-d on the control host, or start an operator session to work this incident yourself.'),
+          ]);
+        }
+        return el('div', { class: 'q-line' }, triggerStatusBadge('pending'), el('span', null, 'Queued for reasoner-d: trigger ', what, ', queued ', relTime(t.created_at)));
+      }
+      return el(
+        'div',
+        { class: 'q-line' },
+        triggerStatusBadge(t.status),
+        el('span', null, 'Trigger ', what, t.status === 'dead_letter' ? ` gave up after ${plural(t.retry_count ?? 0, 'retry', 'retries')}` : '', t.reason ? [': ', el('span', { class: 'dim' }, t.reason)] : null),
+      );
+    });
+}
+
+function reasonerCard(inc) {
+  const R = state.reasoner;
+  const body = el('div', { class: 'card-body reasoner-body' });
+  const queueSlot = el('div', { class: 'q-lines' });
+  const list = runList({
+    empty: el(
+      'div',
+      { class: 'empty-slot' },
+      inc.status === 'open'
+        ? 'No reasoner-d run has picked up this incident yet. Automated runs start on their own when a watch trigger is leased from the queue; an operator session is your own manual session.'
+        : 'No reasoner-d run or operator session was recorded for this incident.',
+    ),
+  });
+  const headBadge = el('span');
+  let runs = sortRuns(R.runs.filter((r) => r.incident_id === inc.incident_id));
+  let triggers = R.triggers.filter((t) => t.incident_id === inc.incident_id);
+
+  const draw = (unavailable = null) => {
+    if (unavailable) {
+      replace(body, el('div', { class: 'muted small' }, unavailable));
+      replace(headBadge);
+      return;
+    }
+    replace(queueSlot, queueLines(triggers, reasonerHealth()));
+    list.draw(runs);
+    replace(body, queueSlot, list.node);
+    const active = runs.filter((r) => r.status === 'active');
+    replace(headBadge, active.length ? el('span', { class: 'badge live' }, el('span', { class: 'dot accent pulse' }), `${active.length} active`) : runs.length ? el('span', { class: 'badge ghost' }, plural(runs.length, 'run')) : null);
+  };
+
+  const node = card(
+    'Reasoner activity',
+    'What reasoner-d and operator sessions did on this incident',
+    body,
+    [headBadge, el('a', { class: 'btn btn-sm btn-ghost', href: `#/reasoner?incident=${enc(inc.incident_id)}` }, 'Queue', icon('arrow'))],
+    'reasoner-card',
+  );
+
+  if (R.loaded && !R.available) draw(R.message ?? 'Reasoner activity is not available.');
+  else draw();
+
+  const poll = livePoll(
+    node,
+    async () => {
+      const [r, t] = await Promise.all([api(`/api/runs?incident_id=${enc(inc.incident_id)}&limit=50`), api(`/api/triggers?incident_id=${enc(inc.incident_id)}&limit=50`)]);
+      if (r.available === false || t.available === false) return draw((r.available === false ? r : t).message ?? 'Reasoner activity is not available.');
+      runs = sortRuns(r.runs);
+      triggers = t.triggers;
+      draw();
+    },
+    { fast: 3500, slow: 15_000, busy: () => runs.some((r) => r.status === 'active') || triggers.some((x) => x.status === 'pending' || x.status === 'leased') },
+  );
+  setTimeout(() => poll.run(), 0);
+  return node;
+}
+
+// ----- fleet-wide view: #/reasoner -----
+
+function triggerRow(t, health) {
+  const stuck = pendingStalled(t, health);
+  let detail;
+  if (t.status === 'leased') detail = [el('span', { class: 'mono' }, plain(t.lease_owner)), el('span', { class: 'muted small' }, 'lease ', relTime(t.lease_expires_at, { until: true }))];
+  else if (t.status === 'pending') detail = [el('span', { class: stuck ? 'warn-text' : 'muted' }, stuck ? 'Waiting, no active reasoner run' : 'Waiting for a reasoner-d lease'), el('span', { class: 'muted small' }, 'queued ', relTime(t.created_at))];
+  else detail = [el('span', { class: t.status === 'dead_letter' ? 'bad-text' : 'dim' }, t.reason ?? (t.status === 'done' ? 'Completed' : '—')), el('span', { class: 'muted small' }, 'updated ', relTime(t.updated_at))];
+  return el(
+    'div',
+    { class: ['q-row', stuck && 'is-stuck'], attrs: { role: 'listitem' } },
+    el('div', { class: 'q-status' }, triggerStatusBadge(t.status)),
+    el('div', { class: 'q-what' }, el('span', null, el('span', { class: 'mono' }, `#${t.event_id}`), ' ', el('span', { class: 'mono dim' }, plain(t.watch_id))), el('span', { class: 'muted small' }, 'queued ', relTime(t.created_at), t.retry_count ? ` · ${plural(t.retry_count, 'retry', 'retries')}` : '')),
+    el('div', { class: 'q-scope' }, t.incident_id ? el('a', { class: 'mono', href: `#/investigations/${enc(t.incident_id)}`, title: t.incident_id }, shortId(t.incident_id)) : el('span', { class: 'muted' }, '—'), el('span', { class: 'mono muted small' }, plain(t.host_id))),
+    el('div', { class: 'q-detail' }, detail),
+  );
+}
+
+function healthNotice(health) {
+  switch (health.state) {
+    case 'working': {
+      const r = health.active[0];
+      return notice('', 'cpu', [
+        el('strong', null, 'reasoner-d is working.'),
+        r
+          ? el('span', null, `${plural(health.active.length, 'active run')}, latest on `, el('a', { class: 'mono', href: `#/investigations/${enc(r.incident_id)}` }, shortId(r.incident_id)), ` · ${plain(r.model_id)}`)
+          : el('span', null, `${plural(health.leased.length, 'trigger')} leased`),
+      ]);
+    }
+    case 'stalled':
+      return notice('warn', 'alert', [
+        el('strong', null, 'reasoner-d does not appear to be running.'),
+        el('span', null, `${plural(health.pending.length, 'trigger')} pending, the oldest for `, relTime(health.oldest).textContent.replace(/ ago$/, ''), ', with no active run or lease. Start reasoner-d on the control host; until then incidents wait for an operator.'),
+      ]);
+    case 'queued':
+      return notice('', 'clock', [el('strong', null, 'Triggers queued.'), el('span', null, `${plural(health.pending.length, 'trigger')} waiting for reasoner-d to lease ${health.pending.length === 1 ? 'it' : 'them'}.`)]);
+    case 'unavailable':
+      return notice('', 'cpu', [el('strong', null, 'Reasoner activity is not available.'), el('span', null, health.message ?? '')]);
+    default:
+      return notice('', 'check', [
+        el('strong', null, 'Queue empty.'),
+        health.lastRun ? el('span', null, 'Last automated run ', relTime(health.lastRun.started_at), ' on ', el('a', { class: 'mono', href: `#/investigations/${enc(health.lastRun.incident_id)}` }, shortId(health.lastRun.incident_id))) : el('span', null, 'No automated run has been recorded yet.'),
+      ]);
+  }
+}
+
+async function renderReasoner(_arg, stale, route) {
+  const q = route?.query;
+  for (const [key, param] of [['incident', 'incident'], ['host', 'host']]) {
+    const v = q?.get(param);
+    if (v !== null && v !== undefined) state.rq[key] = v;
+  }
+  await loadReasoner();
+  if (stale()) return null;
+  const R = state.reasoner;
+  if (!R.available) {
+    return el(
+      'div',
+      { class: 'stack' },
+      healthNotice(reasonerHealth()),
+      card(
+        'What this page shows',
+        null,
+        el('div', { class: 'card-body dim' }, 'Automated reasoner-d runs, their step-by-step events and the trigger queue they lease from. control-d serves these over the investigation socket from Phase 9 on; this console falls back to the audit-log summary on Fleet until then.'),
+      ),
+    );
+  }
+  const f = state.rq;
+  const health = reasonerHealth();
+  const statusSel = QUEUE_FILTERS.find(([id]) => id === f.status) ?? QUEUE_FILTERS[0];
+
+  const kpis = el(
+    'div',
+    { class: 'kpis' },
+    kpi('Active runs', String(health.active.length), health.active.length ? 'reasoner-d is investigating' : 'No automated run in progress'),
+    kpi('Pending triggers', String(health.pending.length), health.oldest ? ['oldest ', relTime(health.oldest)] : 'Nothing waiting'),
+    kpi('Leased', String(health.leased.length), health.leased[0] ? el('span', { class: 'mono' }, plain(health.leased[0].lease_owner)) : 'No lease held'),
+    kpi('Dead-lettered', String(health.dead.length), health.dead.length ? el('span', { class: 'warn-text' }, 'Gave up after retries') : 'None'),
+  );
+
+  // Filters shared by the queue and the run list.
+  const knownIncidents = [...new Set([...state.incidents.map((i) => i.incident_id), ...R.runs.map((r) => r.incident_id), ...R.triggers.map((t) => t.incident_id)].filter(Boolean))].sort();
+  const knownHosts = [...new Set([...state.hosts.map((h) => h.host_id), ...R.runs.map((r) => r.host_id), ...R.triggers.map((t) => t.host_id)].filter(Boolean))].sort();
+  const hostSel = el('select', { attrs: { 'aria-label': 'Filter by host' } }, el('option', { value: '' }, 'All hosts'), knownHosts.map((h) => el('option', { value: h, selected: f.host === h }, h)));
+  const incSel = el('select', { attrs: { 'aria-label': 'Filter by incident' } }, el('option', { value: '' }, 'All incidents'), knownIncidents.map((i) => el('option', { value: i, selected: f.incident === i }, shortId(i))));
+  const setFilter = (k, v) => {
+    f[k] = v;
+    history.replaceState(null, '', '#/reasoner');
+    render();
+  };
+  hostSel.addEventListener('change', () => setFilter('host', hostSel.value));
+  incSel.addEventListener('change', () => setFilter('incident', incSel.value));
+  const seg = el(
+    'div',
+    { class: 'seg q-seg', attrs: { role: 'group', 'aria-label': 'Trigger status' } },
+    QUEUE_FILTERS.map(([id, label]) => el('button', { type: 'button', attrs: { 'aria-pressed': String(statusSel[0] === id) }, on: { click: () => setFilter('status', id) } }, label)),
+  );
+  const toolbar = el('div', { class: 'mit-toolbar' }, seg, el('span', { class: 'spacer' }), hostSel, incSel);
+
+  const scope = () => {
+    const qs = new URLSearchParams();
+    if (f.host) qs.set('host_id', f.host);
+    if (f.incident) qs.set('incident_id', f.incident);
+    return qs;
+  };
+  const queueBody = el('div', { class: 'q-list', attrs: { role: 'list' } });
+  let triggers = [];
+  const drawQueue = () => {
+    const h = reasonerHealth();
+    replace(
+      queueBody,
+      triggers.length
+        ? [el('div', { class: 'q-row head', attrs: { 'aria-hidden': 'true' } }, ['Status', 'Trigger · watch', 'Incident · host', 'Lease or outcome'].map((t) => el('div', null, t))), triggers.map((t) => triggerRow(t, h))]
+        : el('div', { class: 'card-body' }, emptyState('Nothing here', statusSel[0] === 'open' ? 'No trigger is waiting for or held by reasoner-d in this scope.' : 'No trigger in this state and scope.')),
+    );
+  };
+  const order = { leased: 0, pending: 1, dead_letter: 2, done: 3 };
+  const queueCard = card('Trigger queue', 'Watch triggers control-d queued for reasoner-d. A worker leases one, runs an investigation, then marks it done or dead-letters it after repeated failures.', queueBody);
+
+  const runs = runList({ showIncident: true, empty: emptyState('No runs', 'No reasoner-d run or operator session in this scope yet.') });
+  const runsCard = card('Runs', 'Newest first. Active runs expand to a live timeline of turns, tool calls and gate results.', el('div', { class: 'card-body' }, runs.node));
+
+  const node = el('div', { class: 'stack reasoner-view' }, el('div', { class: 'health-slot' }, healthNotice(health)), kpis, toolbar, queueCard, runsCard);
+  const healthSlot = node.firstChild;
+
+  async function refresh() {
+    const qs = scope();
+    const tq = new URLSearchParams(qs);
+    tq.set('limit', '200');
+    if (statusSel[2]) tq.set('status', statusSel[2]);
+    const rq = new URLSearchParams(qs);
+    rq.set('limit', '50');
+    const [t, r] = await Promise.all([api(`/api/triggers?${tq}`), api(`/api/runs?${rq}`), loadReasoner()]);
+    triggers = (t.triggers ?? []).sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    drawQueue();
+    runs.draw(sortRuns(r.runs ?? []));
+    replace(healthSlot, healthNotice(reasonerHealth()));
+    refreshNavReasoner();
+  }
+  replace(queueBody, el('div', { class: 'card-body' }, loading(3)));
+  runs.draw([]);
+  const poll = livePoll(node, refresh, { fast: 4000, slow: 15_000, busy: () => runs.runs.some((x) => x.status === 'active') || triggers.some((x) => x.status === 'leased') });
+  setTimeout(() => poll.run(), 0);
+  return node;
+}
+
+function refreshNavReasoner() {
+  const nav = document.getElementById('nav-reasoner');
+  if (!nav) return;
+  const h = reasonerHealth();
+  const n = h.state === 'unavailable' || h.state === 'loading' ? 0 : h.pending.length + h.leased.length;
+  nav.textContent = n ? String(n) : '';
+  nav.classList.toggle('warn', h.state === 'stalled');
+  nav.title = h.state === 'stalled' ? 'Triggers waiting and reasoner-d looks stopped' : 'Triggers pending or leased';
 }
 
 // ---------------------------------------------------------------------------
@@ -2413,12 +3199,48 @@ function openDrawer(title, sub, bodyNodes, footNodes) {
 
 const defaultRationale = (r) => (r.accepted_baseline ? 'Accept observed change' : 'Accept initial observed state');
 
-function ticketField(form) {
+/**
+ * Who the audit entry is attributed to. Signed in: the account name, fixed
+ * (the server binds it too). Open console: the name remembered on this
+ * browser, shown as text with a "Change" link instead of a required field.
+ */
+function identityLine(form, key, verb = 'Recorded as') {
+  const user = state.auth?.user?.username;
+  form[key] = user || form[key] || operatorName();
+  if (user) return el('div', { class: 'signed-as' }, icon('user'), verb, ' ', el('b', null, user), el('span', { class: 'muted' }, '· your signed-in account'));
+  const slot = el('div', { class: 'signed-as' });
+  const showText = () =>
+    replace(
+      slot,
+      icon('user'),
+      verb,
+      ' ',
+      el('b', null, form[key]),
+      el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: showInput } }, 'Change'),
+    );
+  function showInput() {
+    const input = textInput(form, key, { placeholder: 'your operator name' });
+    input.setAttribute('aria-label', 'Your operator name');
+    replace(slot, field('Your name (recorded in the audit log, remembered on this browser)', input));
+    input.focus();
+  }
+  showText();
+  return slot;
+}
+
+/** Rationale and change ticket: pre-filled and optional to touch, so they live behind one disclosure. */
+function justificationFields(form, { ticket = true } = {}) {
+  const preview = el('span', { class: 'muted' });
+  const sync = () => (preview.textContent = `“${form.rationale.trim() || '…'}”${form.ticket_ref ? ` · ${form.ticket_ref}` : ''}`);
+  const rationale = textInput(form, 'rationale', { onInput: sync });
+  const ticketInput = ticket ? textInput(form, 'ticket_ref', { placeholder: 'CHG-4471 (optional)', mono: true, onInput: sync }) : null;
+  sync();
   return el(
     'details',
-    { class: 'more', open: Boolean(form.ticket_ref) },
-    el('summary', null, 'Add change ticket'),
-    field('Change ticket (optional)', textInput(form, 'ticket_ref', { placeholder: 'CHG-4471', mono: true })),
+    { class: 'more' },
+    el('summary', null, 'Rationale ', preview),
+    field('Rationale (recorded in the audit log)', rationale),
+    ticket ? field('Change ticket (optional)', ticketInput) : null,
   );
 }
 
@@ -2455,11 +3277,11 @@ function openPromoteDrawer(host, r) {
         el('span', { class: 'rel-arrow' }, '→'),
         el('div', { class: 'col' }, el('span', { class: 'eyebrow' }, 'New accepted state'), hashChip(r.current_observed?.state_hash)),
       ),
-      el('div', { class: 'grid-2' }, field('Approver', textInput(form, 'approver', { placeholder: 'your operator name' })), field('Rationale', textInput(form, 'rationale'))),
-      ticketField(form),
+      identityLine(form, 'approver', 'Approved by'),
+      justificationFields(form),
       errNode,
     ],
-    [el('span', { class: 'foot-note' }, 'Signed as you; remembered on this browser'), el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
+    [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
   );
 }
 
@@ -2512,8 +3334,8 @@ function openAcceptAllDrawer(host, rows) {
     `Promotes the current observation of ${rows.length} never-accepted snapshot watches on ${host}, one attributable revision each.`,
     [
       list,
-      el('div', { class: 'grid-2' }, field('Approver', textInput(form, 'approver', { placeholder: 'your operator name' })), field('Rationale', textInput(form, 'rationale'))),
-      ticketField(form),
+      identityLine(form, 'approver', 'Approved by'),
+      justificationFields(form),
       errNode,
     ],
     [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
@@ -2522,6 +3344,20 @@ function openAcceptAllDrawer(host, rows) {
 
 function openCloseDrawer(inc) {
   const form = { actor: operatorName(), resolution: '' };
+  const resolution = textArea(form, 'resolution', { placeholder: 'Outcome, verification performed, follow-ups…', rows: 4 });
+  const presets = [
+    ['Expected change', 'Expected change confirmed with the host owner; baseline to be promoted.'],
+    ['Contained', 'Contained: mitigation applied and verified; no further activity observed.'],
+    ['False positive', 'False positive: no malicious activity found after review of the evidence.'],
+  ];
+  const presetRow = el(
+    'div',
+    { class: 'row preset-row' },
+    el('span', { class: 'muted small' }, 'Start from'),
+    presets.map(([label, text]) =>
+      el('button', { class: 'chip', type: 'button', on: { click: () => { form.resolution = text; resolution.value = text; resolution.focus(); } } }, label),
+    ),
+  );
   const errNode = el('div');
   const submit = el('button', { class: 'btn btn-danger', type: 'button' }, 'Close incident');
   submit.addEventListener('click', async () => {
@@ -2544,8 +3380,9 @@ function openCloseDrawer(inc) {
     [
       el('dl', { class: 'kv' }, el('dt', null, 'Incident'), el('dd', null, idChip(inc.incident_id, { title: 'Incident' })), el('dt', null, 'Host'), el('dd', { class: 'mono' }, inc.host_id)),
       el('p', { class: 'dim' }, inc.summary),
-      field('Actor', textInput(form, 'actor', { placeholder: 'your operator name' })),
-      field('Resolution', textArea(form, 'resolution', { placeholder: 'Outcome, verification performed, follow-ups…', rows: 4 })),
+      identityLine(form, 'actor', 'Closed by'),
+      field('Resolution', resolution),
+      presetRow,
       errNode,
     ],
     [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
@@ -2837,7 +3674,7 @@ function mitigationGuide() {
       step(
         2,
         'Manually, from an investigation',
-        el('p', null, 'Open an incident, start an investigation run, then use the ', el('b', null, 'Propose mitigation'), ' tab. Cite the observed facts that justify it; the gate answers at once with its rule and verdict.'),
+        el('p', null, 'Open an incident, start an operator session, then use the ', el('b', null, 'Mitigation'), ' tab. Cite the observed facts that justify it; the gate answers at once with its rule and verdict.'),
         el(
           'div',
           { class: 'row' },
@@ -3056,17 +3893,30 @@ function approveCommand(intentId) {
 
 function approvalPanel(a, detail) {
   const f = state.approval;
+  if (state.auth?.user?.username) f.approver = state.auth.user.username;
   if (!f.approver) f.approver = operatorName();
   const cmd = el('code', null, approveCommand(a.intent_id));
-  const refreshCmd = () => (cmd.textContent = approveCommand(a.intent_id));
+  const refreshCmd = () => {
+    cmd.textContent = approveCommand(a.intent_id);
+    store('defsec.keyFile', f.keyFile);
+    store('defsec.keyId', f.keyId);
+    rememberOperator(f.approver);
+  };
   const keyFile = field('Operator key file', textInput(f, 'keyFile', { mono: true, onInput: refreshCmd }));
   keyFile.classList.add('span-2');
   const inputs = el(
-    'div',
-    { class: 'grid-2' },
-    field('Approver', textInput(f, 'approver', { placeholder: state.auth?.user?.username ?? 'your name', onInput: refreshCmd })),
-    field('Operator key ID', textInput(f, 'keyId', { mono: true, onInput: refreshCmd })),
-    keyFile,
+    'details',
+    { class: 'more' },
+    el('summary', null, 'Approver and key settings ', el('span', { class: 'muted' }, `${f.approver} · ${f.keyId}`)),
+    el(
+      'div',
+      { class: 'grid-2' },
+      state.auth?.user?.username
+        ? field('Approver', el('div', { class: 'signed-as' }, icon('user'), el('b', null, f.approver)))
+        : field('Approver', textInput(f, 'approver', { placeholder: 'your name', onInput: refreshCmd })),
+      field('Operator key ID', textInput(f, 'keyId', { mono: true, onInput: refreshCmd })),
+      keyFile,
+    ),
   );
   const parts = [
     el(
@@ -3280,6 +4130,7 @@ async function poll() {
   if (document.hidden || !dashboardStarted) return;
   await Promise.all([loadStatus(), loadCore()]);
   renderShell();
+  refreshIncidentMarkers();
   const view = parseRoute().view;
   if (view === 'fleet' || (view === 'mitigations' && !drawer().open)) render();
 }

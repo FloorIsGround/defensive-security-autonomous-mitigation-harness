@@ -8,6 +8,7 @@ import { parseOperatorApproval, signingInfo } from './demo-actions.mjs';
 import {
   ApiError,
   COLLECTOR_TYPES,
+  REASONER_UNSUPPORTED_MESSAGE,
   automationSummary,
   buildIncidentChanges,
   buildWatchSpec,
@@ -15,7 +16,13 @@ import {
   int,
   isStreamWatch,
   parseActionBody,
+  parseEventsQuery,
   parseFindingBody,
+  parseRunsQuery,
+  parseTriggersQuery,
+  publicRunEvent,
+  publicRunSummary,
+  publicTrigger,
   requireIdent,
   requireText,
 } from './domain.mjs';
@@ -43,6 +50,24 @@ function unwrap(resp, tag, expected) {
 }
 
 const RUN_TOKEN_TTL_SECONDS = 3600;
+
+/**
+ * A control-d from before Phase 9 cannot deserialize the new ops: it closes
+ * the connection without a reply (control_rejected_frame), or a future build
+ * may answer with an "unknown variant" error. Either way the console degrades
+ * to "not available" instead of failing the page.
+ */
+function unsupportedOp(err) {
+  if (!(err instanceof ApiError)) return false;
+  if (err.code === 'control_rejected_frame') return true;
+  return /unknown (variant|op)|unsupported (op|request)/i.test(err.message ?? '');
+}
+
+function unavailable(err) {
+  if (unsupportedOp(err)) return { available: false, reason: 'unsupported', message: REASONER_UNSUPPORTED_MESSAGE };
+  if (err instanceof ApiError && err.status === 403) return { available: false, reason: 'forbidden', message: err.message };
+  return null;
+}
 
 export function createLiveBackend({ investigateSock, token, adminSock = null, enableAdmin = false, timeoutMs = 5000 }) {
   // The shared browse token is only ever used for reads. StartInvestigationRun
@@ -102,11 +127,11 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
   /** The live per-run entry (and its dedicated client) for an incident. */
   function resolveRun(incidentId, runId = null) {
     const run = runs.get(incidentId);
-    if (!run) throw new ApiError(409, 'run_required', 'start an investigation run for this incident first');
-    if (runId && runId !== run.run_id) throw new ApiError(409, 'run_mismatch', 'run_id does not match the active console run for this incident');
+    if (!run) throw new ApiError(409, 'run_required', 'start an operator session for this incident first');
+    if (runId && runId !== run.run_id) throw new ApiError(409, 'run_mismatch', 'run_id does not match the active operator session for this incident');
     if (Date.parse(run.expires_at) <= Date.now()) {
       runs.delete(incidentId);
-      throw new ApiError(409, 'run_required', 'the investigation run expired; start a new one');
+      throw new ApiError(409, 'run_required', 'the operator session expired; start a new one');
     }
     return run;
   }
@@ -248,7 +273,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
         throw new ApiError(
           403,
           'admin_required_for_runs',
-          'Starting per-incident runs from a multi-incident console requires --enable-admin so each run gets an isolated capability token without narrowing the console\'s browse session.',
+          'Starting an operator session from a multi-incident console requires --enable-admin so each session gets an isolated capability token without narrowing the console\'s browse session.',
         );
       }
       const existing = runs.get(incidentId);
@@ -354,6 +379,58 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
         host_id: host,
         changes: buildIncidentChanges({ incident: ctx.incident, watches: snapshotWatches, baselines: base.baselines, observationsByWatch }),
       };
+    },
+
+    // ---- Phase 9 reasoner activity (read-only, shared browse token) ----------
+    // These ops are allowed for the observer role, so they use the console's
+    // browse token. StartInvestigationRun is never sent on that token, and no
+    // capability or lease token is ever part of a response.
+
+    async runs(query = {}) {
+      const q = parseRunsQuery(query);
+      const request = { op: 'list_investigation_runs', limit: q.limit };
+      if (q.incident_id) request.incident_id = q.incident_id;
+      if (q.host_id) request.host_id = q.host_id;
+      try {
+        const r = await invCall(request, 'runs');
+        return { available: true, runs: (r.runs ?? []).map(publicRunSummary), server_time: new Date().toISOString() };
+      } catch (err) {
+        const u = unavailable(err);
+        if (u) return { ...u, runs: [], server_time: new Date().toISOString() };
+        throw err;
+      }
+    },
+
+    async runEvents(runId, query = {}) {
+      const q = parseEventsQuery(runId, query);
+      const request = { op: 'get_run_events', run_id: q.run_id, limit: q.limit };
+      if (q.after_seq !== null) request.after_seq = q.after_seq;
+      try {
+        const r = await invCall(request, 'run_events');
+        const events = (r.events ?? []).map(publicRunEvent).sort((a, b) => a.event_seq - b.event_seq);
+        const last = events.at(-1)?.event_seq ?? q.after_seq ?? null;
+        return { available: true, run_id: r.run_id ?? q.run_id, events, next_after_seq: last, server_time: new Date().toISOString() };
+      } catch (err) {
+        const u = unavailable(err);
+        if (u) return { ...u, run_id: q.run_id, events: [], next_after_seq: q.after_seq, server_time: new Date().toISOString() };
+        throw err;
+      }
+    },
+
+    async triggers(query = {}) {
+      const q = parseTriggersQuery(query);
+      const request = { op: 'list_trigger_queue', limit: q.limit };
+      if (q.host_id) request.host_id = q.host_id;
+      if (q.incident_id) request.incident_id = q.incident_id;
+      if (q.statuses) request.statuses = q.statuses;
+      try {
+        const r = await invCall(request, 'trigger_queue');
+        return { available: true, triggers: (r.triggers ?? []).map(publicTrigger), server_time: new Date().toISOString() };
+      } catch (err) {
+        const u = unavailable(err);
+        if (u) return { ...u, triggers: [], server_time: new Date().toISOString() };
+        throw err;
+      }
     },
 
     async automation() {

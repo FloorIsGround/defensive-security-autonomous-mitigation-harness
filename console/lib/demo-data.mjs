@@ -7,6 +7,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
+import { advanceDemoReasoner, buildDemoReasoner, demoRunEvents, demoRuns, demoTriggers, endRunsForIncident, logOperatorStep, openOperatorSession } from './demo-reasoner.mjs';
 import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
@@ -442,6 +443,8 @@ function buildState(now, signer) {
 
   // --- Phase 8 mitigations (typed intents, signed envelopes, receipts) -----
   const actionSet = buildDemoActions({ now, iso, ids, signer });
+  // --- Phase 9 reasoner-d runs, run events and the trigger queue -------------
+  const reasonerSet = buildDemoReasoner({ now, ids });
 
   // --- audit events, chained in timestamp order -----------------------------
   const ev = (ago, event_type, actor, payload) => ({ ago, event_type, actor, payload });
@@ -470,6 +473,7 @@ function buildState(now, signer) {
     ev(30 * MIN, 'finding_recorded', REASONER, { finding_id: 302, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'verified_finding' }),
     ev(12 * MIN, 'finding_recorded', REASONER, { finding_id: 303, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'hypothesis' }),
     ...actionSet.events,
+    ...reasonerSet.auditEvents,
   ].sort((a, b) => b.ago - a.ago);
 
   const audit = [];
@@ -486,6 +490,7 @@ function buildState(now, signer) {
     policyDecisions: [...policyDecisions, ...actionSet.decisions],
     actions: { intents: actionSet.intents, denied: actionSet.denied, nextProposalId: actionSet.nextProposalId },
     audit,
+    reasoner: reasonerSet.reasoner,
     runs: new Map(),
     nextObservationId: 9001 + observations.length,
     nextRevisionId: 40,
@@ -520,7 +525,10 @@ function appendAudit(audit, event_type, actor, payload, timestamp = new Date().t
 export function createDemoBackend({ enableAdmin = true, now = () => Date.now() } = {}) {
   const signer = createDemoSigner();
   let S = buildState(now(), signer);
-  const advance = () => advanceDemoActions(S, now(), appendAudit);
+  const advance = () => {
+    advanceDemoActions(S, now(), appendAudit);
+    advanceDemoReasoner(S, now(), appendAudit);
+  };
 
   const host = (id) => {
     requireIdent(id, 'host_id');
@@ -560,9 +568,9 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
   };
   const resolveRun = (incidentId, runId) => {
     const run = runId ? [...S.runs.values()].find((r) => r.run_id === runId) : S.runs.get(incidentId);
-    if (!run) throw new ApiError(409, 'run_required', 'start an investigation run for this incident first');
+    if (!run) throw new ApiError(409, 'run_required', 'start an operator session for this incident first');
     if (run.incident_id !== incidentId) throw new ApiError(403, 'forbidden', 'finding incident does not match run');
-    if (Date.parse(run.expires_at) <= now()) throw new ApiError(403, 'forbidden', 'investigation run is inactive');
+    if (Date.parse(run.expires_at) <= now()) throw new ApiError(403, 'forbidden', 'operator session is inactive');
     return run;
   };
   const watchRuntime = (w) => ({
@@ -649,10 +657,12 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     },
 
     async incidents() {
+      advance();
       return { incidents: S.incidents.map(publicIncident) };
     },
 
     async incident(incidentId) {
+      advance();
       const inc = incidentRow(incidentId);
       const ws = hostWatches(inc.host_id).filter((w) => !w.incident_id || w.incident_id === incidentId);
       const scoped = new Set(ws.map((w) => w.id));
@@ -674,7 +684,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       };
     },
 
-    async startRun(incidentId, body = {}) {
+    async startRun(incidentId, body = {}, ctx = {}) {
       const inc = incidentRow(incidentId);
       if (inc.status !== 'open') throw new ApiError(403, 'forbidden', 'incident is not open');
       const existing = S.runs.get(incidentId);
@@ -687,6 +697,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       const backend_id = requireText(body.backend_id ?? 'operator-console', 'backend_id', 128);
       const model_id = requireText(body.model_id ?? 'human-operator', 'model_id', 128);
       S.runs.set(incidentId, run);
+      openOperatorSession(S, { run_id: run.run_id, incident_id: incidentId, host_id: inc.host_id, expires_at: run.expires_at, principal_id: ctx.user?.username ? `console:${ctx.user.username}` : 'console-operator', nowMs: now() });
       appendAudit(S.audit, 'run_started', 'console-operator', { run_id: run.run_id, incident_id: incidentId, backend_id, model_id, prompt_schema_version: body.prompt_schema_version ?? 'console.v1', expires_at: run.expires_at });
       return run;
     },
@@ -728,6 +739,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       S.policyDecisions.push(record);
       appendAudit(S.audit, 'watch_proposed', 'console-operator', { proposal_id, run_id: run.run_id, incident_id: incidentId, watch_id: spec.id, rationale });
       appendAudit(S.audit, 'policy_decision', 'console-operator', { decision_id: record.decision_id, proposal_id, ...decision });
+      logOperatorStep(S, run.run_id, now(), 'propose_ephemeral_watch', { args_preview: JSON.stringify({ collector: spec.collector.type, watch_id: spec.id }), accepted: decision.allowed, code: decision.rule_id });
       let bundle_version = null;
       if (decision.allowed) {
         const hst = host(inc.host_id);
@@ -767,6 +779,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       const finding_id = S.nextFindingId++;
       S.findings.push({ finding_id, incident_id: incidentId, run_id: run.run_id, created_at: new Date(now()).toISOString(), finding });
       appendAudit(S.audit, 'finding_recorded', 'console-operator', { finding_id, run_id: run.run_id, incident_id: incidentId, finding, evidence_hashes: evidence });
+      logOperatorStep(S, run.run_id, now(), 'record_hypothesis_or_finding', { args_preview: JSON.stringify({ kind: f.kind, severity: f.severity }), accepted: true });
       inc.updated_at = new Date(now()).toISOString();
       return { finding_id, verified_evidence_count: Object.keys(evidence).length };
     },
@@ -785,6 +798,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       });
       const { run_id: _r, ...proposal } = a;
       const res = proposeDemoAction(S, { incident: inc, run, actor: 'console-operator', proposal, evidenceOk, signer, nowMs: now(), appendAudit });
+      logOperatorStep(S, run.run_id, now(), 'propose_action', { args_preview: JSON.stringify(proposal.verb), accepted: res.decision.allowed, code: res.decision.rule_id });
       inc.updated_at = new Date(now()).toISOString();
       return res;
     },
@@ -798,6 +812,21 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         host_id: inc.host_id,
         changes: buildIncidentChanges({ incident: publicIncident(inc), watches: ws.map(publicWatch), baselines: currentBaselines(inc.host_id), observationsByWatch }),
       };
+    },
+
+    // ---- Phase 9 reasoner activity -------------------------------------------
+    async runs(query = {}) {
+      advance();
+      return demoRuns(S, now(), query);
+    },
+
+    async runEvents(runId, query = {}) {
+      advance();
+      return demoRunEvents(S, now(), runId, query);
+    },
+
+    async triggers(query = {}) {
+      return demoTriggers(S, now(), query);
     },
 
     async automation() {
@@ -877,6 +906,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       inc.status = 'closed';
       inc.updated_at = new Date(now()).toISOString();
       S.runs.delete(incidentId);
+      endRunsForIncident(S, incidentId, now());
       if (retired) {
         const hst = host(inc.host_id);
         hst.active_bundle_version += 1;
