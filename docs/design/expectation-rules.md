@@ -73,6 +73,7 @@ Flow keys use `<protocol>:<remote-address>:<port>:<uid>:<comm>`, with brackets a
 
 A partial or truncated current snapshot can show additions and modifications of entries it contains. It cannot establish removals or that a `require_present` rule is missing a match.
 
+When a set-diff snapshot reports `truncated: true` and the comparison snapshot and previous valid sample were untruncated, the watch emits `truncation_began` with any known omitted counts. The previous sample prevents repeated alerts when the comparison uses a fixed accepted baseline. Recovery by itself does not trigger. Expectation rules filter item changes and preserve the truncation signal.
 
 Derived fields are computed by the evaluator, never sent by the agent:
 
@@ -105,7 +106,7 @@ pub fn apply_expectation_rules(
 * `AllowOptional`: drop added keys whose *current* item matches, removed keys whose *reference* item matches, and modified keys whose current item matches.
 * `IgnoreModified`: drop modified keys whose current item matches.
 * `RequirePresent`: if no current item matches, record the rule in `missing_required`. A non-empty `missing_required` makes the outcome `Triggered` even when the diff is empty after filtering.
-* If all diffs are filtered and nothing is missing, the outcome becomes `NotTriggered`.
+* If all diffs are filtered, nothing is missing, and truncation did not begin, the outcome becomes `NotTriggered`.
 * The `Triggered` details keep the existing `added` / `removed` / `modified` arrays (filtered) and add `missing_required` and `suppressed_by_rules` when they are non-empty. The reason string keeps the `set '<field>' diff: +a -r ~m` form, with ` (k suppressed by rules)` and ` missing required: <n>` appended when relevant.
 * The evaluation is deterministic: rules are applied in `rule_id` order and every key list is sorted.
 

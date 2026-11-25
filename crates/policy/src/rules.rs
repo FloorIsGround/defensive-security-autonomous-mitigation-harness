@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 pub use defsec_protocol::rules::ActiveRule;
 
 use crate::{
-    predicate::{PredicateOutcome, extract_keyed_set, snapshot_has_absence_evidence},
+    predicate::{
+        PredicateOutcome, append_truncation_reason, extract_keyed_set, snapshot_has_absence_evidence,
+    },
     rule_gate::rule_field_registry,
 };
 
@@ -83,6 +85,10 @@ pub fn apply_expectation_rules(
         PredicateOutcome::NotTriggered => Default::default(),
         _ => return result,
     };
+    let truncation = match &result.outcome {
+        PredicateOutcome::Triggered { details, .. } => details.get("truncation_began").cloned(),
+        _ => None,
+    };
     let original_removed = removed.clone();
     let mut sorted = rules.iter().collect::<Vec<_>>();
     sorted.sort_unstable_by(|a, b| a.rule_id.cmp(&b.rule_id));
@@ -141,6 +147,7 @@ pub fn apply_expectation_rules(
         && removed.is_empty()
         && modified.is_empty()
         && result.missing_required.is_empty()
+        && truncation.is_none()
     {
         result.outcome = PredicateOutcome::NotTriggered;
         return result;
@@ -155,6 +162,10 @@ pub fn apply_expectation_rules(
         modified.len()
     );
     let mut details = json!({"added": added, "removed": removed, "modified": modified});
+    if let Some(counts) = truncation {
+        append_truncation_reason(&mut reason, &counts);
+        details["truncation_began"] = counts;
+    }
     if suppressed_count != 0 {
         reason.push_str(&format!(" ({suppressed_count} suppressed by rules)"));
         details["suppressed_by_rules"] = json!(result.suppressed);
@@ -358,6 +369,28 @@ mod tests {
             "private"
         );
         assert_eq!(remote_scope("::ffff:8.8.8.8".parse().unwrap()), "public");
+    }
+
+    #[test]
+    fn allow_rule_filters_all_item_changes_but_preserves_truncation() {
+        let reference = sample(&[]);
+        let mut current = sample(&[("allowed", "unit", 4000)]);
+        current["truncated"] = json!(true);
+        let rules = [rule(
+            "allow",
+            RuleEffect::AllowOptional,
+            json!([{"op":"eq","field":"systemd_unit","value":"unit"}]),
+        )];
+        let eval = apply(&current, &reference, &rules);
+        assert_eq!(eval.matched_rule_ids, ["allow"]);
+        assert_eq!(
+            eval.outcome,
+            PredicateOutcome::Triggered {
+                reason: "set 'sockets' diff: +0 -0 ~0 truncation_began (omitted count unknown) (1 suppressed by rules)".into(),
+                details: json!({"added": [], "removed": [], "modified": [],
+                    "truncation_began": {}, "suppressed_by_rules": {"allow": ["allowed"]}}),
+            }
+        );
     }
 
     #[test]

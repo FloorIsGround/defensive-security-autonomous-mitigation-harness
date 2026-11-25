@@ -80,8 +80,27 @@ impl SustainedCounterState {
 
 /// Only complete snapshots provide evidence that an omitted key is absent.
 pub(crate) fn snapshot_has_absence_evidence(status: ObservationStatus, sample: &Value) -> bool {
-    status == ObservationStatus::Ok
-        && sample.get("truncated").and_then(Value::as_bool) != Some(true)
+    status == ObservationStatus::Ok && !snapshot_is_truncated(sample)
+}
+
+fn snapshot_is_truncated(sample: &Value) -> bool {
+    sample.get("truncated").and_then(Value::as_bool) == Some(true)
+}
+
+const OMITTED_COUNT_FIELDS: [&str; 2] = ["omitted_flows", "omitted_packages"];
+
+pub(crate) fn append_truncation_reason(reason: &mut String, counts: &Value) {
+    let known: Vec<_> = OMITTED_COUNT_FIELDS
+        .into_iter()
+        .filter_map(|field| counts[field].as_u64().map(|count| format!("{field}={count}")))
+        .collect();
+    reason.push_str(" truncation_began (");
+    if known.is_empty() {
+        reason.push_str("omitted count unknown");
+    } else {
+        reason.push_str(&known.join(", "));
+    }
+    reason.push(')');
 }
 
 /// Evaluate a watch trigger predicate against `current`, `last_observed`, and
@@ -233,22 +252,39 @@ pub fn evaluate_predicate(
                 }
             }
 
-            if added.is_empty() && removed.is_empty() && modified.is_empty() {
+            // A baseline stays fixed across runs. Use the previous valid
+            // sample as well to distinguish onset from continuing truncation.
+            let truncation_began = snapshot_is_truncated(cur)
+                && !snapshot_is_truncated(reference)
+                && !last_observed.is_some_and(snapshot_is_truncated);
+            if added.is_empty() && removed.is_empty() && modified.is_empty() && !truncation_began {
                 PredicateOutcome::NotTriggered
             } else {
-                PredicateOutcome::Triggered {
-                    reason: format!(
-                        "set '{set_field}' diff: +{} -{} ~{}",
-                        added.len(),
-                        removed.len(),
-                        modified.len()
-                    ),
-                    details: serde_json::json!({
-                        "added": added,
-                        "removed": removed,
-                        "modified": modified,
-                    }),
+                let mut reason = format!(
+                    "set '{set_field}' diff: +{} -{} ~{}",
+                    added.len(),
+                    removed.len(),
+                    modified.len()
+                );
+                let mut details = serde_json::json!({
+                    "added": added,
+                    "removed": removed,
+                    "modified": modified,
+                });
+                if truncation_began {
+                    let counts = Value::Object(
+                        OMITTED_COUNT_FIELDS
+                            .into_iter()
+                            .filter_map(|field| {
+                                let count = cur.get(field)?.as_u64()?;
+                                Some((field.into(), Value::from(count)))
+                            })
+                            .collect(),
+                    );
+                    append_truncation_reason(&mut reason, &counts);
+                    details["truncation_began"] = counts;
                 }
+                PredicateOutcome::Triggered { reason, details }
             }
         }
         TriggerPredicate::ThresholdSustained {
@@ -415,6 +451,56 @@ mod tests {
                 matches!(outcome, PredicateOutcome::Triggered { details, .. }
                 if details["added"] == json!(["a:all"]) && details["removed"] == json!([]))
             );
+        }
+    }
+
+    #[test]
+    fn set_diff_signals_truncation_onset_for_both_comparison_targets() {
+        let complete = json!({"packages": [{"package_key": "a:all"}]});
+        let mut truncated = complete.clone();
+        truncated["truncated"] = json!(true);
+        truncated["omitted_packages"] = json!(17);
+        for compare_against in [CompareTarget::LastObserved, CompareTarget::AcceptedBaseline] {
+            let pred = TriggerPredicate::SetDiff {
+                compare_against,
+                set_field: "packages".into(),
+                identity_key: "package_key".into(),
+                ignore_fields: vec![],
+            };
+            let evaluate = |status, current, last, baseline| {
+                evaluate_predicate(
+                    &pred,
+                    status,
+                    Some(current),
+                    Some(last),
+                    Some(baseline),
+                    None,
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(
+                evaluate(ObservationStatus::Partial, &truncated, &complete, &complete),
+                PredicateOutcome::Triggered {
+                    reason: "set 'packages' diff: +0 -0 ~0 truncation_began (omitted_packages=17)".into(),
+                    details: json!({"added": [], "removed": [], "modified": [],
+                        "truncation_began": {"omitted_packages": 17}}),
+                }
+            );
+            assert_eq!(
+                evaluate(ObservationStatus::Partial, &truncated, &truncated, &complete),
+                PredicateOutcome::NotTriggered
+            );
+            assert_eq!(
+                evaluate(ObservationStatus::Ok, &complete, &truncated, &complete),
+                PredicateOutcome::NotTriggered
+            );
+            if compare_against == CompareTarget::AcceptedBaseline {
+                assert_eq!(
+                    evaluate(ObservationStatus::Partial, &truncated, &complete, &truncated),
+                    PredicateOutcome::NotTriggered
+                );
+            }
         }
     }
 
