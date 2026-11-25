@@ -100,6 +100,9 @@ pub struct FileMetadataEntry {
     pub uid: Option<u32>,
     #[serde(default)]
     pub gid: Option<u32>,
+    /// Hard link count from the opened regular file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nlink: Option<u64>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
     #[serde(default)]
