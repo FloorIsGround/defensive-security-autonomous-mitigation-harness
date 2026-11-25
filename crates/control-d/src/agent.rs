@@ -11,7 +11,9 @@ use defsec_protocol::{
     canonical::canonical_sha256_hex,
     observation::{ObservationPayload, ObservationRecord, ObservationStatus},
     rpc::{PolicyDecision, Severity},
-    watch::{CollectorSpec, DataClassification, TriggerPredicate, WatchClass, WatchSpec},
+    watch::{
+        CollectorSpec, CompareTarget, DataClassification, TriggerPredicate, WatchClass, WatchSpec,
+    },
     wire::{
         AgentToControl, BundleAckStatus, ControlToAgent, WIRE_PROTOCOL_VERSION, WatchRunSummary,
     },
@@ -455,11 +457,23 @@ fn ingest(
             && spec.lifecycle.expires_at.is_none_or(|expiry| expiry > now)
             && let PredicateOutcome::Triggered { .. } = outcome
         {
+            let comparison_id = match spec.trigger {
+                TriggerPredicate::SetDiff {
+                    compare_against: CompareTarget::LastObserved,
+                    ..
+                } => state.last_success_id,
+                TriggerPredicate::SetDiff {
+                    compare_against: CompareTarget::AcceptedBaseline,
+                    ..
+                } => state.baseline_observation_id,
+                _ => None,
+            };
+            let evidence = [Some(id), comparison_id];
             trigger(
                 db,
                 &spec,
                 &outcome,
-                Some(id),
+                &evidence,
                 floor.expected_policy_version,
                 now,
             )?;
@@ -486,6 +500,8 @@ fn ingest(
 
 struct WatchState {
     last_hash: Option<String>,
+    last_success_id: Option<i64>,
+    baseline_observation_id: Option<i64>,
     last_session: Option<String>,
     last_sample: Option<Value>,
     latest_session: Option<String>,
@@ -503,14 +519,15 @@ struct WatchState {
 
 fn read_state(db: &Connection, spec: &WatchSpec) -> Result<WatchState> {
     Ok(db.query_row("SELECT prior.state_hash,prior.session_id,prior.sample_json,latest.session_id,latest.seq_no,b.sample_json,
-        s.observation_errors,w.active,s.retired,s.last_success_at,w.created_at,s.summary_json,s.summary_session_id,s.summary_errors
+        s.observation_errors,w.active,s.retired,s.last_success_at,w.created_at,s.summary_json,s.summary_session_id,s.summary_errors,
+        prior.observation_id,b.observation_id
         FROM watch_state s JOIN watch_specs w USING(host_id,watch_id,spec_version)
         LEFT JOIN observations prior ON s.last_success_id=prior.observation_id
         LEFT JOIN observations latest ON s.last_observation_id=latest.observation_id
         LEFT JOIN baseline_revisions b ON s.baseline_revision_id=b.revision_id
         WHERE s.host_id=?1 AND s.watch_id=?2 AND s.spec_version=?3",
         params![spec.host_id,spec.id,spec.version], |r| Ok(WatchState {
-            last_hash:r.get(0)?,last_session:r.get(1)?,last_sample:optional_json(r,2)?,latest_session:r.get(3)?,latest_seq:r.get(4)?,
+            last_hash:r.get(0)?,last_success_id:r.get(14)?,baseline_observation_id:r.get(15)?,last_session:r.get(1)?,last_sample:optional_json(r,2)?,latest_session:r.get(3)?,latest_seq:r.get(4)?,
             baseline:optional_json(r,5)?,observation_errors:r.get(6)?,enabled:r.get(7)?,retired:r.get(8)?,
             freshness:r.get::<_,Option<String>>(9)?.map(|v| crate::service::parse_stamp(&v,9)).transpose()?,
             created:crate::service::parse_stamp(&r.get::<_,String>(10)?,10)?,summary:optional_json(r,11)?,summary_session:r.get(12)?,summary_errors:r.get(13)?,
@@ -594,7 +611,7 @@ fn heartbeat_watch(
         db.execute("UPDATE watch_state SET outcome_json=?4 WHERE host_id=?1 AND watch_id=?2 AND spec_version=?3",
             params![spec.host_id,spec.id,spec.version,serde_json::to_string(&outcome)?])?;
         if matches!(outcome, PredicateOutcome::Triggered { .. }) {
-            trigger(db, spec, &outcome, None, policy_version, now)?;
+            trigger(db, spec, &outcome, &[], policy_version, now)?;
         }
     }
     Ok(())
@@ -604,7 +621,7 @@ fn trigger(
     db: &Connection,
     spec: &WatchSpec,
     outcome: &PredicateOutcome,
-    evidence: Option<i64>,
+    evidence: &[Option<i64>],
     policy_version: u32,
     now: DateTime<Utc>,
 ) -> Result<()> {
@@ -661,7 +678,7 @@ fn trigger(
                 IncidentOpened,
                 "control",
                 &uuid(),
-                json!({"incident_id":incident,"host_id":spec.host_id,"watch_id":spec.id,"observation_id":evidence,"fingerprint":fingerprint}),
+                json!({"incident_id":incident,"host_id":spec.host_id,"watch_id":spec.id,"observation_id":evidence.first().copied().flatten(),"fingerprint":fingerprint}),
             )?;
             incident
         };
@@ -706,7 +723,7 @@ fn trigger(
         };
         db.execute("INSERT INTO trigger_events (incident_id,host_id,watch_id,spec_version,fingerprint,created_at,updated_at,status,outcome_json)
             VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8)", params![incident,spec.host_id,spec.id,spec.version,fingerprint,stamp(now),
-                if suppressed.is_some() {"suppressed"} else {"pending"},json!({"predicate":outcome,"suppression":suppressed}).to_string()])?;
+                if suppressed.is_some() {"suppressed"} else {"pending"},json!({"predicate":outcome,"suppression":suppressed,"reason":reason}).to_string()])?;
         let event = db.last_insert_rowid();
         if suppressed.is_none() {
             db.execute(
@@ -731,9 +748,9 @@ fn trigger(
         )?;
         (event, incident)
     };
-    if let Some(id) = evidence {
+    for id in evidence.iter().flatten() {
         db.execute(
-            "INSERT INTO trigger_evidence VALUES (?1,?2)",
+            "INSERT OR IGNORE INTO trigger_evidence VALUES (?1,?2)",
             params![event, id],
         )?;
     }

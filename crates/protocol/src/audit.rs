@@ -21,6 +21,7 @@ pub enum AuditEventType {
     IncidentClosed,
     RunStarted,
     RunCompleted,
+    RunFinished,
     FindingRecorded,
     CapabilityMinted,
     ActionProposed,

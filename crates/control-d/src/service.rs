@@ -558,7 +558,7 @@ impl ControlService {
                     [&incident_id],
                     |r| r.get::<_, String>(0),
                 )?;
-                db.execute("UPDATE agent_runs SET status='closed' WHERE incident_id=?1 AND status='active'", [&incident_id])?;
+                db.execute("UPDATE agent_runs SET status='cancelled',ended_at=?2 WHERE incident_id=?1 AND status='active'", params![incident_id,stamp(now)])?;
                 for run_id in runs {
                     audit(
                         db,
