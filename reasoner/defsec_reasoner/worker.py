@@ -430,6 +430,31 @@ class ReasonerWorker:
                 retryable=isinstance(exc, RpcTransportError),
             )
 
+        try:
+            return self._investigate(
+                client, lease, outcome, lease_token, context, capabilities
+            )
+        except Exception as exc:  # noqa: BLE001 - never strand a leased trigger or an active run
+            logger.exception("run %s crashed for event %s", outcome.run_id, event_id)
+            return self._fail_lease(
+                client, outcome, lease_token,
+                f"internal error: {type(exc).__name__}: {exc}", retryable=True,
+            )
+
+    def _investigate(
+        self,
+        client: ControlRpcClient,
+        lease: dict[str, Any],
+        outcome: WorkerOutcome,
+        lease_token: str,
+        context: dict[str, Any],
+        capabilities: list[dict[str, Any]],
+    ) -> WorkerOutcome:
+        """Run the bounded model loop for a leased trigger with a started run."""
+        event_id = int(lease["event_id"])
+        incident_id = str(lease["incident_id"])
+        host_id = str(lease["host_id"])
+        run_id = str(outcome.run_id)
         # A fresh capability is bound to the run by control-d; keep using the
         # same client (same token) for the rest of the run.
         diff = trigger_diff(lease.get("outcome") or {})
