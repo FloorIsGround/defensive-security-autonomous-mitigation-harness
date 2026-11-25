@@ -88,6 +88,7 @@ Unknown fields, type mismatches (e.g. `Prefix` on an integer field) and clauses 
 pub struct RuleEvaluation {
     pub outcome: PredicateOutcome,                 // filtered outcome
     pub suppressed: BTreeMap<String, Vec<String>>, // rule_id -> identity keys suppressed (<= 50 keys per rule)
+    pub suppressed_counts: BTreeMap<String, usize>, // exact counts before key sampling
     pub missing_required: Vec<String>,             // rule_ids whose RequirePresent had no match
     pub matched_rule_ids: Vec<String>,             // rules that matched at least one item (for hit counts)
 }
@@ -169,6 +170,8 @@ Investigation interface:
 
 * `ProposeExpectationRule { run_id, idempotency_key, rule: ExpectationRuleSpec }`. Requires the investigator role and run scope; the rule host must be within the capability. The gate runs with `Investigator` origin. If allowed, the rule is stored as `proposed` with a backtest. Response: `RuleProposalEvaluated { decision: PolicyDecision, rule_id: Option<String>, backtest: Option<RuleBacktest> }`.
 * `ListExpectationRules { host_id: Option<String>, statuses: Option<Vec<String>>, limit: Option<u32>, before: Option<String> }`. Any role, scoped to the capability's hosts. Response: `ExpectationRules { rules: Vec<ExpectationRuleRecord>, next_before: Option<String> }`.
+
+* `GetIncidentContext` can include `rule_suppression: { rules: [{ rule_id, rationale, suppressed_keys, count }], total }`. This is the suppression recorded on the newest set-diff trigger event visible to the caller within the incident's collector scope. Each contributing rule is listed in rule ID order, with up to 20 sorted identity keys and the full count of suppressed changes. `total` sums those counts. The rationale identifies the rule even after revocation or expiry. The field is omitted for older triggers and when the newest visible set-diff trigger recorded no suppression.
 
 Admin interface:
 

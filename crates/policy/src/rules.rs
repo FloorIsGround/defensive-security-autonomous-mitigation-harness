@@ -25,6 +25,7 @@ use crate::{
 pub struct RuleEvaluation {
     pub outcome: PredicateOutcome,
     pub suppressed: BTreeMap<String, Vec<String>>,
+    pub suppressed_counts: BTreeMap<String, usize>,
     pub missing_required: Vec<String>,
     pub matched_rule_ids: Vec<String>,
 }
@@ -41,6 +42,7 @@ pub fn apply_expectation_rules(
     let mut result = RuleEvaluation {
         outcome: raw,
         suppressed: BTreeMap::new(),
+        suppressed_counts: BTreeMap::new(),
         missing_required: Vec::new(),
         matched_rule_ids: Vec::new(),
     };
@@ -119,10 +121,11 @@ pub fn apply_expectation_rules(
         }
 
         let mut suppressed = BTreeSet::new();
+        let mut count = 0;
         let mut retain = |keys: &mut Vec<String>, matches: &dyn Fn(&String) -> bool| {
             keys.retain(|key| {
                 if matches(key) {
-                    suppressed_count += 1;
+                    count += 1;
                     suppressed.insert(key.clone());
                     false
                 } else {
@@ -135,7 +138,9 @@ pub fn apply_expectation_rules(
             retain(&mut removed, &matches_reference);
         }
         retain(&mut modified, &|key| matching_current.contains(key));
-        if !suppressed.is_empty() {
+        if count != 0 {
+            suppressed_count += count;
+            result.suppressed_counts.insert(rule.rule_id.clone(), count);
             result.suppressed.insert(
                 rule.rule_id.clone(),
                 suppressed.into_iter().take(50).collect(),

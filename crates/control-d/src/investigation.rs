@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::{
     expectation_rules::RuleStore,
-    ledger::{audit, json_column, rows},
+    ledger::{audit, json_column, optional_json, rows},
     service::{
         ControlError, ControlService, Result,
         actions::{ActionProposal, list_actions},
@@ -268,11 +268,25 @@ impl ControlService {
                         )
                     },
                 )?;
+                let rule_suppression = db
+                    .query_row(
+                        "SELECT json_extract(t.outcome_json, '$.rule_suppression')
+                     FROM trigger_events t JOIN watch_specs w USING(host_id,watch_id,spec_version)
+                     WHERE t.incident_id=?1
+                       AND json_extract(w.spec_json, '$.collector.type') IN (SELECT value FROM json_each(?2))
+                       AND json_extract(w.spec_json, '$.trigger.type')='set_diff'
+                     ORDER BY t.event_id DESC LIMIT 1",
+                        params![incident_id, collector_scope_json(&capability)?],
+                        |r| optional_json(r, 0),
+                    )
+                    .optional()?
+                    .flatten();
                 InvestigationResponse::IncidentContext {
                     incident,
                     active_watches,
                     recent_observations,
                     findings,
+                    rule_suppression,
                 }
             }
             InvestigationRequest::QueryObservations {

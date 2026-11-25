@@ -1116,3 +1116,99 @@ fn rule_pages_are_exclusive_at_tied_timestamps_and_preserve_scope() {
     assert_eq!(ids(rules), all_ids[101..]);
     assert_ne!(all_ids[101], foreign_id);
 }
+
+#[test]
+fn incident_context_reports_scoped_suppression_with_full_counts_and_capped_keys() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let big = f.create(allow("many.service"));
+    let small = f.create(allow("one.service"));
+    f.put(1, vec![]);
+    let mut sockets: Vec<_> = (4000..4055)
+        .rev()
+        .map(|port| socket("many.service", port))
+        .collect();
+    sockets.push(socket("one.service", 4100));
+    sockets.push(socket("unexpected.service", 22));
+    let observation = f.put(2, sockets);
+    assert!(f.saw_trigger(observation));
+
+    let incident_id = f.incident();
+    let token = f.token(PrincipalRole::Observer, None);
+    let context = |token| {
+        f.investigate(
+            token,
+            InvestigationRequest::GetIncidentContext {
+                incident_id: incident_id.clone(),
+            },
+        )
+    };
+    let InvestigationResponse::IncidentContext {
+        rule_suppression: Some(detail),
+        ..
+    } = context(&token)
+    else {
+        panic!("expected suppression in the incident context");
+    };
+    assert_eq!(detail.total, 56);
+    assert_eq!(detail.rules.len(), 2);
+    assert!(detail.rules[0].rule_id < detail.rules[1].rule_id);
+    let many = detail.rules.iter().find(|r| r.rule_id == big).unwrap();
+    assert_eq!(many.count, 55);
+    assert_eq!(many.rationale, "expected local service listener");
+    assert_eq!(
+        many.suppressed_keys,
+        (4000..4020)
+            .map(|port| format!("tcp:127.0.0.5:{port}"))
+            .collect::<Vec<_>>()
+    );
+    let one = detail.rules.iter().find(|r| r.rule_id == small).unwrap();
+    assert_eq!(one.count, 1);
+    assert_eq!(one.suppressed_keys, ["tcp:127.0.0.5:4100"]);
+
+    let AdminResponse::TokenMinted {
+        token: other_scope, ..
+    } = f.admin(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
+        principal_id: "other-collector-observer".into(),
+        role: PrincipalRole::Observer,
+        allowed_hosts: vec!["edge".into()],
+        allowed_collectors: vec![CollectorType::FilesMetadata],
+        incident_id: None,
+        ttl_seconds: 300,
+    })
+    else {
+        panic!("could not mint observer token");
+    };
+    assert!(matches!(
+        context(&other_scope),
+        InvestigationResponse::IncidentContext {
+            rule_suppression: None,
+            ..
+        }
+    ));
+
+    // A newer trigger with an unsuppressed diff replaces the prior explanation.
+    assert!(matches!(
+        f.admin(AdminRequest::RevokeExpectationRule {
+            rule_id: big,
+            actor: "operator".into(),
+            reason: "reviewed".into(),
+        }),
+        AdminResponse::RuleDecided { .. }
+    ));
+    let observation = f.put(
+        3,
+        vec![
+            socket("unexpected.service", 22),
+            socket("one.service", 4100),
+        ],
+    );
+    assert!(f.saw_trigger(observation));
+    assert!(matches!(
+        context(&token),
+        InvestigationResponse::IncidentContext {
+            rule_suppression: None,
+            ..
+        }
+    ));
+}

@@ -763,7 +763,7 @@ function workspaceView(ctx, caps) {
     for (const fn of evidenceListeners) fn();
   };
   // Built first: it indexes added/removed sockets that the fact tables below mark.
-  const changesSlot = changesCard(inc, ctx.changes, { watchMap, triggers: ctx.triggers ?? [] });
+  const changesSlot = changesCard(inc, ctx.changes, { watchMap, triggers: ctx.triggers ?? [], ruleSuppression: ctx.rule_suppression });
 
   const incActions = state.actions.list.filter((a) => a.incident_id === inc.incident_id);
   const incPending = incActions.filter(isAwaiting).length;
@@ -2057,12 +2057,13 @@ function changeView(c, actionFor) {
   );
 }
 
-function changesCard(inc, r, { watchMap = new Map(), triggers = [] } = {}) {
-  if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
+function changesCard(inc, r, { watchMap = new Map(), triggers = [], ruleSuppression = null } = {}) {
+  const suppressed = suppressionNote(inc, triggers, ruleSuppression);
+  if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, suppressed, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
   {
     // "Allow for this service": only on set_diff socket watches, only for admins.
     // A socket an active rule already covers is marked instead (matched here in
-    // the browser against the listed rules; control-d only reports a count).
+    // the browser against the currently active rules).
     const allowFor = (c) => {
       const w = watchMap.get(c.watch_id);
       if (c.collector_type !== 'sockets.listening' || c.diff.kind !== 'set' || w?.trigger?.type !== 'set_diff') return () => null;
@@ -2079,7 +2080,6 @@ function changesCard(inc, r, { watchMap = new Map(), triggers = [] } = {}) {
         );
       };
     };
-    const suppressed = suppressionNote(inc, triggers);
     const n = r.changes.length;
     for (const c of r.changes) {
       if (c.diff.kind === 'set' && c.collector_type === 'sockets.listening') {
@@ -2908,12 +2908,19 @@ const suppressedCount = (reason) => {
   return m ? Number(m[1]) : 0;
 };
 
-/**
- * control-d appends "(k suppressed by rules)" to a set_diff trigger reason (and
- * so to the incident summary) when active rules filtered items. The rule IDs
- * themselves are not exposed to the console, only the count.
- */
-function suppressionNote(inc, triggers) {
+function suppressionNote(inc, triggers, ruleSuppression) {
+  const href = `#/rules?host=${enc(inc.host_id)}`;
+  if (ruleSuppression?.rules.length) {
+    const { rules, total } = ruleSuppression;
+    return notice('', 'rules', [
+      el('strong', null, `Suppressed by ${plural(rules.length, 'rule')} (${plural(total, 'item')} total)`),
+      el('ul', null, rules.map((r) => el('li', null,
+        el('a', { href, title: r.rule_id }, r.rationale),
+        ` (${plural(r.count, 'item')})`,
+      ))),
+    ]);
+  }
+  // Older triggers carry the count in the reason.
   const sets = triggers.filter((t) => /^set '/.test(t.reason ?? '')).sort((a, b) => b.event_id - a.event_id);
   const latest = sets[0] ?? null;
   const n = latest ? suppressedCount(latest.reason) : suppressedCount(inc.summary);

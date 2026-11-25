@@ -731,6 +731,16 @@ export function parseRulesQuery({ status = null, host_id = null, limit = null, b
   };
 }
 
+export function publicRuleSuppression(suppression) {
+  if (!Array.isArray(suppression?.rules) || !suppression.rules.length) return null;
+  return {
+    total: suppression.total,
+    rules: suppression.rules.map(({ rule_id, rationale, suppressed_keys, count }) => ({
+      rule_id, rationale, suppressed_keys: suppressed_keys.slice(0, 20), count,
+    })),
+  };
+}
+
 export function publicBacktest(b) {
   if (!b || typeof b !== 'object') return null;
   const n = (v) => (Number.isFinite(v) ? v : 0);

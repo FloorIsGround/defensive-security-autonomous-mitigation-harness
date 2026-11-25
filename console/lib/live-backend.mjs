@@ -29,6 +29,7 @@ import {
   parseTriggersQuery,
   publicBacktest,
   publicRuleRecord,
+  publicRuleSuppression,
   publicRunEvent,
   publicRunSummary,
   publicTrigger,
@@ -284,6 +285,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
         active_watches: r.active_watches,
         recent_observations: r.recent_observations,
         findings: r.findings,
+        rule_suppression: publicRuleSuppression(r.rule_suppression),
         run: publicRun(runs.has(incidentId) && Date.parse(runs.get(incidentId).expires_at) > Date.now() ? runs.get(incidentId) : null),
       };
     },

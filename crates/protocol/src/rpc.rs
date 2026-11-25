@@ -14,7 +14,7 @@ use crate::action::{
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
 use crate::profile::HostProfileSummary;
-use crate::rules::ExpectationRuleSpec;
+use crate::rules::{ExpectationRuleSpec, RuleSuppression};
 use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
@@ -426,6 +426,8 @@ pub enum InvestigationResponse {
         active_watches: Vec<WatchSpec>,
         recent_observations: Vec<ObservationSlice>,
         findings: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_suppression: Option<RuleSuppression>,
     },
     Observations {
         observations: Vec<ObservationSlice>,

@@ -433,12 +433,14 @@ const sockScope = (host, watch = 'base-sockets-listening') => ({ host_id: host, 
  * for approval (with its stored backtest), and a history of rejected, revoked
  * and expired rules. Backtests are computed against the demo observations.
  */
+export const RESOLVER_RULE_ID = 'rule-5e2c7a10-3b1d-4f0e-9a44-0c6f1d2b8e71';
+
 export function buildDemoRules(S, nowMs) {
   const iso = (ago) => new Date(nowMs - ago).toISOString();
   const rule = (o) => ({ backtest: null, decided_by: null, decided_at: null, decision_note: null, hit_count: 0, last_matched_at: null, run_id: null, incident_id: null, ...o });
   const rules = [
     rule({
-      rule_id: 'rule-5e2c7a10-3b1d-4f0e-9a44-0c6f1d2b8e71', status: 'active', origin: 'operator', proposed_by: 'j.rivera',
+      rule_id: RESOLVER_RULE_ID, status: 'active', origin: 'operator', proposed_by: 'j.rivera',
       spec: { scope: sockScope('edge-vm-07', null), matches: [{ op: 'eq', field: 'systemd_unit', value: 'systemd-resolved.service' }, { op: 'eq', field: 'bind_scope', value: 'loopback' }, { op: 'in', field: 'local_port', values: [53, 5355] }], effect: 'allow_optional', rationale: 'Stub resolver binds and releases its loopback listeners on network changes.', expires_at: null },
       created_at: iso(9 * DAY), decided_by: 'j.rivera', decided_at: iso(9 * DAY), hit_count: 37, last_matched_at: iso(11 * MIN),
     }),

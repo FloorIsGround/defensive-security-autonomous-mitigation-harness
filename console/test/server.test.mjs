@@ -2565,9 +2565,17 @@ describe('expectation rules (demo)', () => {
     assert.equal((await get(port, `${base}&before=invalid`)).status, 400);
   });
 
-  test('a demo trigger reports items suppressed by rules, as control-d appends it to the reason', async () => {
+  test('demo incident context identifies the rule responsible for suppression', async () => {
     const t = (await get(port, '/api/triggers?incident_id=inc-2026-0042')).json.triggers;
     assert.ok(t.some((x) => /\(1 suppressed by rules\)$/.test(x.reason ?? '')));
+    const ctx = (await get(port, '/api/incidents/inc-2026-0042')).json;
+    const rules = (await get(port, '/api/rules?host_id=edge-vm-07')).json.rules;
+    const resolver = rules.find((r) => r.spec.matches.some((c) => c.value === 'systemd-resolved.service'));
+    assert.deepEqual(ctx.rule_suppression, {
+      total: 1,
+      rules: [{ rule_id: resolver.rule_id, rationale: resolver.spec.rationale, suppressed_keys: ['udp:127.0.0.53:53'], count: 1 }],
+    });
+    assert.equal((await get(port, '/api/incidents/inc-2026-0039')).json.rule_suppression, null);
   });
 });
 
@@ -2585,10 +2593,15 @@ describe('expectation rules over a mock control-d', () => {
     };
     const denial = (code, message, policy_version) => ({ admin_result: 'error', code, message, decision: { allowed: false, rule_id: code, reason: message, policy_version } });
     const cursor = JSON.stringify([now, record.rule_id]);
+    const rule_suppression = { total: 31, rules: [{ rule_id: record.rule_id, rationale: 'Expected nginx listener', suppressed_keys: ['tcp:127.0.0.1:443'], count: 31 }] };
     const invSeen = [];
     const admSeen = [];
     const invSrv = await mockUdsServer(inv, (frame) => {
       invSeen.push(frame);
+      if (frame.request.op === 'get_incident_context') {
+        return { result: 'incident_context', incident: { incident_id: 'inc-1', host_id: 'edge-x' }, active_watches: [], recent_observations: [], findings: [],
+          rule_suppression: { ...rule_suppression, capability_token: 'cap-LEAK' } };
+      }
       return frame.request.op === 'list_expectation_rules' ? { result: 'expectation_rules', rules: [{ ...record, capability_token: 'cap-LEAK' }], next_before: cursor } : { result: 'error', code: 'invalid_request', message: 'unexpected' };
     });
     const admSrv = await mockUdsServer(adm, (frame) => {
@@ -2626,6 +2639,9 @@ describe('expectation rules over a mock control-d', () => {
       assert.equal(invSeen.at(-1).capability_token, 'browse-token-LEAK');
       assert.deepEqual(Object.keys(l1.json.rules[0]).sort(), RULE_KEYS);
       assert.equal(track(await post(ro.port, '/api/admin/rules/backtest', { rule: serviceRule('edge-x', null) })).status, 403);
+
+      const incident = track(await get(ro.port, '/api/incidents/inc-1'));
+      assert.deepEqual(incident.json.rule_suppression, rule_suppression);
 
       // With admin: every host.
       const l2 = track(await get(rw.port, '/api/rules'));

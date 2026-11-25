@@ -81,6 +81,23 @@ pub enum RuleOrigin {
     Investigator,
 }
 
+/// Suppression captured when a set-diff trigger is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSuppression {
+    pub rules: Vec<RuleSuppressionEntry>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSuppressionEntry {
+    pub rule_id: String,
+    pub rationale: String,
+    pub suppressed_keys: Vec<String>,
+    pub count: usize,
+}
+
 /// A rule selected for evaluation by the control plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRule {
