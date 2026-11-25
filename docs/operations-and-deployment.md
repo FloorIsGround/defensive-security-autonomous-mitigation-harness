@@ -214,7 +214,7 @@ Example profile:
 }
 ```
 
-`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16); `expected_services` are validated systemd unit names (at most 64); `approved_file_roots` holds at most 32 normalized absolute paths. The agent opens the profile once and accepts only regular, valid UTF-8 files owned by root or the agent user, with a 64 KiB read limit. The file must be writable only by its owner. A group- or world-writable parent directory must have the sticky bit set. The applied summary (tags, expected services, effective collectors) is reported to the control plane on registration; the control plane treats it as informational.
+`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16); `expected_services` are validated systemd unit names (at most 64); `approved_file_roots` holds at most 32 normalized absolute paths. The agent opens the profile once and accepts only regular, valid UTF-8 files owned by root or the agent user, with a 64 KiB read limit. The file must be writable only by its owner. Every ancestor through `/` must be a real directory owned by root or the agent user. Group or world write access is permitted only on root-owned ancestors with the sticky bit set. The applied summary (tags, expected services, effective collectors) is reported to the control plane on registration; the control plane treats it as informational.
 
 ### Onboard a host with a role template
 
