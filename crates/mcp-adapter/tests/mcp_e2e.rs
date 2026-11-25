@@ -32,11 +32,13 @@ const READ_TOOLS: &[&str] = &[
     "list_investigation_runs",
     "get_run_events",
     "list_trigger_queue",
+    "list_expectation_rules",
 ];
 const WRITE_TOOLS: &[&str] = &[
     "start_investigation_run",
     "propose_ephemeral_watch",
     "record_hypothesis_or_finding",
+    "propose_expectation_rule",
 ];
 
 struct TestDir(PathBuf);
@@ -219,6 +221,105 @@ fn baseline() -> Value {
         "wake_policy":{"cooldown_seconds":60,"max_wakeups_per_hour":4},
         "lifecycle":{"enabled":true}
     })
+}
+
+fn sockets_baseline() -> Value {
+    json!({
+        "id":"listeners", "version":1, "host_id":HOST, "class":"baseline",
+        "collector":{"type":"sockets.listening","parameters":{"include_tcp":true,"include_udp":false,"include_ipv6":true,"resolve_process":true}},
+        "schedule":{"interval_seconds":30,"timeout_seconds":5},
+        "trigger":{"type":"set_diff","compare_against":"last_observed","set_field":"sockets",
+                   "identity_key":"socket_key","ignore_fields":["inode","pid","pid_start_time_ticks"]},
+        "wake_policy":{"cooldown_seconds":60,"max_wakeups_per_hour":4},
+        "lifecycle":{"enabled":true}
+    })
+}
+
+fn socket_entry(key: &str, port: u16, unit: &str) -> Value {
+    json!({
+        "socket_key":key, "protocol":"tcp", "local_addr":"127.0.0.5", "local_port":port,
+        "uid":1000, "inode":3, "systemd_unit":unit
+    })
+}
+
+fn seed_sockets_incident(service: &ControlService) {
+    assert!(matches!(
+        service.handle_admin_request(AdminRequest::EnrollHost {
+            host_id: HOST.into(),
+            agent_public_key_hex: None,
+        }),
+        AdminResponse::HostEnrolled { .. }
+    ));
+    assert!(matches!(
+        service.handle_admin_request(AdminRequest::ApplyBaselineWatch {
+            spec: serde_json::from_value::<WatchSpec>(sockets_baseline()).unwrap(),
+            actor: "operator".into(),
+            rationale: "monitor local listeners".into(),
+        }),
+        AdminResponse::WatchApplied { .. }
+    ));
+    let replies = service.handle_agent_message(AgentToControl::Register {
+        protocol_version: WIRE_PROTOCOL_VERSION,
+        host_id: HOST.into(),
+        agent_version: "test".into(),
+        boot_id: "boot".into(),
+        session_id: "session".into(),
+        active_bundle_version: 0,
+        active_bundle_digest: None,
+        sent_at: Utc::now(),
+    });
+    assert!(matches!(
+        replies.first(),
+        Some(ControlToAgent::RegisterAck { accepted: true, .. })
+    ));
+    let snapshots = [
+        vec![socket_entry("tcp:127.0.0.5:22", 22, "sshd.service")],
+        vec![
+            socket_entry("tcp:127.0.0.5:22", 22, "sshd.service"),
+            socket_entry("tcp:127.0.0.5:4002", 4002, "nxserver.service"),
+        ],
+    ];
+    for (index, sockets) in snapshots.into_iter().enumerate() {
+        let seq_no = index as u64 + 1;
+        let data = json!({"count":sockets.len(), "partial_attribution":false, "sockets":sockets});
+        let observation = ObservationRecord {
+            host_id: HOST.into(),
+            session_id: "session".into(),
+            seq_no,
+            watch_id: "listeners".into(),
+            spec_version: 1,
+            collector_type: CollectorType::SocketsListening,
+            observed_at: Utc::now(),
+            status: ObservationStatus::Ok,
+            state_hash: canonical_sha256_hex(&data).unwrap(),
+            payload: ObservationPayload::Snapshot { data },
+            is_reconciliation: false,
+            sustained_count: None,
+            sustained_active: None,
+            partial_reasons: vec![],
+        };
+        let replies =
+            service.handle_agent_message(AgentToControl::PushObservationDelta { observation });
+        assert!(matches!(replies.as_slice(),
+            [ControlToAgent::ObservationAck { acked_seq_no, .. }] if *acked_seq_no == seq_no));
+    }
+}
+
+fn expectation_rule(expires_at: Option<Value>) -> Value {
+    let mut rule = json!({
+        "scope":{"host_id":HOST,"collector":"sockets.listening"},
+        "matches":[
+            {"op":"eq","field":"systemd_unit","value":"nxserver.service"},
+            {"op":"eq","field":"bind_scope","value":"loopback"},
+            {"op":"range","field":"local_port","min":4000,"max":4100}
+        ],
+        "effect":"allow_optional",
+        "rationale":"expected local service listener"
+    });
+    if let Some(expires_at) = expires_at {
+        rule["expires_at"] = expires_at;
+    }
+    rule
 }
 
 fn seed_incident(service: &ControlService) {
@@ -498,6 +599,188 @@ async fn investigator_flow_preserves_controller_decisions() {
     assert_eq!(
         unauthorized.tool("list_hosts", json!({}), true).await["result"],
         "error"
+    );
+    server_task.abort();
+    assert!(server_task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn investigator_proposes_expectation_rule_for_current_run() {
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    seed_sockets_incident(&service);
+    let AdminResponse::Incidents { incidents } =
+        service.handle_admin_request(AdminRequest::ListIncidents)
+    else {
+        panic!("could not discover fixture incident")
+    };
+    assert_eq!(incidents.len(), 1);
+    let incident_id = incidents[0].incident_id.clone();
+    let AdminResponse::TokenMinted { token, .. } = service.handle_admin_request(
+        AdminRequest::MintCapabilityToken {
+            principal_id: "investigator".into(),
+            role: PrincipalRole::Investigator,
+            allowed_hosts: vec![HOST.into()],
+            allowed_collectors: vec![CollectorType::SocketsListening],
+            incident_id: Some(incident_id.clone()),
+            ttl_seconds: 300,
+        },
+    )
+    else {
+        panic!("could not mint fixture token")
+    };
+    let AdminResponse::TokenMinted {
+        token: observer_token,
+        ..
+    } = service.handle_admin_request(AdminRequest::MintCapabilityToken {
+        principal_id: "observer".into(),
+        role: PrincipalRole::Observer,
+        allowed_hosts: vec![HOST.into()],
+        allowed_collectors: vec![CollectorType::SocketsListening],
+        incident_id: Some(incident_id.clone()),
+        ttl_seconds: 300,
+    })
+    else {
+        panic!("could not mint observer token")
+    };
+    let socket = dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let server_task = tokio::spawn(server.serve_investigation(service));
+    let mut client = Client::new(Mode::Investigator, socket.clone(), token);
+    client
+        .handshake("2025-03-26", &[READ_TOOLS, WRITE_TOOLS].concat())
+        .await;
+
+    // Before any run exists the proposal is refused locally...
+    let reply = client
+        .request(
+            "tools/call",
+            json!({"name":"propose_expectation_rule","arguments":{
+                "idempotency_key":"early","rule":expectation_rule(None)
+            }}),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+    assert_eq!(
+        reply["error"]["message"],
+        "No investigation run is active; call start_investigation_run first"
+    );
+    // ... and the caller cannot choose the run binding.
+    let reply = client
+        .request(
+            "tools/call",
+            json!({"name":"propose_expectation_rule","arguments":{
+                "run_id":"run-x","idempotency_key":"early","rule":expectation_rule(None)
+            }}),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+    assert_eq!(
+        reply["error"]["message"],
+        "run_id is bound to the adapter's current investigation run"
+    );
+
+    let run = client
+        .tool(
+            "start_investigation_run",
+            json!({
+                "incident_id":incident_id, "backend_id":"mcp",
+                "model_id":"fixture", "prompt_schema_version":"1"
+            }),
+            false,
+        )
+        .await;
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+
+    let accepted = client
+        .tool(
+            "propose_expectation_rule",
+            json!({
+                "idempotency_key":"nx",
+                "rule":expectation_rule(Some(json!(Utc::now() + chrono::Duration::days(3))))
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(accepted["result"], "rule_proposal_evaluated");
+    assert_eq!(accepted["decision"]["allowed"], true);
+    assert_eq!(accepted["decision"]["policy_version"], 1);
+    let rule_id = accepted["rule_id"].as_str().unwrap().to_string();
+    assert!(rule_id.starts_with("rule-"));
+    assert_eq!(
+        accepted["backtest"],
+        json!({
+            "observations_scanned":2, "triggered_before":1, "triggered_after":0,
+            "items_matched":1, "sample_keys":["tcp:127.0.0.5:4002"],
+            "currently_matching":1
+        })
+    );
+
+    // A gate denial surfaces as a decision, not a crash: investigator rules
+    // must carry an expiry within 30 days.
+    let denied = client
+        .tool(
+            "propose_expectation_rule",
+            json!({"idempotency_key":"no-expiry","rule":expectation_rule(None)}),
+            false,
+        )
+        .await;
+    assert_eq!(denied["result"], "rule_proposal_evaluated");
+    assert_eq!(denied["decision"]["allowed"], false);
+    assert_eq!(denied["decision"]["rule_id"], "rule-gate/investigator-expiry");
+    assert!(denied["rule_id"].is_null());
+    assert!(denied["backtest"].is_null());
+
+    // Unknown rule fields are rejected against the closed typed schema.
+    let mut unknown = expectation_rule(Some(json!(Utc::now() + chrono::Duration::days(3))));
+    unknown["rationale_backup"] = json!("not part of the schema");
+    let reply = client
+        .request(
+            "tools/call",
+            json!({"name":"propose_expectation_rule","arguments":{
+                "idempotency_key":"unknown-field","rule":unknown
+            }}),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+
+    let listed = client
+        .tool("list_expectation_rules", json!({"statuses":["proposed"]}), false)
+        .await;
+    assert_eq!(listed["result"], "expectation_rules");
+    let rules = listed["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["rule_id"], *rule_id);
+    assert_eq!(rules[0]["status"], "proposed");
+    assert_eq!(rules[0]["origin"], "investigator");
+    assert_eq!(rules[0]["run_id"], *run_id);
+    assert_eq!(rules[0]["incident_id"], *incident_id);
+    assert_eq!(rules[0]["spec"]["matches"][0]["value"], "nxserver.service");
+    assert_eq!(rules[0]["backtest"]["observations_scanned"], 2);
+    assert_eq!(rules[0]["hit_count"], 0);
+
+    // An invalid status filter surfaces as a tool error, not a crash.
+    let invalid = client
+        .tool("list_expectation_rules", json!({"statuses":["bogus"]}), true)
+        .await;
+    assert_eq!(invalid["result"], "error");
+    assert_eq!(invalid["code"], "invalid_request");
+    assert_eq!(invalid["message"], "unknown expectation rule status");
+
+    // Read-only mode lists the same scoped rules but cannot propose.
+    let mut observer = Client::new(Mode::ReadOnly, socket.clone(), observer_token);
+    observer.handshake("2024-11-05", READ_TOOLS).await;
+    let observed = observer
+        .tool("list_expectation_rules", json!({"host_id":HOST}), false)
+        .await;
+    assert_eq!(observed["rules"][0]["rule_id"], *rule_id);
+    let reply = observer
+        .request("tools/call", json!({"name":"propose_expectation_rule","arguments":{}}))
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+    assert_eq!(
+        reply["error"]["message"],
+        "Tool is unavailable in this mode"
     );
     server_task.abort();
     assert!(server_task.await.unwrap_err().is_cancelled());
