@@ -5,13 +5,16 @@ use defsec_policy::{
     control_gate::{WakeBudgetConfig, WakeDecision, check_wake_budget},
     edge_floor::{EdgeSafetyConfig, is_valid_identifier},
     predicate::{PredicateOutcome, evaluate_predicate},
+    rules::apply_expectation_rules,
 };
 use defsec_protocol::{
     audit::AuditEventType::{BundleAcked, IncidentOpened},
     canonical::canonical_sha256_hex,
     observation::{ObservationPayload, ObservationRecord, ObservationStatus},
     rpc::{PolicyDecision, Severity},
-    watch::{CollectorSpec, DataClassification, TriggerPredicate, WatchClass, WatchSpec},
+    watch::{
+        CollectorSpec, CompareTarget, DataClassification, TriggerPredicate, WatchClass, WatchSpec,
+    },
     wire::{
         AgentToControl, BundleAckStatus, ControlToAgent, WIRE_PROTOCOL_VERSION, WatchRunSummary,
     },
@@ -20,7 +23,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::{
-    ledger::{audit, json_column},
+    expectation_rules::{active_rules, record_rule_hits},
+    ledger::{audit, json_column, optional_json},
     service::{
         ControlError, ControlService, Result, active_watches, bundle, record_decision,
         require_host, stamp, uuid,
@@ -436,6 +440,31 @@ fn ingest(
             errors,
             0,
         );
+        let outcome = if let TriggerPredicate::SetDiff {
+            compare_against, ..
+        } = &spec.trigger
+            && matches!(
+                outcome,
+                PredicateOutcome::Triggered { .. } | PredicateOutcome::NotTriggered
+            ) {
+            let reference = match compare_against {
+                CompareTarget::LastObserved => state.last_sample.as_ref(),
+                CompareTarget::AcceptedBaseline => state.baseline.as_ref(),
+            };
+            let rules = active_rules(db, &o.host_id, o.collector_type, &o.watch_id, now)?;
+            let evaluation = apply_expectation_rules(
+                &spec.trigger,
+                o.collector_type,
+                outcome,
+                sample,
+                reference,
+                &rules,
+            );
+            record_rule_hits(db, &evaluation.matched_rule_ids, now)?;
+            evaluation.outcome
+        } else {
+            outcome
+        };
         let freshness = sample.map(|_| {
             let observed = o.observed_at.min(now);
             stamp(
@@ -515,16 +544,6 @@ fn read_state(db: &Connection, spec: &WatchSpec) -> Result<WatchState> {
             freshness:r.get::<_,Option<String>>(9)?.map(|v| crate::service::parse_stamp(&v,9)).transpose()?,
             created:crate::service::parse_stamp(&r.get::<_,String>(10)?,10)?,summary:optional_json(r,11)?,summary_session:r.get(12)?,summary_errors:r.get(13)?,
         }))?)
-}
-
-fn optional_json<T: serde::de::DeserializeOwned>(
-    r: &rusqlite::Row<'_>,
-    index: usize,
-) -> rusqlite::Result<Option<T>> {
-    r.get::<_, Option<String>>(index)?
-        .as_ref()
-        .map(|_| json_column(r, index))
-        .transpose()
 }
 
 fn heartbeat_watch(

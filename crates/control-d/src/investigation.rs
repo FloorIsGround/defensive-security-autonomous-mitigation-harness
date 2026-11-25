@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::{
+    expectation_rules::RuleStore,
     ledger::{audit, json_column, rows},
     service::{
         ControlError, ControlService, Result,
@@ -87,7 +88,39 @@ impl ControlService {
                 return Err(ControlError::denied("investigation run is inactive"));
             }
         }
+        let rule_store = RuleStore {
+            db,
+            now,
+            request: request_id,
+            policy_version: self.policy().policy_version,
+        };
         let response = match call.request {
+            InvestigationRequest::ProposeExpectationRule {
+                run_id,
+                idempotency_key,
+                rule,
+            } => {
+                require_investigator(&capability)?;
+                let incident = authorize_run(db, &capability, &run_id)?;
+                rule_store.propose(&capability, &incident, &run_id, &idempotency_key, rule)?
+            }
+            InvestigationRequest::ListExpectationRules {
+                host_id,
+                statuses,
+                limit,
+            } => {
+                if let Some(host) = &host_id {
+                    authorize_host(&capability, host)?;
+                }
+                InvestigationResponse::ExpectationRules {
+                    rules: rule_store.list(
+                        host_id.as_deref(),
+                        Some(&capability.allowed_hosts),
+                        statuses.as_deref(),
+                        limit,
+                    )?,
+                }
+            }
             InvestigationRequest::ListHosts { limit } => InvestigationResponse::Hosts {
                 hosts: list_hosts(db)?
                     .into_iter()

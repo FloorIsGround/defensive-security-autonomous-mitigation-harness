@@ -153,6 +153,8 @@ pub enum TriggerPredicate {
         compare_against: CompareTarget,
         set_field: String,
         identity_key: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignore_fields: Vec<String>,
     },
     ThresholdSustained {
         field: String,
@@ -239,6 +241,19 @@ pub enum DataClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_set_diff_watch_preserves_signed_canonical_bytes() {
+        const LEGACY: &str = concat!(
+            r#"{"class":"baseline","collector":{"parameters":{"include_ipv6":true,"include_tcp":true,"include_udp":true,"resolve_process":true},"type":"sockets.listening"},"host_id":"edge-1","id":"sockets","incident_id":null,"#,
+            r#""lifecycle":{"enabled":true,"expires_at":null,"max_runs":null},"schedule":{"interval_seconds":30,"timeout_seconds":5},"trigger":{"compare_against":"accepted_baseline","identity_key":"socket_key","set_field":"sockets","type":"set_diff"},"version":1,"wake_policy":{"cooldown_seconds":60,"max_wakeups_per_hour":4}}"#
+        );
+        let spec: WatchSpec = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(
+            crate::canonical::to_canonical_json_bytes(&spec).unwrap(),
+            LEGACY.as_bytes()
+        );
+    }
 
     #[test]
     fn rejects_unknown_fields_in_watch_spec() {

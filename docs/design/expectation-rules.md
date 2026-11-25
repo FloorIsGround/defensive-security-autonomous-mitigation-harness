@@ -96,7 +96,7 @@ pub fn apply_expectation_rules(
 ) -> RuleEvaluation
 ```
 
-* Only applies when `predicate` is `SetDiff` and `raw` is `Triggered` or `NotTriggered` with a valid sample. Every other outcome is returned unchanged.
+* Only applies when `predicate` is `SetDiff` using the collector registry’s set field and identity key, and `raw` is `Triggered` or `NotTriggered` with a valid sample. Every other outcome is returned unchanged.
 * `AllowOptional`: drop added keys whose *current* item matches, removed keys whose *reference* item matches, and modified keys whose current item matches.
 * `IgnoreModified`: drop modified keys whose current item matches.
 * `RequirePresent`: if no current item matches, record the rule in `missing_required`. A non-empty `missing_required` makes the outcome `Triggered` even when the diff is empty after filtering.
@@ -106,7 +106,7 @@ pub fn apply_expectation_rules(
 
 ### `set_diff` volatile fields
 
-`TriggerPredicate::SetDiff` gains `#[serde(default, skip_serializing_if = "Vec::is_empty")] ignore_fields: Vec<String>`. These fields are removed from both items before the `modified` comparison. Existing signed specs serialize identically. The edge floor validates it: ≤ 8 entries, each a valid field identifier. Recommended for sockets: `["inode","pid","pid_start_time_ticks"]`.
+`TriggerPredicate::SetDiff` gains `#[serde(default, skip_serializing_if = "Vec::is_empty")] ignore_fields: Vec<String>`. These top-level item fields are removed from both items before the `modified` comparison. Existing signed specs serialize identically. The edge floor validates it: ≤ 8 entries, each a valid field identifier. Recommended for sockets: `["inode","pid","pid_start_time_ticks"]`.
 
 ## Gate (`crates/policy/src/rule_gate.rs`)
 
@@ -150,6 +150,7 @@ CREATE TABLE expectation_rules (
 CREATE INDEX expectation_rules_scope ON expectation_rules (host_id, collector_type, status);
 ```
 
+* Migration v5 also stores proposal receipts keyed by run and idempotency key, so retries return the original policy decision and backtest. Denied submissions get receipts and policy decisions. Only stored proposals consume the per-run quota, and only unexpired pending proposals consume the host quota.
 * An expired rule is never applied. It is reported as `expired` (computed, not stored).
 * `hit_count` and `last_matched_at` update in the same transaction as the observation that matched.
 * Audit events (new `AuditEventType` variants): `RuleProposed`, `RuleActivated`, `RuleRejected`, `RuleRevoked`. Activation records the approver and the canonical spec hash.
@@ -191,6 +192,8 @@ pub struct ExpectationRuleRecord {
     pub decision_note: Option<String>, pub hit_count: u64, pub last_matched_at: Option<DateTime<Utc>>,
 }
 ```
+
+Backtests order observations by ledger receipt order and use the watch revision associated with each observation. They reconstruct the prior successful sample by receipt order and the accepted baseline by promotion time. Historical-session samples that did not advance the live checkpoint can affect this reconstruction. A promotion timestamp equal to the receipt timestamp is treated as later. Investigator backtests include baseline watches and watches from the investigator's incident.
 
 ## Surfaces
 
