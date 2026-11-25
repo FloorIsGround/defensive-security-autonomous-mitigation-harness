@@ -116,7 +116,7 @@ pub(super) fn cancel(
                 run_id,
                 hash,
                 capability.principal_id,
-                capability.run_id.is_none()
+                capability.run_id.is_none() && capability.may_spawn_runs
             ],
             |row| {
                 Ok((

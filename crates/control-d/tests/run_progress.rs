@@ -624,8 +624,8 @@ fn delegated_tokens_expire_at_the_minimum_and_do_not_narrow_parent_scope() {
 #[test]
 fn delegation_quota_spans_tokens_and_cancel_revokes_the_child() {
     let f = Fixture::new();
-    let (parent, _) = mint_parent(&f, "parent", 7200, &["edge"]);
-    let (same_principal, _) = mint_parent(&f, "parent", 7200, &["edge"]);
+    let (parent, _) = mint_parent(&f, "fixture", 7200, &["edge"]);
+    let (same_principal, _) = mint_parent(&f, "fixture", 7200, &["edge"]);
     let (other, _) = mint_parent(&f, "other", 7200, &["edge"]);
     let runs: Vec<_> = (0..4)
         .map(|_| delegated(f.call(&parent, delegate("inc-1", None))))
@@ -634,12 +634,13 @@ fn delegation_quota_spans_tokens_and_cancel_revokes_the_child() {
     assert!(matches!(f.call(&same_principal, delegate("inc-1", None)),
         Response::Error {code, ..} if code=="delegated_run_quota"));
     delegated(f.call(&other, delegate("inc-1", None)));
-    for wrong in [&other, &runs[1].1] {
+    let no_spawn = f.mint(PrincipalRole::Investigator, &["edge"], None);
+    for wrong in [&other, &no_spawn, &runs[1].1] {
         assert!(
             matches!(f.call(wrong, cancel(run)), Response::Error {code, ..} if code=="forbidden")
         );
     }
-    let (narrow_parent, _) = mint_parent(&f, "parent", 7200, &["foreign"]);
+    let (narrow_parent, _) = mint_parent(&f, "fixture", 7200, &["foreign"]);
     assert!(
         matches!(f.call(&narrow_parent, cancel(run)), Response::Error {code, ..} if code=="forbidden")
     );
@@ -702,6 +703,110 @@ fn delegation_quota_spans_tokens_and_cancel_revokes_the_child() {
         f.service
             .handle_admin_request(AdminRequest::VerifyAuditChain),
         AdminResponse::AuditChainStatus { valid: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn delegated_token_cannot_manage_trigger_leases_over_the_socket() {
+    use control_d::server::{SocketPolicy, UnixServer};
+    use defsec_protocol::wire::{read_frame, write_frame};
+    use tokio::net::UnixStream;
+
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "worker", 300, &["edge"]);
+    let (_, child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    let event_id = f.trigger("pending", "inc-1", "fixture");
+    let lease_request = Request::LeaseNextTrigger {
+        lease_owner: "worker".into(),
+        lease_seconds: 120,
+    };
+    let Response::TriggerLeased { lease: Some(lease) } = f.call(&parent, lease_request.clone())
+    else {
+        panic!("no ongoing lease");
+    };
+    assert_eq!(lease.event_id, event_id);
+    f.trigger("pending", "inc-1", "second fixture");
+
+    let socket = f._dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let task = tokio::spawn(server.serve_investigation(f.service.clone()));
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    for request in [
+        lease_request,
+        Request::CompleteTriggerLease {
+            event_id,
+            lease_token: lease.lease_token.clone(),
+            run_id: None,
+            summary: None,
+        },
+        Request::FailTriggerLease {
+            event_id,
+            lease_token: lease.lease_token,
+            error: "fixture".into(),
+            retryable: true,
+        },
+    ] {
+        write_frame(
+            &mut stream,
+            &InvestigationCall {
+                request_id: "child-lease".into(),
+                capability_token: child.clone(),
+                request,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap(),
+            Some(Response::Error {
+                code: "forbidden".into(),
+                message: "delegated runs cannot manage trigger leases".into(),
+            })
+        );
+    }
+    assert_eq!(f.queue(&parent, Some(vec!["leased".into()])).len(), 1);
+    assert_eq!(f.queue(&parent, Some(vec!["pending".into()])).len(), 1);
+    task.abort();
+}
+
+#[test]
+fn child_cannot_read_another_runs_events_and_cancelled_finish_revokes_it() {
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "parent", 300, &["edge"]);
+    let (run, child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    let (other, other_child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    assert!(matches!(
+        f.call(
+            &other_child,
+            report(&other, json!({"note":"private to the other run"}))
+        ),
+        Response::RunProgressRecorded { .. }
+    ));
+    assert!(matches!(
+        f.call(&child, events(&run, None)),
+        Response::RunEvents { .. }
+    ));
+    assert!(matches!(
+        f.call(&child, events(&other, None)),
+        Response::Error { code, .. } if code == "forbidden"
+    ));
+    assert_eq!(
+        f.call(
+            &child,
+            finish(&run, RunTerminalStatus::Cancelled, "stopped")
+        ),
+        Response::RunFinished {
+            run_id: run.clone(),
+            status: RunTerminalStatus::Cancelled,
+        }
+    );
+    assert!(matches!(
+        f.call(&child, Request::GetCapability {}),
+        Response::Error { message, .. } if message == "invalid capability token"
+    ));
+    assert!(matches!(
+        f.call(&parent, events(&run, None)),
+        Response::RunEvents { .. }
     ));
 }
 
