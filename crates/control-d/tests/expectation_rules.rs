@@ -739,3 +739,144 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn backtest_sample_keys_capped_at_ten_and_items_distinct() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let empty = f.put(1, vec![]);
+    f.promote(empty);
+    let mut sockets = Vec::new();
+    for i in 0..12u16 {
+        sockets.push(socket("nxserver.service", 4000 + i));
+    }
+    f.put(2, sockets.clone());
+    f.put(3, sockets.clone());
+    let rule = allow("nxserver.service");
+    let bt = f.backtest(rule);
+    assert_eq!(bt.items_matched, 12);
+    assert_eq!(bt.sample_keys.len(), 10);
+}
+
+#[test]
+fn backtest_promotion_equal_to_receipt_is_treated_as_later() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let base = f.put(1, vec![]);
+    f.promote(base);
+    let nx = socket("nxserver.service", 4000);
+    let drift = f.put(2, vec![nx.clone()]);
+    f.db()
+        .execute(
+            "UPDATE baseline_revisions SET approved_at=(SELECT received_at FROM observations WHERE observation_id=?1) WHERE observation_id=?2",
+            params![drift, base],
+        )
+        .unwrap();
+    let rule = allow("nxserver.service");
+    let bt = f.backtest(rule);
+    assert_eq!(bt.triggered_before, 0);
+}
+
+#[test]
+fn backtest_triggered_before_reflects_active_require_present_rules() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let empty = f.put(1, vec![]);
+    f.promote(empty);
+    f.put(2, vec![]);
+    let required: ExpectationRuleSpec = serde_json::from_value(json!({
+        "scope":{"host_id":"edge","collector":"sockets.listening","watch_id":"sockets"},
+        "matches":[{"op":"eq","field":"local_port","value":22},
+                   {"op":"eq","field":"systemd_unit","value":"sshd.service"}],
+        "effect":"require_present","rationale":"ssh must be present"
+    }))
+    .unwrap();
+    f.create(required);
+    let rule = allow("nxserver.service");
+    let bt = f.backtest(rule);
+    assert!(bt.triggered_before >= 1);
+}
+
+#[test]
+fn rule_host_scoping_prevents_cross_host_suppression() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let empty = f.put(1, vec![]);
+    f.promote(empty);
+    let nx = socket("nxserver.service", 4000);
+    let mut foreign_rule = allow("nxserver.service");
+    foreign_rule.scope.host_id = "foreign".into();
+    foreign_rule.scope.watch_id = None;
+    f.create(foreign_rule);
+    let drift = f.put(2, vec![nx]);
+    assert!(f.saw_trigger(drift));
+}
+
+#[test]
+fn decide_on_rejected_or_active_rule_errors_without_new_audit_entry() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let empty = f.put(1, vec![]);
+    f.promote(empty);
+    let nx = socket("nxserver.service", 4000);
+    f.put(2, vec![nx.clone()]);
+    let active_id = f.create(allow("nxserver.service"));
+    let (token, run) = f.run(&f.incident());
+    let mut proposed = allow("nxserver.service");
+    proposed.expires_at = Some(Utc::now() + Duration::days(3));
+    let (rejected_id, _) = proposal_result(f.propose(&token, &run, "rej", proposed));
+    f.decide(&rejected_id, false);
+    let before: i64 = f.db().query_row("SELECT COUNT(*) FROM audit_outbox", [], |r| r.get(0)).unwrap();
+    assert!(matches!(f.decide(&active_id, false), AdminResponse::Error { .. }));
+    assert!(matches!(f.decide(&rejected_id, true), AdminResponse::Error { .. }));
+    assert!(matches!(f.decide(&rejected_id, false), AdminResponse::Error { .. }));
+    let after: i64 = f.db().query_row("SELECT COUNT(*) FROM audit_outbox", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, after);
+}
+
+// behavior 2 investigator scope test via manual rows
+#[test]
+fn investigator_backtest_scope_includes_own_incident_and_baseline() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let empty = f.put(1, vec![]);
+    f.promote(empty);
+    let nx = socket("nxserver.service", 4000);
+    f.put(2, vec![nx.clone()]);
+    let incident = f.incident();
+    f.db()
+        .execute(
+            "INSERT INTO incidents (incident_id,host_id,status,priority_json,summary,created_at,updated_at) VALUES ('inc-other','edge','open','{}','other','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    // insert ephemeral watch specs for own and other incident
+    let spec_json: String = f
+        .db()
+        .query_row(
+            "SELECT spec_json FROM watch_specs WHERE host_id='edge' AND watch_id='sockets' AND spec_version=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for (wid, inc) in [("eph-own", incident.as_str()), ("eph-other", "inc-other")] {
+        f.db()
+            .execute(
+                "INSERT INTO watch_specs (host_id,watch_id,spec_version,incident_id,spec_json,creator,active,created_at) VALUES ('edge',?1,1,?2,?3,'operator',1,'2026-01-01T00:00:00Z')",
+                params![wid, inc, spec_json],
+            )
+            .unwrap();
+        let sample = json!({"sockets":[nx.clone()]});
+        f.db()
+            .execute(
+                "INSERT INTO observations (host_id,session_id,seq_no,watch_id,spec_version,collector_type,observed_at,received_at,status_json,state_hash,payload_json,sample_json,record_json) VALUES ('edge','session',?1,?2,1,'sockets.listening','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','\"ok\"','h','{}',?3,'{}')",
+                params![if wid=="eph-own" { 100i64 } else { 101i64 }, wid, sample.to_string()],
+            )
+            .unwrap();
+    }
+    let (token, run) = f.run(&incident);
+    let mut rule = allow("nxserver.service");
+    rule.expires_at = Some(Utc::now() + Duration::days(3));
+    // scope to all watches
+    rule.scope.watch_id = None;
+    let response = f.propose(&token, &run, "scope", rule);
+    let InvestigationResponse::RuleProposalEvaluated { backtest: Some(bt), .. } = response else {
+        panic!("{response:?}")
+    };
+    // baseline watch + own ephemeral = 2 (base empty? Actually baseline watch obs seq1 empty + seq2 nx; plus own ephemeral obs = 3?) 
+    assert_eq!(bt.observations_scanned, 3);
+}
