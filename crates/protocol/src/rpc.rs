@@ -183,6 +183,8 @@ pub enum InvestigationRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ProposeEphemeralWatch {
         run_id: String,
@@ -470,6 +472,8 @@ pub enum InvestigationResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     ProposalEvaluated {
         decision: PolicyDecision,
@@ -546,6 +550,8 @@ pub enum AdminRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ApplyBaselineWatch {
         spec: WatchSpec,
@@ -628,6 +634,8 @@ pub enum AdminResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     WatchApplied {
         watch_id: String,

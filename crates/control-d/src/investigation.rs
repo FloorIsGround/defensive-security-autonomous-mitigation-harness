@@ -168,18 +168,19 @@ impl ControlService {
                 host_id,
                 statuses,
                 limit,
+                before,
             } => {
                 if let Some(host) = &host_id {
                     authorize_host(&capability, host)?;
                 }
-                InvestigationResponse::ExpectationRules {
-                    rules: rule_store.list(
-                        host_id.as_deref(),
-                        Some(&capability.allowed_hosts),
-                        statuses.as_deref(),
-                        limit,
-                    )?,
-                }
+                let (rules, next_before) = rule_store.list(
+                    host_id.as_deref(),
+                    Some(&capability.allowed_hosts),
+                    statuses.as_deref(),
+                    limit,
+                    before.as_deref(),
+                )?;
+                InvestigationResponse::ExpectationRules { rules, next_before }
             }
             InvestigationRequest::ListHosts { limit, tag } => InvestigationResponse::Hosts {
                 hosts: list_hosts(db, tag.as_deref())?

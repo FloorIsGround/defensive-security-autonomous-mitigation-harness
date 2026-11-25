@@ -2547,6 +2547,24 @@ describe('expectation rules (demo)', () => {
     }
   });
 
+  test('demo history returns each rule once across pages and validates cursors', async () => {
+    const base = '/api/rules?status=rejected,revoked,expired';
+    const all = (await get(port, base)).json.rules.map((r) => r.rule_id);
+    assert.ok(all.length >= 2);
+    const seen = [];
+    let before = null;
+    do {
+      const r = await get(port, `${base}&limit=1${before === null ? '' : `&before=${encodeURIComponent(before)}`}`);
+      assert.equal(r.status, 200, r.text);
+      assert.equal(r.json.rules.length, 1);
+      seen.push(r.json.rules[0].rule_id);
+      assert.ok(seen.length <= all.length, 'the cursor always advances');
+      before = r.json.next_before;
+    } while (before !== null);
+    assert.deepEqual(seen, all);
+    assert.equal((await get(port, `${base}&before=invalid`)).status, 400);
+  });
+
   test('a demo trigger reports items suppressed by rules, as control-d appends it to the reason', async () => {
     const t = (await get(port, '/api/triggers?incident_id=inc-2026-0042')).json.triggers;
     assert.ok(t.some((x) => /\(1 suppressed by rules\)$/.test(x.reason ?? '')));
@@ -2566,17 +2584,18 @@ describe('expectation rules over a mock control-d', () => {
       created_at: now, decided_by: null, decided_at: null, decision_note: null, hit_count: 0, last_matched_at: null,
     };
     const denial = (code, message, policy_version) => ({ admin_result: 'error', code, message, decision: { allowed: false, rule_id: code, reason: message, policy_version } });
+    const cursor = JSON.stringify([now, record.rule_id]);
     const invSeen = [];
     const admSeen = [];
     const invSrv = await mockUdsServer(inv, (frame) => {
       invSeen.push(frame);
-      return frame.request.op === 'list_expectation_rules' ? { result: 'expectation_rules', rules: [{ ...record, capability_token: 'cap-LEAK' }] } : { result: 'error', code: 'invalid_request', message: 'unexpected' };
+      return frame.request.op === 'list_expectation_rules' ? { result: 'expectation_rules', rules: [{ ...record, capability_token: 'cap-LEAK' }], next_before: cursor } : { result: 'error', code: 'invalid_request', message: 'unexpected' };
     });
     const admSrv = await mockUdsServer(adm, (frame) => {
       admSeen.push(frame);
       switch (frame.admin_op) {
         case 'list_expectation_rules':
-          return { admin_result: 'expectation_rules', rules: [record] };
+          return frame.before === cursor ? { admin_result: 'expectation_rules', rules: [] } : { admin_result: 'expectation_rules', rules: [record], next_before: cursor };
         case 'backtest_expectation_rule':
           return frame.rule.matches.length === 1
             ? denial('rule-gate/identity-anchor', 'rule must constrain systemd_unit, comm, or uid with eq or in', 6)
@@ -2602,6 +2621,7 @@ describe('expectation rules over a mock control-d', () => {
       const l1 = track(await get(ro.port, '/api/rules?status=proposed,active&host_id=edge-x&limit=20'));
       assert.equal(l1.status, 200, l1.text);
       assert.equal(l1.json.source, 'investigate');
+      assert.equal(l1.json.next_before, cursor);
       assert.deepEqual(invSeen.at(-1).request, { op: 'list_expectation_rules', limit: 20, host_id: 'edge-x', statuses: ['proposed', 'active'] });
       assert.equal(invSeen.at(-1).capability_token, 'browse-token-LEAK');
       assert.deepEqual(Object.keys(l1.json.rules[0]).sort(), RULE_KEYS);
@@ -2611,6 +2631,12 @@ describe('expectation rules over a mock control-d', () => {
       const l2 = track(await get(rw.port, '/api/rules'));
       assert.equal(l2.json.source, 'admin');
       assert.deepEqual(admSeen.at(-1), { admin_op: 'list_expectation_rules', limit: 100 });
+
+      assert.equal(l2.json.next_before, cursor);
+      const l3 = track(await get(rw.port, `/api/rules?before=${encodeURIComponent(cursor)}`));
+      assert.deepEqual(admSeen.at(-1), { admin_op: 'list_expectation_rules', limit: 100, before: cursor });
+      assert.deepEqual(l3.json.rules, []);
+      assert.equal(l3.json.next_before, null);
 
       const rule = serviceRule('edge-x', 'base-sockets');
       const bt = track(await post(rw.port, '/api/admin/rules/backtest', { rule }));

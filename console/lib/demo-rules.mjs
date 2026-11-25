@@ -336,13 +336,30 @@ export function backtestRule(S, rule, nowMs, incidentId = null) {
   return out;
 }
 
-export function listRules(S, { statuses = null, host_id = null, limit = 50 } = {}, nowMs) {
-  return S.rules
+export function listRules(S, { statuses = null, host_id = null, limit = 50, before = null } = {}, nowMs) {
+  let cutoff = null;
+  if (before !== null) {
+    try {
+      const cursor = JSON.parse(before);
+      if (!Array.isArray(cursor) || cursor.length !== 2 || typeof cursor[0] !== 'string' || !Number.isFinite(Date.parse(cursor[0])) ||
+          typeof cursor[1] !== 'string' || !/^[a-zA-Z0-9_.-]{1,96}$/.test(cursor[1])) throw new Error();
+      cutoff = { created_at: cursor[0], rule_id: cursor[1] };
+    } catch {
+      throw new ApiError(400, 'invalid_request', 'invalid expectation rule cursor');
+    }
+  }
+  const compare = (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) ||
+    (a.rule_id < b.rule_id ? -1 : Number(a.rule_id > b.rule_id));
+  const pageSize = Math.min(limit ?? 50, 100);
+  const page = S.rules
     .map((r) => ({ ...r, status: effectiveStatus(r, nowMs) }))
-    .filter((r) => (!host_id || r.spec.scope.host_id === host_id) && (!statuses || statuses.includes(r.status)))
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || a.rule_id.localeCompare(b.rule_id))
-    .slice(0, Math.min(limit ?? 50, 100))
-    .map(publicRuleRecord);
+    .filter((r) => (!host_id || r.spec.scope.host_id === host_id) && (!statuses || statuses.includes(r.status)) && (!cutoff || compare(r, cutoff) > 0))
+    .sort(compare)
+    .slice(0, pageSize + 1);
+  const hasMore = page.length > pageSize;
+  if (hasMore) page.pop();
+  const last = page.at(-1);
+  return { rules: page.map(publicRuleRecord), next_before: hasMore && last ? JSON.stringify([last.created_at, last.rule_id]) : null };
 }
 
 function recordDecision(S, appendAudit, actor, decision, context, nowIso) {

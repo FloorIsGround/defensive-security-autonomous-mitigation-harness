@@ -994,7 +994,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
 
     async rules(query = {}) {
       const q = parseRulesQuery(query);
-      return { available: true, source: enableAdmin ? 'admin' : 'investigate', rules: listRules(S, q, now()), server_time: new Date(now()).toISOString() };
+      return { available: true, source: enableAdmin ? 'admin' : 'investigate', ...listRules(S, q, now()), server_time: new Date(now()).toISOString() };
     },
 
     async backtestRule(body = {}) {

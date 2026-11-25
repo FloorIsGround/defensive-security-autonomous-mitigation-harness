@@ -248,8 +248,9 @@ impl Fixture {
             host_id: None,
             statuses,
             limit: Some(100),
+            before: None,
         });
-        let AdminResponse::ExpectationRules { rules } = response else {
+        let AdminResponse::ExpectationRules { rules, .. } = response else {
             panic!("{response:?}")
         };
         rules
@@ -411,10 +412,11 @@ fn rules_change_only_new_observations_and_record_hits_lifecycle_and_audit() {
             host_id: None,
             statuses: Some(vec!["proposed".into()]),
             limit: Some(10),
+            before: None,
         },
     );
     assert!(
-        matches!(listed, InvestigationResponse::ExpectationRules { rules }
+        matches!(listed, InvestigationResponse::ExpectationRules { rules, .. }
         if rules.len() == 1 && rules[0].rule_id == proposal_id && rules[0].hit_count == 0)
     );
 
@@ -597,6 +599,7 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
             host_id: Some("foreign".into()),
             statuses: None,
             limit: None,
+            before: None,
         },
     );
     assert!(matches!(listed, InvestigationResponse::Error { code, .. } if code == "forbidden"));
@@ -606,11 +609,15 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
             host_id: None,
             statuses: None,
             limit: None,
+            before: None,
         },
     );
     assert_eq!(
         listed,
-        InvestigationResponse::ExpectationRules { rules: vec![] }
+        InvestigationResponse::ExpectationRules {
+            rules: vec![],
+            next_before: None
+        }
     );
 
     for i in 0..3 {
@@ -1004,7 +1011,12 @@ fn admin_rule_gate_denials_return_the_decision_for_each_operation() {
     let approve = f.decide(&id, true);
 
     for response in [create, backtest, approve] {
-        let AdminResponse::Error { code, message, decision: Some(decision) } = response else {
+        let AdminResponse::Error {
+            code,
+            message,
+            decision: Some(decision),
+        } = response
+        else {
             panic!("{response:?}")
         };
         assert!(!decision.allowed);
@@ -1012,5 +1024,95 @@ fn admin_rule_gate_denials_return_the_decision_for_each_operation() {
         assert_eq!(decision.rule_id, code);
         assert_eq!(decision.reason, message);
     }
-    assert!(matches!(f.decide("rule-missing", true), AdminResponse::Error { decision: None, .. }));
+    assert!(matches!(
+        f.decide("rule-missing", true),
+        AdminResponse::Error { decision: None, .. }
+    ));
+}
+
+#[test]
+fn rule_pages_are_exclusive_at_tied_timestamps_and_preserve_scope() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let rule = allow("expected.service");
+    for _ in 0..102 {
+        f.create(rule.clone());
+    }
+    let mut foreign = rule;
+    foreign.scope.host_id = "foreign".into();
+    let foreign_id = f.create(foreign);
+    let db = f.db();
+    db.execute(
+        "UPDATE expectation_rules SET created_at='2026-01-01T00:00:00.000000000Z'
+         WHERE host_id='edge'",
+        [],
+    )
+    .unwrap();
+    let all_ids: Vec<String> = db
+        .prepare("SELECT rule_id FROM expectation_rules WHERE host_id='edge' ORDER BY rule_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+
+    let admin_page = |before| {
+        f.admin(AdminRequest::ListExpectationRules {
+            host_id: Some("edge".into()),
+            statuses: Some(vec!["active".into()]),
+            limit: Some(500),
+            before,
+        })
+    };
+    let AdminResponse::ExpectationRules {
+        rules,
+        next_before: Some(cursor),
+    } = admin_page(None)
+    else {
+        panic!("expected an admin continuation");
+    };
+    let ids = |rules: Vec<ExpectationRuleRecord>| {
+        rules.into_iter().map(|r| r.rule_id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(rules), all_ids[..100]);
+    let AdminResponse::ExpectationRules {
+        rules,
+        next_before: None,
+    } = admin_page(Some(cursor.clone()))
+    else {
+        panic!("expected the final admin page");
+    };
+    assert_eq!(ids(rules), all_ids[100..]);
+    assert!(
+        matches!(admin_page(Some("invalid".into())), AdminResponse::Error { code, decision: None, .. } if code == "invalid_request")
+    );
+
+    let token = f.token(PrincipalRole::Observer, None);
+    let scoped_page = |before| {
+        f.investigate(
+            &token,
+            InvestigationRequest::ListExpectationRules {
+                host_id: None,
+                statuses: Some(vec!["active".into()]),
+                limit: Some(1),
+                before,
+            },
+        )
+    };
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: Some(next),
+    } = scoped_page(Some(cursor))
+    else {
+        panic!("expected a scoped continuation");
+    };
+    assert_eq!(ids(rules), all_ids[100..101]);
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: None,
+    } = scoped_page(Some(next))
+    else {
+        panic!("expected the final scoped page");
+    };
+    assert_eq!(ids(rules), all_ids[101..]);
+    assert_ne!(all_ids[101], foreign_id);
 }

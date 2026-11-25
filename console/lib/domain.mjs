@@ -719,7 +719,7 @@ export function parseRuleRevoke(body) {
   return { reason: requireText(body.reason, 'reason', 1024), actor: requireText(body.actor, 'actor', 128) };
 }
 
-export function parseRulesQuery({ status = null, host_id = null, limit = null } = {}) {
+export function parseRulesQuery({ status = null, host_id = null, limit = null, before = null } = {}) {
   const statuses = status
     ? [...new Set(String(status).split(',').map((s) => s.trim()).filter(Boolean))].map((s) => requireEnum(s, RULE_STATUSES, 'status'))
     : null;
@@ -727,6 +727,7 @@ export function parseRulesQuery({ status = null, host_id = null, limit = null } 
     statuses,
     host_id: host_id ? requireIdent(host_id, 'host_id') : null,
     limit: int(limit, 'limit', { min: 1, max: 100, optional: true }) ?? 100,
+    before: before === null ? null : requireText(before, 'before', 256),
   };
 }
 

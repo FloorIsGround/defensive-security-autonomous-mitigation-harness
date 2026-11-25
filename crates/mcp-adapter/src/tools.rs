@@ -175,6 +175,7 @@ const READ_TOOLS: &[Tool] = &[
                         ]))),
                     ),
                     ("limit", nullable(unsigned(u32::MAX.into()))),
+                    ("before", nullable(string())),
                 ],
             )
         },

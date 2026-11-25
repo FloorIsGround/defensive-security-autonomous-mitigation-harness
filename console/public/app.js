@@ -3129,12 +3129,15 @@ async function renderRules(_arg, stale, route) {
   const hostQ = q?.get('host');
   if (hostQ !== null && hostQ !== undefined) state.rv.host = hostQ;
   const f = state.rv;
-  const qs = (statuses) => {
+  const currentStatuses = 'active,proposed';
+  const historyStatuses = 'rejected,revoked,expired';
+  const qs = (statuses, before = null) => {
     const p = new URLSearchParams({ status: statuses, limit: '100' });
     if (f.host) p.set('host_id', f.host);
+    if (before !== null) p.set('before', before);
     return p;
   };
-  const [cur, hist] = await Promise.all([api(`/api/rules?${qs('active,proposed')}`), api(`/api/rules?${qs('rejected,revoked,expired')}`)]);
+  const [cur, hist] = await Promise.all([api(`/api/rules?${qs(currentStatuses)}`), api(`/api/rules?${qs(historyStatuses)}`)]);
   if (stale()) return null;
   if (cur.available === false) {
     return el(
@@ -3183,13 +3186,43 @@ async function renderRules(_arg, stale, route) {
     pending: emptyState('Nothing waiting for approval', 'reasoner-d may propose a rule for benign, recurring noise. Proposals are inert until an operator approves them here.'),
     history: emptyState('No history yet', 'Rejected, revoked and expired rules stay here for the audit trail.'),
   }[f.tab];
-  const list = lists[f.tab];
+  const tab = f.tab;
+  const list = lists[tab];
+  const cards = el('div', { class: 'rule-list' }, list.map(ruleCard));
+  const emptyCard = el('div', { class: 'card', hidden: list.length > 0 }, el('div', { class: 'card-body' }, empty));
+  const errors = el('div');
+  let before = (tab === 'history' ? hist : cur).next_before ?? null;
+  const more = el('button', { class: 'btn', type: 'button', hidden: before === null }, 'Load more');
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    replace(errors);
+    try {
+      const page = await api(`/api/rules?${qs(tab === 'history' ? historyStatuses : currentStatuses, before)}`);
+      if (stale()) return;
+      if (page.available === false) throw new Error(page.message ?? 'Rules unavailable');
+      const shown = new Set(list.map((r) => r.rule_id));
+      const added = page.rules.filter((r) => !shown.has(r.rule_id) && (tab === 'history' || r.status === (tab === 'pending' ? 'proposed' : 'active')));
+      list.push(...added);
+      cards.append(...added.map(ruleCard));
+      emptyCard.hidden = list.length > 0;
+      tabs.querySelectorAll('.tab-count')[RULE_TABS.findIndex(([id]) => id === tab)].textContent = String(list.length);
+      before = page.next_before ?? null;
+      more.hidden = before === null;
+    } catch (err) {
+      if (!stale()) replace(errors, errorBox(err));
+    } finally {
+      more.disabled = false;
+    }
+  });
   return el(
     'div',
     { class: 'stack rules-view' },
     notes,
     el('div', { class: 'rules-toolbar' }, tabs, el('span', { class: 'spacer' }), hosts.length > 1 || f.host ? hostSel : null),
-    list.length ? el('div', { class: 'rule-list' }, list.map(ruleCard)) : el('div', { class: 'card' }, el('div', { class: 'card-body' }, empty)),
+    cards,
+    emptyCard,
+    errors,
+    more,
   );
 }
 

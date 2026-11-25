@@ -372,10 +372,16 @@ impl ControlService {
                 host_id,
                 statuses,
                 limit,
+                before,
             } => {
-                let response = AdminResponse::ExpectationRules {
-                    rules: rule_store.list(host_id.as_deref(), None, statuses.as_deref(), limit)?,
-                };
+                let (rules, next_before) = rule_store.list(
+                    host_id.as_deref(),
+                    None,
+                    statuses.as_deref(),
+                    limit,
+                    before.as_deref(),
+                )?;
+                let response = AdminResponse::ExpectationRules { rules, next_before };
                 if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
                     return Err(ControlError::invalid(
                         "rule list exceeds the frame limit; lower the limit or filter by host or status",

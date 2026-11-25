@@ -465,6 +465,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
     async rules(query = {}) {
       const q = parseRulesQuery(query);
       const filter = { limit: q.limit };
+      if (q.before !== null) filter.before = q.before;
       if (q.host_id) filter.host_id = q.host_id;
       if (q.statuses) filter.statuses = q.statuses;
       const server_time = new Date().toISOString();
@@ -489,7 +490,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
           throw err;
         }
       }
-      return { available: true, source, rules: (r.rules ?? []).map(publicRuleRecord), server_time };
+      return { available: true, source, rules: (r.rules ?? []).map(publicRuleRecord), next_before: r.next_before ?? null, server_time };
     },
 
     async backtestRule(body = {}) {
