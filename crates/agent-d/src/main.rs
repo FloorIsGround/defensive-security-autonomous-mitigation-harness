@@ -22,6 +22,7 @@ use tokio::{
 
 use agent_d::collectors::RealLinuxCollectors;
 use agent_d::engine::AgentEngine;
+use agent_d::profile::load_profile;
 use agent_d::spool::DurabilityProfile;
 
 const MIN_HEARTBEAT_SECONDS: u64 = 5;
@@ -70,6 +71,11 @@ struct Args {
     /// Ed25519 public key (hex) of the control signing key.
     #[arg(long)]
     control_pub_hex: String,
+
+    /// Optional admin-owned host profile JSON (see docs/operations-and-deployment.md).
+    /// Can only tighten the local safety floor; load failures are fatal.
+    #[arg(long)]
+    profile: Option<PathBuf>,
 
     /// Spool durability profile.
     #[arg(long, value_enum, default_value = "durable")]
@@ -249,9 +255,29 @@ async fn setup(
 
     // MVP: the local safety floor uses its reviewed defaults. A separate
     // trusted administrative path (never the signed bundle) owns this config.
-    let cfg = EdgeSafetyConfig::default();
+    // An optional admin-owned host profile can only tighten it.
+    let base_cfg = EdgeSafetyConfig::default();
+    let (cfg, profile_summary) = match &args.profile {
+        None => (base_cfg, None),
+        Some(path) => {
+            let loaded = load_profile(path, &base_cfg)?;
+            tracing::info!(
+                profile = %path.display(),
+                tags = ?loaded.summary.host_tags,
+                expected_services = ?loaded.summary.expected_services,
+                enabled_collectors = ?loaded
+                    .summary
+                    .enabled_collectors
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>(),
+                "host profile applied; edge floor tightened"
+            );
+            (loaded.cfg, Some(loaded.summary))
+        }
+    };
     let collector = std::sync::Arc::new(RealLinuxCollectors::new());
-    let engine = AgentEngine::new(
+    let mut engine = AgentEngine::new(
         cfg,
         args.host_id.clone(),
         durability,
@@ -259,6 +285,7 @@ async fn setup(
         store,
         collector,
     )?;
+    engine.set_host_profile_summary(profile_summary);
     Ok(engine)
 }
 
@@ -460,6 +487,32 @@ mod tests {
         assert!(parse(&tls).is_ok());
         tls.extend(["--control-sock", "agent.sock"]);
         assert!(parse(&tls).is_err());
+    }
+
+    #[test]
+    fn profile_flag_is_optional_and_parsed_as_a_path() {
+        let base = [
+            "agent-d",
+            "--host-id",
+            "edge-01",
+            "--control-key-id",
+            "key",
+            "--control-pub-hex",
+            "hex",
+        ];
+        let args = Args::try_parse_from(base.to_vec()).unwrap();
+        assert_eq!(args.profile, None);
+
+        let args = Args::try_parse_from(
+            base.into_iter()
+                .chain(["--profile", "/etc/defsecautmit/edge-01.profile.json"])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            args.profile.as_deref(),
+            Some(std::path::Path::new("/etc/defsecautmit/edge-01.profile.json"))
+        );
     }
 
     #[test]

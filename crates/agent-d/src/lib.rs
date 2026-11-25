@@ -1,17 +1,21 @@
 //! `agent-d`: the DefSecAutMit edge agent.
 //!
-//! Milestone 3 scope:
-//! - Four Ubuntu/Debian Linux MVP collectors (`sockets.listening`,
-//!   `systemd.unit_state`, `files.metadata`, `journal.unit_events`) behind a
-//!   single async `CollectorBackend` trait.
+//! Milestone 3 scope plus Phase 11 edge collectors:
+//! - Six Ubuntu/Debian Linux snapshot/stream collectors
+//!   (`sockets.listening`, `systemd.unit_state`, `files.metadata`,
+//!   `journal.unit_events`, `connections.outbound`, `packages.inventory`)
+//!   behind a single async `CollectorBackend` trait.
 //! - `FakeHostCollectors`: deterministic in-process simulator for tests.
 //! - Bounded observation spooling with `Minimal` (RAM) and `Durable` (disk)
 //!   profiles and atomic metadata persistence.
 //! - `AgentEngine`: signed watch bundle verification, hash-staggered
 //!   scheduling, edge-lite diffing, sustained counters, heartbeats.
+//! - Admin-owned host profile loading (`--profile`) that can only tighten
+//!   the local edge safety floor.
 
 pub mod collectors;
 pub mod engine;
+pub mod profile;
 pub mod spool;
 
 pub use collectors::{

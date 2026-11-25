@@ -117,6 +117,87 @@ pub struct FilesMetadataSnapshot {
     pub files: Vec<FileMetadataEntry>,
 }
 
+/// Process-attribution completeness for one outbound flow group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowAttribution {
+    /// Every socket in the group resolved to a process.
+    Full,
+    /// Only some sockets in the group resolved to a process.
+    Partial,
+    /// No socket in the group resolved to a process (or resolution disabled).
+    None,
+}
+
+/// One normalized outbound flow group emitted by `connections.outbound`.
+/// Local ephemeral ports and PIDs are deliberately excluded: they churn and
+/// would make the snapshot unstable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundFlowEntry {
+    /// Stable identity: `<proto>:<remote_addr>:<remote_port>:<uid>:<comm or '?'>`
+    pub flow_key: String,
+    /// `tcp` | `tcp6` | `udp` | `udp6`
+    pub protocol: String,
+    pub remote_addr: String,
+    pub remote_port: u16,
+    pub uid: u32,
+    /// Sorted unique `/proc/net` state names for the grouped sockets.
+    pub states: Vec<String>,
+    /// Number of individual sockets in this group.
+    pub count: u32,
+    #[serde(default)]
+    pub comm: Option<String>,
+    #[serde(default)]
+    pub systemd_unit: Option<String>,
+    pub attribution: FlowAttribution,
+}
+
+/// Normalized snapshot emitted by `connections.outbound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionsOutboundSnapshot {
+    pub flows: Vec<OutboundFlowEntry>,
+    /// Total flow groups found after filtering, including any omitted groups.
+    pub total_flows: u32,
+    pub attribution_partial: bool,
+    /// Present only when flow groups beyond the cap were omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_flows: Option<u32>,
+}
+
+/// One installed package entry emitted by `packages.inventory`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageInventoryEntry {
+    /// Stable identity: `<name>:<arch>`
+    pub package_key: String,
+    pub name: String,
+    pub arch: String,
+    pub version: String,
+}
+
+/// Normalized snapshot emitted by `packages.inventory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackagesInventorySnapshot {
+    pub packages: Vec<PackageInventoryEntry>,
+    /// Total installed packages found, including any omitted entries.
+    pub total_packages: u32,
+    /// SHA-256 of the raw dpkg status file bytes.
+    pub status_file_sha256: String,
+    /// Stanzas that failed to parse and were skipped.
+    #[serde(default)]
+    pub malformed_stanzas: u32,
+    /// Present only when packages beyond the cap were omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_packages: Option<u32>,
+}
+
 /// Bounded, redacted journal record emitted by `journal.unit_events`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -15,6 +15,7 @@ use defsec_policy::edge_floor::{
 };
 use defsec_policy::predicate::SustainedCounterState;
 use defsec_protocol::observation::{ObservationPayload, ObservationRecord, ObservationStatus};
+use defsec_protocol::profile::HostProfileSummary;
 use defsec_protocol::signing::{
     SignedEnvelope, VerifyingKeyStore, DOMAIN_WATCH_BUNDLE_V1,
 };
@@ -193,6 +194,9 @@ pub struct AgentEngine<C: CollectorBackend> {
     reconcile_requested: BTreeSet<String>,
     spool: ObservationSpool,
     semaphore: Arc<Semaphore>,
+    /// Summary of the admin-owned host profile applied at startup (if any);
+    /// reported on Register for the control plane. Informational only.
+    host_profile_summary: Option<HostProfileSummary>,
 }
 
 impl<C: CollectorBackend> AgentEngine<C> {
@@ -308,7 +312,19 @@ impl<C: CollectorBackend> AgentEngine<C> {
             last_reconciliation: BTreeMap::new(),
             reconcile_requested: BTreeSet::new(),
             spool,
+            host_profile_summary: None,
         })
+    }
+
+    /// Attach the summary of an applied admin-owned host profile. Reported on
+    /// Register; the control plane may ignore it.
+    pub fn set_host_profile_summary(&mut self, summary: Option<HostProfileSummary>) {
+        self.host_profile_summary = summary;
+    }
+
+    /// The applied host profile summary, if any (for tests and callers).
+    pub fn host_profile_summary(&self) -> Option<&HostProfileSummary> {
+        self.host_profile_summary.as_ref()
     }
 
     // ------------------------------------------------------------------
@@ -367,6 +383,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
             active_bundle_version: self.active_bundle_version(),
             active_bundle_digest: self.active_bundle_digest().map(str::to_string),
             sent_at: now,
+            host_profile: self.host_profile_summary.clone(),
         }
     }
 

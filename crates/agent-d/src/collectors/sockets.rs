@@ -38,6 +38,8 @@ pub struct RawSocketRow {
     pub protocol: String,
     pub local_addr: String,
     pub local_port: u16,
+    pub remote_addr: String,
+    pub remote_port: u16,
     pub uid: u32,
     pub inode: u64,
     pub state_hex: String,
@@ -128,21 +130,28 @@ pub fn parse_proc_net_table(text: &str, protocol: &str) -> Vec<RawSocketRow> {
         if fields.len() < 10 {
             continue;
         }
-        let Some((addr_hex, port_hex)) = fields[1].split_once(':') else {
+        let expected_len = if protocol.ends_with('6') { 32 } else { 8 };
+        let decode_endpoint = |hex: &str| -> Option<String> {
+            if hex.len() == expected_len {
+                if expected_len == 8 {
+                    decode_ipv4_hex(hex)
+                } else {
+                    decode_ipv6_hex(hex)
+                }
+            } else {
+                None
+            }
+        };
+        let Some((local_hex, local_port_hex)) = fields[1].split_once(':') else {
             continue;
         };
-        let Some(local_port) = decode_port_hex(port_hex) else { continue };
-        let expected_len = if protocol.ends_with('6') { 32 } else { 8 };
-        let local_addr = if addr_hex.len() == expected_len {
-            if expected_len == 8 {
-                decode_ipv4_hex(addr_hex)
-            } else {
-                decode_ipv6_hex(addr_hex)
-            }
-        } else {
-            None
+        let Some(local_port) = decode_port_hex(local_port_hex) else { continue };
+        let Some(local_addr) = decode_endpoint(local_hex) else { continue };
+        let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') else {
+            continue;
         };
-        let Some(local_addr) = local_addr else { continue };
+        let Some(remote_port) = decode_port_hex(remote_port_hex) else { continue };
+        let Some(remote_addr) = decode_endpoint(remote_hex) else { continue };
         let (Ok(uid), Ok(inode)) = (fields[7].parse::<u32>(), fields[9].parse::<u64>()) else {
             continue;
         };
@@ -150,6 +159,8 @@ pub fn parse_proc_net_table(text: &str, protocol: &str) -> Vec<RawSocketRow> {
             protocol: protocol.to_string(),
             local_addr,
             local_port,
+            remote_addr,
+            remote_port,
             uid,
             inode,
             state_hex: fields[3].to_ascii_uppercase(),
@@ -436,7 +447,7 @@ mod tests {
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 0100007F:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 11101 1 0000000000000000 100 0 0 10 0
    1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 22202 1 0000000000000000 100 0 0 10 0
-   2: 7F000001:9C4A C0A80001:01BB 01 00000000:00000000 02:00000073 00000000  1000        0 33303 3 0000000000000000 21 3 28 10 -1
+   2: 7F000001:9C4A 0100A8C0:01BB 01 00000000:00000000 02:00000073 00000000  1000        0 33303 3 0000000000000000 21 3 28 10 -1
 ";
 
     const TCP6_FIXTURE: &str = "\
@@ -489,6 +500,16 @@ mod tests {
         assert_eq!(listen[0].inode, 11101);
         assert_eq!(listen[1].local_addr, "0.0.0.0");
         assert_eq!(listen[1].local_port, 8080);
+        // Remote endpoint decoding (little-endian hex words) also works:
+        // C0A80001 -> 192.168.0.1, 01BB -> 443.
+        let outbound = &rows[2];
+        assert_eq!(outbound.remote_addr, "192.168.0.1");
+        assert_eq!(outbound.remote_port, 443);
+        assert!(!outbound
+            .remote_addr
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .is_loopback());
     }
 
     #[test]
@@ -552,6 +573,8 @@ mod tests {
                 protocol: "tcp".into(),
                 local_addr: "10.0.0.1".into(),
                 local_port: (1024 + (i % 1000)) as u16,
+                remote_addr: "192.0.2.1".into(),
+                remote_port: 443,
                 uid: 0,
                 inode: 100_000 + i,
                 state_hex: "0A".into(),

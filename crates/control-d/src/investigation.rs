@@ -1000,6 +1000,14 @@ fn collector_capability(
             DataClassification::BoundedRedactedText,
             "Bounded, redacted systemd journal events",
         ),
+        CollectorType::ConnectionsOutbound => (
+            DataClassification::MetadataSensitive,
+            "Outbound connection flows grouped by remote endpoint",
+        ),
+        CollectorType::PackagesInventory => (
+            DataClassification::MetadataLow,
+            "Installed dpkg package inventory",
+        ),
     };
     CollectorCapability {
         collector_type,

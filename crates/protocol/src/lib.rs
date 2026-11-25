@@ -5,6 +5,7 @@ pub mod action;
 pub mod audit;
 pub mod canonical;
 pub mod observation;
+pub mod profile;
 pub mod rpc;
 pub mod rules;
 pub mod signing;
