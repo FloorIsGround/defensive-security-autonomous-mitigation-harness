@@ -78,6 +78,12 @@ impl SustainedCounterState {
     }
 }
 
+/// Only complete snapshots provide evidence that an omitted key is absent.
+pub(crate) fn snapshot_has_absence_evidence(status: ObservationStatus, sample: &Value) -> bool {
+    status == ObservationStatus::Ok
+        && sample.get("truncated").and_then(Value::as_bool) != Some(true)
+}
+
 /// Evaluate a watch trigger predicate against `current`, `last_observed`, and
 /// `accepted_baseline`.
 #[allow(clippy::too_many_arguments)]
@@ -219,9 +225,11 @@ pub fn evaluate_predicate(
                     Some(_) => {}
                 }
             }
-            for k in prev_map.keys() {
-                if !cur_map.contains_key(k) {
-                    removed.push(k.clone());
+            if snapshot_has_absence_evidence(status, cur) {
+                for k in prev_map.keys() {
+                    if !cur_map.contains_key(k) {
+                        removed.push(k.clone());
+                    }
                 }
             }
 
@@ -377,6 +385,37 @@ mod tests {
         let cur = json!({ "active_state": "active" });
         let out = evaluate_predicate(&pred, ObservationStatus::Ok, Some(&cur), None, None, None, 0, 0);
         assert_eq!(out, PredicateOutcome::BaselineUnavailable);
+    }
+
+    #[test]
+    fn incomplete_set_diff_keeps_additions_but_suppresses_removals() {
+        let pred = TriggerPredicate::SetDiff {
+            compare_against: CompareTarget::LastObserved,
+            set_field: "packages".into(),
+            identity_key: "package_key".into(),
+            ignore_fields: vec![],
+        };
+        let previous = json!({"packages": [{"package_key": "z:all"}]});
+        for (status, truncated) in [
+            (ObservationStatus::Partial, false),
+            (ObservationStatus::Ok, true),
+        ] {
+            let current = json!({"truncated": truncated, "packages": [{"package_key": "a:all"}]});
+            let outcome = evaluate_predicate(
+                &pred,
+                status,
+                Some(&current),
+                Some(&previous),
+                None,
+                None,
+                0,
+                0,
+            );
+            assert!(
+                matches!(outcome, PredicateOutcome::Triggered { details, .. }
+                if details["added"] == json!(["a:all"]) && details["removed"] == json!([]))
+            );
+        }
     }
 
     #[test]

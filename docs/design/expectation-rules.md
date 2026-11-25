@@ -69,6 +69,11 @@ pub enum RuleEffect {
 | `connections.outbound` (P11) | `flows` / `flow_key` | `protocol`, `remote_addr`, `remote_port`, `uid`, `comm`, `systemd_unit`, `remote_scope` (derived) |
 | `packages.inventory` (P11) | `packages` / `package_key` | `name`, `arch` |
 
+Flow keys use `<protocol>:<remote-address>:<port>:<uid>:<comm>`, with brackets around IPv6 addresses and percent encoding for process name bytes outside the URI unreserved set. A bare `?` means attribution is unavailable. A literal question mark is `%3F`. Package keys use validated `<name>:<arch>` fields. IPv4-mapped IPv6 addresses use their IPv4 meaning for `remote_scope`.
+
+A partial or truncated current snapshot can show additions and modifications of entries it contains. It cannot establish removals or that a `require_present` rule is missing a match.
+
+
 Derived fields are computed by the evaluator, never sent by the agent:
 
 * `bind_scope`: `loopback` (127.0.0.0/8, ::1), `any` (0.0.0.0, ::), otherwise `specific`.

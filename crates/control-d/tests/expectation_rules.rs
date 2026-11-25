@@ -124,6 +124,10 @@ impl Fixture {
     }
 
     fn put_snapshot(&self, seq_no: u64, data: Value) -> i64 {
+        self.put_snapshot_with_status(seq_no, data, ObservationStatus::Ok)
+    }
+
+    fn put_snapshot_with_status(&self, seq_no: u64, data: Value, status: ObservationStatus) -> i64 {
         let observation = ObservationRecord {
             host_id: "edge".into(),
             session_id: "session".into(),
@@ -132,7 +136,7 @@ impl Fixture {
             spec_version: 1,
             collector_type: CollectorType::SocketsListening,
             observed_at: Utc::now(),
-            status: ObservationStatus::Ok,
+            status,
             state_hash: canonical_sha256_hex(&data).unwrap(),
             payload: ObservationPayload::Snapshot { data },
             is_reconciliation: false,
@@ -649,6 +653,47 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
         AdminResponse::RuleDecided { .. }
     ));
     proposal_result(f.propose(&token, &run, "fourth", rule));
+}
+
+#[test]
+fn incomplete_snapshots_preserve_additions_without_removals_or_missing_rules() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let baseline = f.put(1, vec![socket("sshd.service", 22)]);
+    f.promote(baseline);
+    let required: ExpectationRuleSpec = serde_json::from_value(json!({
+        "scope":{"host_id":"edge","collector":"sockets.listening"},
+        "matches":[{"op":"eq","field":"local_port","value":22},
+                   {"op":"eq","field":"systemd_unit","value":"sshd.service"}],
+        "effect":"require_present","rationale":"SSH listener must be available"
+    }))
+    .unwrap();
+    let rule_id = f.create(required);
+    for (seq, status, truncated) in [
+        (2, ObservationStatus::Partial, false),
+        (3, ObservationStatus::Ok, true),
+    ] {
+        let id = f.put_snapshot_with_status(
+            seq,
+            json!({
+                "truncated": truncated, "sockets":[socket("new.service", 21)],
+            }),
+            status,
+        );
+        assert!(f.saw_trigger(id));
+        let outcome = f.outcome();
+        assert_eq!(outcome["details"]["added"], json!(["tcp:127.0.0.5:21"]));
+        assert_eq!(outcome["details"]["removed"], json!([]));
+        assert!(outcome["details"].get("missing_required").is_none());
+    }
+    let incomplete =
+        f.put_snapshot_with_status(4, json!({"sockets":[]}), ObservationStatus::Partial);
+    assert!(!f.saw_trigger(incomplete));
+    assert_eq!(f.outcome(), json!({"outcome":"not_triggered"}));
+    let complete = f.put(5, vec![]);
+    assert!(f.saw_trigger(complete));
+    let outcome = f.outcome();
+    assert_eq!(outcome["details"]["removed"], json!(["tcp:127.0.0.5:22"]));
+    assert_eq!(outcome["details"]["missing_required"], json!([rule_id]));
 }
 
 #[test]

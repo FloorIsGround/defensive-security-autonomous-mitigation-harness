@@ -383,6 +383,7 @@ impl RuleStore<'_> {
                         &spec.trigger,
                         rule.scope.collector,
                         raw.clone(),
+                        status,
                         Some(&sample),
                         reference.as_ref(),
                         rules
