@@ -8,6 +8,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
 import { advanceDemoReasoner, buildDemoReasoner, demoRunEvents, demoRuns, demoTriggers, endRunsForIncident, logOperatorStep, openOperatorSession } from './demo-reasoner.mjs';
+import { buildDemoRules, demoBacktest, demoCreate, demoDecide, demoRevoke, demoRuleAuditEvents, listRules } from './demo-rules.mjs';
 import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
@@ -20,6 +21,11 @@ import {
   isStreamWatch,
   parseActionBody,
   parseFindingBody,
+  parseRuleBody,
+  parseRuleDecision,
+  parseRuleId,
+  parseRuleRevoke,
+  parseRulesQuery,
   requireIdent,
   requireText,
 } from './domain.mjs';
@@ -446,6 +452,9 @@ function buildState(now, signer) {
   // --- Phase 9 reasoner-d runs, run events and the trigger queue -------------
   const reasonerSet = buildDemoReasoner({ now, ids });
 
+  // --- Phase 10 expectation rules (backtests computed over the fixtures) -----
+  const rules = buildDemoRules({ hosts, watches, observations, baselineRevisions }, now);
+
   // --- audit events, chained in timestamp order -----------------------------
   const ev = (ago, event_type, actor, payload) => ({ ago, event_type, actor, payload });
   const events = [
@@ -474,6 +483,7 @@ function buildState(now, signer) {
     ev(12 * MIN, 'finding_recorded', REASONER, { finding_id: 303, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'hypothesis' }),
     ...actionSet.events,
     ...reasonerSet.auditEvents,
+    ...demoRuleAuditEvents(rules, now),
   ].sort((a, b) => b.ago - a.ago);
 
   const audit = [];
@@ -491,6 +501,7 @@ function buildState(now, signer) {
     actions: { intents: actionSet.intents, denied: actionSet.denied, nextProposalId: actionSet.nextProposalId },
     audit,
     reasoner: reasonerSet.reasoner,
+    rules,
     runs: new Map(),
     nextObservationId: 9001 + observations.length,
     nextRevisionId: 40,
@@ -977,6 +988,37 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         incidentOpen: (id) => S.incidents.find((i) => i.incident_id === id)?.status === 'open',
         appendAudit,
       });
+    },
+
+    // ---- Phase 10 expectation rules ------------------------------------------
+
+    async rules(query = {}) {
+      const q = parseRulesQuery(query);
+      return { available: true, source: enableAdmin ? 'admin' : 'investigate', rules: listRules(S, q, now()), server_time: new Date(now()).toISOString() };
+    },
+
+    async backtestRule(body = {}) {
+      requireAdmin();
+      const { rule } = parseRuleBody(body);
+      return demoBacktest(S, rule, now());
+    },
+
+    async createRule(body = {}) {
+      requireAdmin();
+      const { rule, actor } = parseRuleBody(body, { actor: true });
+      return demoCreate(S, appendAudit, rule, actor, now());
+    },
+
+    async decideRule(ruleId, body = {}) {
+      requireAdmin();
+      const id = parseRuleId(ruleId);
+      return demoDecide(S, appendAudit, id, parseRuleDecision(body), now());
+    },
+
+    async revokeRule(ruleId, body = {}) {
+      requireAdmin();
+      const id = parseRuleId(ruleId);
+      return demoRevoke(S, appendAudit, id, parseRuleRevoke(body), now());
     },
 
     // ---- demo-only helpers ---------------------------------------------------

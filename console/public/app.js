@@ -33,6 +33,8 @@ const state = {
   runOpen: new Set(), // run timelines the operator expanded
   runClosed: new Set(), // active run timelines the operator collapsed
   rq: { status: 'open', host: '', incident: '' }, // trigger queue / runs filters
+  rules: { loaded: false, available: false, message: null, source: null, list: [] }, // active + proposed expectation rules (fleet glance, nav)
+  rv: { tab: 'active', host: '' }, // rules view filters
   lastRefresh: null,
 };
 
@@ -335,6 +337,8 @@ function renderShell() {
   const pending = awaitingApproval().length;
   document.getElementById('nav-mitigations').textContent = pending ? String(pending) : '';
   refreshNavReasoner();
+  const pendingRules = state.rules.list.filter((r) => r.status === 'proposed').length;
+  document.getElementById('nav-rules').textContent = pendingRules ? String(pendingRules) : '';
   renderUserSlot();
 }
 
@@ -347,6 +351,7 @@ const VIEWS = {
   investigations: { title: 'Investigations', sub: 'Observed facts, model hypotheses and verified findings', render: renderInvestigations },
   reasoner: { title: 'Reasoner activity', sub: 'Automated reasoner-d runs, operator sessions and the trigger queue', render: renderReasoner },
   mitigations: { title: 'Mitigations', sub: 'Typed, TTL-bounded containment: autonomous within policy, dual-signed beyond it', render: renderMitigations },
+  rules: { title: 'Expectation rules', sub: 'Typed, auditable allowances for expected changes in socket sets, approved by an operator', render: renderRules },
   baselines: { title: 'Baselines & telemetry', sub: 'Accepted baseline against last and current observed state', render: renderBaselines },
   audit: { title: 'Policy & audit', sub: 'Deterministic policy decisions and the tamper-evident audit chain', render: renderAudit },
 };
@@ -400,7 +405,7 @@ async function refreshAll() {
 }
 
 async function loadCore() {
-  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions(), loadAutomation(), loadReasoner()]);
+  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions(), loadAutomation(), loadReasoner(), loadRules()]);
   if (h.status === 'fulfilled') state.hosts = h.value.hosts;
   if (i.status === 'fulfilled') state.incidents = i.value.incidents;
 }
@@ -485,7 +490,7 @@ async function renderFleet() {
     approvalNotice(),
     kpis,
     automationCard(),
-    el('div', { class: 'section-title' }, el('h2', null, 'Edge fleet'), el('span', { class: 'muted' }, `${hosts.length} enrolled`)),
+    el('div', { class: 'section-title' }, el('h2', null, 'Edge fleet'), el('div', { class: 'row' }, rulesGlance(), el('span', { class: 'muted' }, `${hosts.length} enrolled`))),
     grid,
   );
 }
@@ -677,11 +682,13 @@ async function renderInvestigations(arg, _stale, route) {
 
 async function loadWorkspace(incidentId, container) {
   try {
-    const [ctx, changes] = await Promise.all([
+    const [ctx, changes, triggers] = await Promise.all([
       api(`/api/incidents/${encodeURIComponent(incidentId)}`),
       api(`/api/incidents/${encodeURIComponent(incidentId)}/changes`).catch((error) => ({ error })),
+      api(`/api/triggers?incident_id=${encodeURIComponent(incidentId)}&limit=50`).catch(() => null),
     ]);
     ctx.changes = changes;
+    ctx.triggers = triggers?.available ? triggers.triggers : [];
     let caps = state.capabilities.get(ctx.incident.host_id);
     if (!caps) {
       try {
@@ -756,7 +763,7 @@ function workspaceView(ctx, caps) {
     for (const fn of evidenceListeners) fn();
   };
   // Built first: it indexes added/removed sockets that the fact tables below mark.
-  const changesSlot = changesCard(inc, ctx.changes);
+  const changesSlot = changesCard(inc, ctx.changes, { watchMap, triggers: ctx.triggers ?? [] });
 
   const incActions = state.actions.list.filter((a) => a.incident_id === inc.incident_id);
   const incPending = incActions.filter(isAwaiting).length;
@@ -2007,11 +2014,11 @@ function describeEntry(type, x) {
 
 const fmtVal = (v) => (v === null || v === undefined ? '∅' : typeof v === 'string' && /^[0-9a-f]{64}$/.test(v) ? `${v.slice(0, 10)}…` : String(v));
 
-function diffItems(c) {
+function diffItems(c, actionFor = () => null) {
   const items = [];
   const d = c.diff;
   if (d.kind === 'set') {
-    for (const x of d.added) items.push(['add', 'Added', describeEntry(c.collector_type, x)]);
+    for (const x of d.added) items.push(['add', 'Added', describeEntry(c.collector_type, x), actionFor(x)]);
     for (const x of d.removed) items.push(['del', 'Removed', describeEntry(c.collector_type, x)]);
     for (const x of d.changed) items.push(['mod', 'Changed', [x.key, el('span', { class: 'muted' }, ` · ${x.fields.map((f) => `${f.field} ${fmtVal(f.before)} → ${fmtVal(f.after)}`).join(', ')}`)]]);
   } else if (d.kind === 'fields') {
@@ -2023,12 +2030,12 @@ function diffItems(c) {
   return items;
 }
 
-function changeView(c) {
+function changeView(c, actionFor) {
   const basis =
     c.basis === 'accepted_baseline'
       ? [`vs accepted baseline rev ${c.accepted_baseline.revision_id}`, c.accepted_baseline.approver ? ` (${c.accepted_baseline.approver})` : '']
       : [`vs #${c.reference.observation_id}, just before this incident opened`];
-  const items = diffItems(c);
+  const items = diffItems(c, actionFor);
   const LIMIT = 8;
   return el(
     'div',
@@ -2044,15 +2051,35 @@ function changeView(c) {
     c.diff.kind === 'unavailable'
       ? el('div', { class: 'empty-slot' }, 'The accepted baseline observation is outside the loaded window, so only hashes can be compared: ', hashChip(c.accepted_baseline.state_hash), ' → ', hashChip(c.latest.state_hash))
       : items.length
-        ? el('ul', { class: 'diff-list' }, items.slice(0, LIMIT).map(([cls, tag, what]) => el('li', { class: cls }, el('span', { class: 'tag' }, tag), el('span', { class: 'what' }, what))))
+        ? el('ul', { class: 'diff-list' }, items.slice(0, LIMIT).map(([cls, tag, what, action]) => el('li', { class: [cls, action && 'has-action'] }, el('span', { class: 'tag' }, tag), el('span', { class: 'what' }, what), action ? el('span', { class: 'diff-action' }, action) : null)))
         : el('div', { class: 'empty-slot' }, 'Hashes differ, but no field-level difference is modelled for this collector.'),
     items.length > LIMIT ? el('div', { class: 'diff-more' }, `${items.length - LIMIT} more difference${items.length - LIMIT === 1 ? '' : 's'} in the observation detail below.`) : null,
   );
 }
 
-function changesCard(inc, r) {
+function changesCard(inc, r, { watchMap = new Map(), triggers = [] } = {}) {
   if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
   {
+    // "Allow for this service": only on set_diff socket watches, only for admins.
+    // A socket an active rule already covers is marked instead (matched here in
+    // the browser against the listed rules; control-d only reports a count).
+    const allowFor = (c) => {
+      const w = watchMap.get(c.watch_id);
+      if (c.collector_type !== 'sockets.listening' || c.diff.kind !== 'set' || w?.trigger?.type !== 'set_diff') return () => null;
+      const rules = activeSocketRules(inc.host_id, c.watch_id);
+      return (x) => {
+        const hit = rules.find((r) => socketMatchesRule(r.spec, x));
+        if (hit) return el('a', { class: 'badge ok rule-hit', href: `#/rules?host=${enc(inc.host_id)}`, title: ruleSentence(hit.spec) }, icon('rules'), `Allowed by rule ${hit.rule_id.replace(/^rule-/, '').slice(0, 8)}`);
+        if (!adminEnabled()) return null;
+        return el(
+          'button',
+          { class: 'btn btn-sm btn-ghost', type: 'button', title: `Draft an expectation rule that allows ${x.systemd_unit ?? x.comm ?? 'this process'} to listen here`, on: { click: () => openRuleComposer({ host_id: inc.host_id, watch_id: c.watch_id, item: x, incident: inc }) } },
+          icon('rules'),
+          'Allow for this service',
+        );
+      };
+    };
+    const suppressed = suppressionNote(inc, triggers);
     const n = r.changes.length;
     for (const c of r.changes) {
       if (c.diff.kind === 'set' && c.collector_type === 'sockets.listening') {
@@ -2062,7 +2089,7 @@ function changesCard(inc, r) {
     return card(
       'What changed',
       n ? `${n} snapshot watch${n === 1 ? '' : 'es'} on ${inc.host_id} differ${n === 1 ? 's' : ''} from the accepted baseline or the state before this incident` : null,
-      n ? el('div', { class: 'card-body' }, r.changes.map(changeView)) : el('div', { class: 'card-body' }, el('div', { class: 'empty-slot' }, 'No snapshot differences against an accepted baseline or the state just before this incident opened. Stream watches (journal) are append-only and not compared.')),
+      n ? el('div', { class: 'card-body' }, suppressed, r.changes.map((c) => changeView(c, allowFor(c)))) : el('div', { class: 'card-body' }, suppressed, el('div', { class: 'empty-slot' }, 'No snapshot differences against an accepted baseline or the state just before this incident opened. Stream watches (journal) are append-only and not compared.')),
       null,
       'changes',
     );
@@ -2775,6 +2802,675 @@ function refreshNavReasoner() {
   nav.textContent = n ? String(n) : '';
   nav.classList.toggle('warn', h.state === 'stalled');
   nav.title = h.state === 'stalled' ? 'Triggers waiting and reasoner-d looks stopped' : 'Triggers pending or leased';
+}
+
+// ---------------------------------------------------------------------------
+// View: Expectation rules (Phase 10)
+// ---------------------------------------------------------------------------
+
+const EFFECTS = {
+  allow_optional: { label: 'Allow optional', help: 'Matching sockets may appear, disappear or change without alerting.' },
+  ignore_modified: { label: 'Ignore modified', help: 'Changes to matching sockets (PID, inode) are ignored; sockets that appear or disappear still alert.' },
+  require_present: { label: 'Require present', help: 'Alerts when no current socket matches, for a service that must stay up.' },
+};
+const RULE_STATUS = { active: ['ok', 'Active'], proposed: ['warn', 'Pending approval'], rejected: ['bad', 'Rejected'], revoked: ['', 'Revoked'], expired: ['', 'Expired'] };
+const COLLECTOR_NOUN = { 'sockets.listening': 'sockets', 'connections.outbound': 'outbound connections', 'packages.inventory': 'packages' };
+const RULE_TABS = [
+  ['active', 'Active'],
+  ['pending', 'Pending'],
+  ['history', 'History'],
+];
+const EXPIRY_CHOICES = [
+  ['7', '7 days'],
+  ['30', '30 days'],
+  ['90', '90 days'],
+  ['never', 'No expiry'],
+];
+/** Which composer row a gate denial belongs to (crates/policy/src/rule_gate.rs). */
+const DENIAL_TARGET = {
+  'rule-gate/identity-anchor': 'identity',
+  'rule-gate/port-bounds': 'local_port',
+  'rule-gate/wildcard-bind': 'bind_scope',
+  'rule-gate/expired': 'expiry',
+  'rule-gate/investigator-expiry': 'expiry',
+  'rule-gate/scope': 'scope',
+  'rule-gate/shape': 'rationale',
+};
+
+async function loadRules() {
+  try {
+    const r = await api('/api/rules?status=active,proposed&limit=100');
+    state.rules = { loaded: true, available: r.available !== false, message: r.message ?? null, source: r.source ?? null, list: r.rules ?? [] };
+  } catch (err) {
+    state.rules = { loaded: true, available: false, message: err.message, source: null, list: [] };
+  }
+}
+
+const ruleValueText = (v) => (typeof v === 'string' ? v : String(v));
+
+function clauseText(c) {
+  switch (c.op) {
+    case 'eq':
+      return `${c.field} = ${ruleValueText(c.value)}`;
+    case 'in':
+      return `${c.field} in ${c.values.map(ruleValueText).join(', ')}`;
+    case 'range':
+      return `${c.field} ${c.min}–${c.max}`;
+    case 'prefix':
+      return `${c.field} starts with ${c.value}`;
+    default:
+      return String(c.field ?? '');
+  }
+}
+
+/** "Allow optional: sockets on edge-01 where systemd_unit = nginx.service and local_port in 80, 443" */
+function ruleSentence(spec) {
+  const noun = COLLECTOR_NOUN[spec.scope.collector] ?? spec.scope.collector;
+  const watch = spec.scope.watch_id ? ` (${spec.scope.watch_id})` : '';
+  return `${EFFECTS[spec.effect]?.label ?? spec.effect}: ${noun} on ${spec.scope.host_id}${watch} where ${spec.matches.map(clauseText).join(' and ')}`;
+}
+
+function ruleSentenceNode(spec) {
+  const noun = COLLECTOR_NOUN[spec.scope.collector] ?? spec.scope.collector;
+  const parts = [];
+  spec.matches.forEach((c, i) => {
+    if (i) parts.push(' and ');
+    parts.push(el('code', { class: 'clause' }, clauseText(c)));
+  });
+  return el(
+    'p',
+    { class: 'rule-sentence', title: ruleSentence(spec) },
+    el('b', null, `${EFFECTS[spec.effect]?.label ?? spec.effect}:`),
+    ` ${noun} on `,
+    el('span', { class: 'mono' }, spec.scope.host_id),
+    spec.scope.watch_id ? [' (', el('span', { class: 'mono' }, spec.scope.watch_id), ')'] : null,
+    parts.length ? [' where ', parts] : ' (no clauses)',
+  );
+}
+
+/** Fleet glance: active rules and proposals waiting for an operator. */
+function rulesGlance() {
+  const R = state.rules;
+  if (!R.loaded || !R.available) return null;
+  const active = R.list.filter((r) => r.status === 'active').length;
+  const pending = R.list.filter((r) => r.status === 'proposed').length;
+  return el(
+    'a',
+    { class: 'chip rules-glance', href: pending ? '#/rules?tab=pending' : '#/rules', title: 'Expectation rules: active, and proposals waiting for an operator' },
+    icon('rules'),
+    `Rules · ${active} active`,
+    pending ? el('span', { class: 'badge warn' }, `${pending} pending`) : el('span', { class: 'muted' }, '· 0 pending'),
+  );
+}
+
+const suppressedCount = (reason) => {
+  const m = /\((\d+) suppressed by rules\)/.exec(String(reason ?? ''));
+  return m ? Number(m[1]) : 0;
+};
+
+/**
+ * control-d appends "(k suppressed by rules)" to a set_diff trigger reason (and
+ * so to the incident summary) when active rules filtered items. The rule IDs
+ * themselves are not exposed to the console, only the count.
+ */
+function suppressionNote(inc, triggers) {
+  const sets = triggers.filter((t) => /^set '/.test(t.reason ?? '')).sort((a, b) => b.event_id - a.event_id);
+  const latest = sets[0] ?? null;
+  const n = latest ? suppressedCount(latest.reason) : suppressedCount(inc.summary);
+  if (!n) return null;
+  return notice(
+    '',
+    'rules',
+    [
+      el('strong', null, `Expectation rules suppressed ${plural(n, 'item')} in this observation.`),
+      el('span', null, latest ? ['control-d filtered ', n === 1 ? 'it' : 'them', ' out of the ', el('span', { class: 'mono' }, latest.watch_id), ` diff before queueing trigger #${latest.event_id}. The comparison below is the console's own, so sockets an active rule covers are marked “Allowed by rule”.`] : "control-d filtered them out of the socket diff before opening or updating this incident. The comparison below is the console's own, so sockets an active rule covers are marked “Allowed by rule”."),
+    ],
+    el('a', { class: 'btn btn-sm', href: `#/rules?host=${enc(inc.host_id)}` }, 'View rules'),
+  );
+}
+
+function activeSocketRules(host, watchId) {
+  const now = Date.now();
+  return state.rules.list.filter(
+    (r) =>
+      r.status === 'active' &&
+      r.spec.effect !== 'require_present' &&
+      r.spec.scope.host_id === host &&
+      r.spec.scope.collector === 'sockets.listening' &&
+      (!r.spec.scope.watch_id || r.spec.scope.watch_id === watchId) &&
+      !(r.spec.expires_at && Date.parse(r.spec.expires_at) <= now),
+  );
+}
+
+/** Same semantics as crates/policy/src/rules.rs item_matches, for display only. */
+function socketMatchesRule(spec, item) {
+  const eq = (v, sample) => (typeof v === 'number' ? Number.isInteger(sample) && sample === v : sample === v);
+  return spec.matches.every((c) => {
+    const sample = c.field === 'bind_scope' ? socketBindScope(item.local_addr) : item[c.field];
+    if (sample === null || sample === undefined) return false;
+    if (c.op === 'eq') return eq(c.value, sample);
+    if (c.op === 'in') return c.values.some((v) => eq(v, sample));
+    if (c.op === 'range') return Number.isInteger(sample) && sample >= c.min && sample <= c.max;
+    if (c.op === 'prefix') return typeof sample === 'string' && sample.startsWith(c.value);
+    return false;
+  });
+}
+
+function decisionBox(d, verdict) {
+  return el(
+    'div',
+    { class: ['decision', d.allowed ? 'ok' : 'bad'], attrs: { role: 'status' } },
+    el('div', { class: 'row' }, el('span', { class: 'verdict' }, verdict), el('span', { class: 'spacer' }), d.policy_version != null ? el('span', { class: 'mono muted' }, `policy v${d.policy_version}`) : null),
+    el('div', { class: 'rule' }, d.rule_id),
+    el('div', { class: 'reason' }, d.reason),
+  );
+}
+
+function backtestView(b, { title = 'Backtest' } = {}) {
+  if (!b) return el('div', { class: 'empty-slot' }, 'No backtest was stored with this proposal.');
+  const cell = (k, v, sub) => el('div', { class: 'bt-cell' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, v), el('div', { class: 's' }, sub));
+  const fewer = b.triggered_before - b.triggered_after;
+  return el(
+    'div',
+    { class: 'backtest' },
+    el('div', { class: 'bt-head' }, el('span', { class: 'eyebrow' }, title), el('span', { class: 'muted small' }, `${plural(b.observations_scanned, 'recent observation')} scanned`)),
+    el(
+      'div',
+      { class: 'bt-grid' },
+      cell('Would trigger', [String(b.triggered_before), el('span', { class: 'muted' }, ' → '), String(b.triggered_after)], fewer > 0 ? `${plural(fewer, 'trigger')} fewer with this rule` : 'No fewer triggers'),
+      cell('Items matched', String(b.items_matched), 'distinct socket keys'),
+      cell('Matching now', String(b.currently_matching), 'in the newest observation'),
+    ),
+    b.sample_keys.length
+      ? el('div', { class: 'bt-keys' }, el('span', { class: 'muted small' }, 'Sample keys'), b.sample_keys.map((k) => el('code', { class: 'key-chip' }, k)))
+      : el('div', { class: 'muted small' }, b.observations_scanned ? 'No item in the scanned observations matches this rule.' : 'No set_diff observation in scope yet; the rule applies from the next observation.'),
+    b.items_matched > 3 ? el('div', { class: 'hint warn' }, `Matches ${b.items_matched} distinct sockets. Check that every sample key belongs to this service.`) : null,
+  );
+}
+
+function ruleDecideForm(r) {
+  if (!adminEnabled()) {
+    return el('div', { class: 'muted small' }, roleAdmin() ? 'Approving or rejecting needs the admin interface (start the console with --enable-admin).' : 'Observer accounts can review proposals but not approve or reject them.');
+  }
+  const form = { note: '', actor: operatorName() };
+  const out = el('div');
+  const note = textInput(form, 'note', { placeholder: 'Note for the audit log (optional)' });
+  note.setAttribute('aria-label', `Decision note for ${r.rule_id} (optional)`);
+  const approve = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, icon('check'), 'Approve');
+  const reject = el('button', { class: 'btn btn-sm', type: 'button' }, 'Reject');
+  const go = async (yes) => {
+    approve.disabled = true;
+    reject.disabled = true;
+    replace(out);
+    try {
+      const res = await api(`/api/admin/rules/${enc(r.rule_id)}/decide`, { method: 'POST', body: { approve: yes, note: form.note.trim() || null, actor: form.actor } });
+      if (!res.allowed) {
+        replace(out, decisionBox(res.decision, 'Approval denied by the rule gate'));
+        approve.disabled = false;
+        reject.disabled = false;
+        return;
+      }
+      rememberOperator(form.actor);
+      toast(yes ? 'Rule approved; it applies from the next observation' : 'Proposal rejected', yes ? 'ok' : '');
+      await loadRules();
+      renderShell();
+      render();
+    } catch (err) {
+      replace(out, errorBox(err));
+      approve.disabled = false;
+      reject.disabled = false;
+    }
+  };
+  approve.addEventListener('click', () => go(true));
+  reject.addEventListener('click', () => go(false));
+  return el('div', { class: 'rule-actions' }, el('div', { class: 'rule-decide' }, note, el('div', { class: 'row' }, reject, approve)), identityLine(form, 'actor', 'Decided by'), out);
+}
+
+function ruleRevokeForm(r) {
+  if (!adminEnabled()) return null;
+  const slot = el('div', { class: 'rule-actions' });
+  const closed = () => replace(slot, el('div', { class: 'row' }, el('span', { class: 'spacer' }), el('button', { class: 'btn btn-sm', type: 'button', on: { click: open } }, 'Revoke…')));
+  function open() {
+    const form = { reason: '', actor: operatorName() };
+    const out = el('div');
+    const reason = textInput(form, 'reason', { placeholder: 'Why this rule no longer applies' });
+    reason.setAttribute('aria-label', `Revocation reason for ${r.rule_id}`);
+    const btn = el('button', { class: 'btn btn-sm btn-danger', type: 'submit' }, 'Revoke rule');
+    const note = el('span', { class: 'form-note' });
+    const f = el(
+      'form',
+      { class: 'form rule-revoke', attrs: { novalidate: true } },
+      field('Reason (required, recorded in the audit log)', reason),
+      identityLine(form, 'actor', 'Revoked by'),
+      el('div', { class: 'form-actions' }, note, el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: closed } }, 'Cancel'), btn),
+      out,
+    );
+    const recheck = guardSubmit(f, btn, note, () => (form.reason.trim() ? null : 'A reason is required to revoke.'), 'Applies from the next observation');
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      btn.disabled = true;
+      replace(out);
+      try {
+        await api(`/api/admin/rules/${enc(r.rule_id)}/revoke`, { method: 'POST', body: { reason: form.reason, actor: form.actor } });
+        rememberOperator(form.actor);
+        toast('Rule revoked', 'ok');
+        await loadRules();
+        renderShell();
+        render();
+      } catch (err) {
+        replace(out, errorBox(err));
+        recheck();
+      }
+    });
+    replace(slot, f);
+    reason.focus();
+  }
+  closed();
+  return slot;
+}
+
+function ruleCard(r) {
+  const spec = r.spec;
+  const [cls, label] = RULE_STATUS[r.status] ?? ['', cap(r.status)];
+  const investigator = r.origin === 'investigator';
+  const meta = (k, v) => el('div', null, el('dt', null, k), el('dd', null, v));
+  const noun = COLLECTOR_NOUN[spec.scope.collector] ?? spec.scope.collector;
+  const decidedVerb = { active: 'Approved', expired: 'Approved', rejected: 'Rejected', revoked: 'Revoked' }[r.status];
+  const showDecision = r.decided_by && decidedVerb && (investigator || r.status !== 'active');
+  return el(
+    'article',
+    { class: ['card', 'rule-card', `is-${r.status}`] },
+    el(
+      'div',
+      { class: 'rule-head' },
+      el('span', { class: ['badge', cls] }, label),
+      el('span', { class: 'badge ghost', title: EFFECTS[spec.effect]?.help ?? '' }, EFFECTS[spec.effect]?.label ?? spec.effect),
+      el('span', { class: 'badge ghost' }, investigator ? 'Investigator proposal' : 'Operator rule'),
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'id-chip', type: 'button', title: `Copy ${r.rule_id}`, on: { click: (e) => copy(r.rule_id, e.currentTarget) } }, r.rule_id.replace(/^rule-/, '').slice(0, 8)),
+    ),
+    ruleSentenceNode(spec),
+    spec.rationale ? el('p', { class: 'rule-why' }, spec.rationale) : null,
+    el(
+      'dl',
+      { class: 'rule-meta' },
+      meta('Scope', [el('a', { class: 'mono', href: `#/baselines/${enc(spec.scope.host_id)}` }, spec.scope.host_id), ' · ', spec.scope.watch_id ? el('span', { class: 'mono' }, spec.scope.watch_id) : `every ${noun} watch`]),
+      meta(r.status === 'expired' ? 'Expired' : 'Expires', spec.expires_at ? relTime(spec.expires_at) : 'Never'),
+      meta('Hits', String(r.hit_count)),
+      meta('Last matched', r.last_matched_at ? relTime(r.last_matched_at) : 'Never'),
+    ),
+    el(
+      'div',
+      { class: 'rule-origin' },
+      icon(investigator ? 'cpu' : 'user'),
+      el(
+        'span',
+        null,
+        investigator ? 'Proposed by ' : 'Created by ',
+        el('b', null, r.proposed_by ?? 'unknown'),
+        r.run_id ? [' in run ', el('a', { class: 'mono', href: r.incident_id ? `#/reasoner?incident=${enc(r.incident_id)}` : '#/reasoner', title: r.run_id }, shortId(r.run_id))] : null,
+        r.incident_id ? [' on ', el('a', { class: 'mono', href: `#/investigations/${enc(r.incident_id)}`, title: r.incident_id }, shortId(r.incident_id))] : null,
+        ' · ',
+        relTime(r.created_at),
+      ),
+    ),
+    showDecision
+      ? el('div', { class: 'rule-origin' }, icon(r.status === 'rejected' || r.status === 'revoked' ? 'close' : 'check'), el('span', null, `${decidedVerb} by `, el('b', null, r.decided_by), ' · ', relTime(r.decided_at), r.decision_note ? [' · ', el('span', { class: 'dim' }, `“${r.decision_note}”`)] : null))
+      : null,
+    r.status === 'proposed' ? [backtestView(r.backtest, { title: 'Backtest stored with the proposal' }), ruleDecideForm(r)] : null,
+    r.status === 'active' ? ruleRevokeForm(r) : null,
+  );
+}
+
+async function renderRules(_arg, stale, route) {
+  const q = route?.query;
+  const tabQ = q?.get('tab');
+  if (tabQ && RULE_TABS.some(([id]) => id === tabQ)) state.rv.tab = tabQ;
+  const hostQ = q?.get('host');
+  if (hostQ !== null && hostQ !== undefined) state.rv.host = hostQ;
+  const f = state.rv;
+  const qs = (statuses) => {
+    const p = new URLSearchParams({ status: statuses, limit: '100' });
+    if (f.host) p.set('host_id', f.host);
+    return p;
+  };
+  const [cur, hist] = await Promise.all([api(`/api/rules?${qs('active,proposed')}`), api(`/api/rules?${qs('rejected,revoked,expired')}`)]);
+  if (stale()) return null;
+  if (cur.available === false) {
+    return el(
+      'div',
+      { class: 'stack' },
+      notice('', 'rules', [el('strong', null, 'Expectation rules are not available.'), el('span', null, cur.message ?? '')]),
+      card('What this page shows', null, el('div', { class: 'card-body dim' }, 'Small, typed rules that tell control-d which changes in a socket set are expected, for example a service that opens and closes its listeners on demand. control-d serves them from Phase 10 on.')),
+    );
+  }
+  if (!f.host) {
+    state.rules = { loaded: true, available: true, message: null, source: cur.source ?? null, list: cur.rules };
+    renderShell();
+  }
+  const lists = {
+    active: cur.rules.filter((r) => r.status === 'active'),
+    pending: cur.rules.filter((r) => r.status === 'proposed'),
+    history: hist.rules,
+  };
+  const go = (patch) => {
+    Object.assign(f, patch);
+    history.replaceState(null, '', '#/rules');
+    render();
+  };
+  const tabs = el(
+    'div',
+    { class: 'tabs', attrs: { role: 'tablist', 'aria-label': 'Rule status' } },
+    RULE_TABS.map(([id, label]) =>
+      el('button', { type: 'button', attrs: { role: 'tab', 'aria-selected': String(f.tab === id) }, on: { click: () => go({ tab: id }) } }, label, el('span', { class: ['tab-count', id === 'pending' && lists.pending.length && 'warn-text'] }, String(lists[id].length))),
+    ),
+  );
+  const hosts = [...new Set([...state.hosts.map((h) => h.host_id), ...cur.rules.map((r) => r.spec.scope.host_id), ...hist.rules.map((r) => r.spec.scope.host_id), f.host].filter(Boolean))].sort();
+  const hostSel = el('select', { attrs: { 'aria-label': 'Filter rules by host' } }, el('option', { value: '' }, 'All hosts'), hosts.map((h) => el('option', { value: h, selected: f.host === h }, h)));
+  hostSel.addEventListener('change', () => go({ host: hostSel.value }));
+
+  const notes = [];
+  if (!adminEnabled()) {
+    notes.push(
+      notice('', 'lock', [
+        el('strong', null, 'Read-only.'),
+        el('span', null, roleAdmin() ? `Rules are listed through the ${cur.source === 'admin' ? 'admin' : "console's browse"} scope. Creating, approving and revoking rules use control-d's admin interface; start the console with --enable-admin.` : 'Observer accounts can review rules but not create, approve or revoke them.'),
+      ]),
+    );
+  }
+  const empty = {
+    active: emptyState('No active rules', 'Rules start from an incident: in its What changed card, use “Allow for this service” on an added socket, check the backtest, then create the rule.'),
+    pending: emptyState('Nothing waiting for approval', 'reasoner-d may propose a rule for benign, recurring noise. Proposals are inert until an operator approves them here.'),
+    history: emptyState('No history yet', 'Rejected, revoked and expired rules stay here for the audit trail.'),
+  }[f.tab];
+  const list = lists[f.tab];
+  return el(
+    'div',
+    { class: 'stack rules-view' },
+    notes,
+    el('div', { class: 'rules-toolbar' }, tabs, el('span', { class: 'spacer' }), hosts.length > 1 || f.host ? hostSel : null),
+    list.length ? el('div', { class: 'rule-list' }, list.map(ruleCard)) : el('div', { class: 'card' }, el('div', { class: 'card-body' }, empty)),
+  );
+}
+
+// ----- "Allow for this service" composer -----
+
+function socketBindScope(addr) {
+  const a = String(addr ?? '').toLowerCase();
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(a) || a === '::1' || a === '0:0:0:0:0:0:0:1') return 'loopback';
+  if (a === '0.0.0.0' || a === '::' || a === '0:0:0:0:0:0:0:0') return 'any';
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(a) || a.includes(':')) return 'specific';
+  return null;
+}
+
+const expiryIso = (choice) => (choice === 'never' ? null : new Date(Date.now() + Number(choice) * 86_400_000).toISOString());
+
+function openRuleComposer({ host_id, watch_id, item, incident = null }) {
+  const scope = socketBindScope(item.local_addr);
+  const d = {
+    actor: operatorName(),
+    watchOnly: true,
+    effect: 'allow_optional',
+    expiry: '30',
+    expires_at: expiryIso('30'),
+    portMode: 'exact',
+    rationale: '',
+    rationaleEdited: false,
+    clauses: [
+      item.systemd_unit ? { key: 'systemd_unit', label: 'Unit', value: item.systemd_unit, on: true } : null,
+      item.comm ? { key: 'comm', label: 'Process', value: item.comm, on: true } : null,
+      Number.isInteger(item.uid) ? { key: 'uid', label: 'UID', value: item.uid, on: true } : null,
+      item.protocol ? { key: 'protocol', label: 'Protocol', value: item.protocol, on: true } : null,
+      Number.isInteger(item.local_port) ? { key: 'local_port', label: 'Port', value: item.local_port, on: true } : null,
+      scope ? { key: 'bind_scope', label: 'Bind scope', value: scope, on: true } : null,
+    ].filter(Boolean),
+  };
+  const service = item.systemd_unit ?? item.comm ?? `uid ${item.uid}`;
+  const loopbackPinned = () => d.clauses.some((c) => c.key === 'bind_scope' && c.on && c.value === 'loopback');
+  const autoRationale = () =>
+    `Expected service socket: ${service} listens on ${item.protocol} ${sockAddr(item)} on ${host_id}${incident ? ` (seen in ${shortId(incident.incident_id)})` : ''}.`;
+  d.rationale = autoRationale();
+  const spec = () => ({
+    scope: { host_id, collector: 'sockets.listening', watch_id: d.watchOnly ? watch_id : null },
+    matches: d.clauses
+      .filter((c) => c.on)
+      .map((c) => (c.key === 'local_port' && d.portMode === 'ephemeral' && loopbackPinned() ? { op: 'range', field: 'local_port', min: 1024, max: 65535 } : { op: 'eq', field: c.key, value: c.value })),
+    effect: d.effect,
+    rationale: d.rationale,
+    expires_at: d.expires_at,
+  });
+
+  // Backtest state: re-run (debounced) whenever the candidate spec changes.
+  let bt = { key: null, status: 'idle', res: null, err: null };
+  let timer = null;
+  let seq = 0;
+  const specKey = () => JSON.stringify(spec());
+
+  const sentenceSlot = el('div', { class: 'rule-preview' });
+  const resultSlot = el('div', { class: 'stack' });
+  const denySlots = new Map();
+  const denySlot = (key) => {
+    const node = el('div', { class: 'clause-deny', hidden: true, attrs: { role: 'alert' } });
+    denySlots.set(key, node);
+    return node;
+  };
+  const createBtn = el('button', { class: 'btn btn-primary', type: 'button', disabled: true }, 'Create rule');
+  const rerunBtn = el('button', { class: 'btn', type: 'button', on: { click: () => run() } }, icon('refresh'), 'Re-run backtest');
+  const footNote = el('span', { class: 'foot-note' });
+
+  function missing() {
+    if (!d.clauses.some((c) => c.on)) return 'Keep at least one match clause.';
+    if (!d.rationale.trim()) return 'Add a rationale.';
+    if (bt.status === 'error') return 'The backtest failed; re-run it.';
+    if (bt.key !== specKey() || bt.status !== 'done') return 'Running the backtest…';
+    if (!bt.res.allowed) return `Denied by ${bt.res.decision.rule_id}; adjust the rule.`;
+    return null;
+  }
+  function recheck() {
+    const m = missing();
+    createBtn.disabled = Boolean(m);
+    footNote.textContent = m ?? 'Backtest done · control-d decides';
+    footNote.classList.toggle('warn-text', Boolean(m) && bt.status !== 'running' && bt.status !== 'pending');
+  }
+
+  function markDenial(decision) {
+    for (const node of denySlots.values()) {
+      node.hidden = true;
+      clear(node);
+    }
+    if (!decision || decision.allowed) return;
+    let target = DENIAL_TARGET[decision.rule_id] ?? 'general';
+    if (target === 'identity') target = ['systemd_unit', 'comm', 'uid'].find((k) => denySlots.has(k)) ?? 'clauses';
+    if (target === 'bind_scope' && !d.clauses.some((c) => c.key === 'bind_scope' && c.on)) target = denySlots.has('bind_scope') ? 'bind_scope' : 'clauses';
+    if (target === 'local_port' && !denySlots.has('local_port')) target = 'clauses';
+    if (target === 'rationale' && d.rationale.trim() && new TextEncoder().encode(d.rationale).length <= 1024) target = 'clauses';
+    const node = denySlots.get(target);
+    if (!node) return;
+    replace(node, el('span', { class: 'rule-pill bad' }, decision.rule_id), el('span', null, decision.reason));
+    node.hidden = false;
+  }
+
+  function drawResult() {
+    if (bt.status === 'pending' || bt.status === 'running') {
+      replace(resultSlot, el('div', { class: 'backtest is-loading' }, el('span', { class: 'eyebrow' }, 'Backtest'), el('div', { class: 'skeleton' }), el('div', { class: 'skeleton' })));
+    } else if (bt.status === 'error') {
+      replace(resultSlot, errorBox(bt.err));
+    } else if (bt.status === 'done' && bt.res.allowed) {
+      replace(resultSlot, backtestView(bt.res.backtest, { title: 'Backtest against recent observations' }));
+    } else if (bt.status === 'done') {
+      replace(resultSlot, decisionBox(bt.res.decision, 'Denied by the rule gate'));
+    } else {
+      replace(resultSlot, el('div', { class: 'empty-slot' }, 'Keep at least one clause and a rationale to run the backtest.'));
+    }
+    markDenial(bt.status === 'done' ? bt.res.decision : null);
+  }
+
+  async function run() {
+    clearTimeout(timer);
+    const s = spec();
+    const key = JSON.stringify(s);
+    const mine = ++seq;
+    if (!s.matches.length) {
+      bt = { key: null, status: 'idle', res: null, err: null };
+      drawResult();
+      recheck();
+      return;
+    }
+    bt = { key, status: 'running', res: null, err: null };
+    drawResult();
+    recheck();
+    try {
+      const res = await api('/api/admin/rules/backtest', { method: 'POST', body: { rule: s } });
+      if (mine !== seq) return;
+      bt = { key, status: 'done', res, err: null };
+    } catch (err) {
+      if (mine !== seq) return;
+      bt = { key, status: 'error', res: null, err };
+    }
+    drawResult();
+    recheck();
+  }
+  function changed({ rerender = false } = {}) {
+    if (!d.rationaleEdited) {
+      d.rationale = autoRationale();
+      rationale.value = d.rationale;
+    }
+    if (rerender) drawForm();
+    replace(sentenceSlot, ruleSentenceNode(spec()));
+    clearTimeout(timer);
+    bt = { ...bt, status: 'pending' };
+    drawResult();
+    recheck();
+    timer = setTimeout(run, 350);
+  }
+
+  const rationale = textArea(d, 'rationale', { rows: 3 });
+  rationale.setAttribute('aria-label', 'Rationale');
+  rationale.addEventListener('input', () => {
+    d.rationaleEdited = Boolean(rationale.value.trim());
+    changed();
+  });
+
+  const formSlot = el('div', { class: 'stack' });
+  function drawForm() {
+    denySlots.clear();
+    const seg = (label, options, current, onPick) =>
+      el(
+        'div',
+        { class: 'seg', attrs: { role: 'group', 'aria-label': label } },
+        options.map(([v, text]) => el('button', { type: 'button', attrs: { 'aria-pressed': String(current === v) }, on: { click: () => onPick(v) } }, text)),
+      );
+    const clauseRow = (c) => {
+      const box = el('input', { type: 'checkbox', checked: c.on, attrs: { 'aria-label': `Match on ${c.key}` } });
+      box.addEventListener('change', () => {
+        c.on = box.checked;
+        changed({ rerender: c.key === 'bind_scope' });
+      });
+      const portChoice =
+        c.key === 'local_port' && c.on && loopbackPinned()
+          ? seg('Port match', [['exact', `Only ${c.value}`], ['ephemeral', 'Any 1024–65535']], d.portMode, (v) => {
+              d.portMode = v;
+              changed({ rerender: true });
+            })
+          : null;
+      const shown = c.key === 'local_port' && d.portMode === 'ephemeral' && loopbackPinned() ? 'local_port 1024–65535' : `${c.key} = ${ruleValueText(c.value)}`;
+      return el(
+        'div',
+        { class: ['clause-row', !c.on && 'is-off'] },
+        el('label', { class: 'clause-main' }, box, el('span', { class: 'clause-label' }, c.label), el('code', { class: 'clause' }, shown)),
+        portChoice ? el('div', { class: 'clause-extra' }, portChoice, el('span', { class: 'hint' }, 'A loopback-only rule may cover the ephemeral range.')) : null,
+        denySlot(c.key),
+      );
+    };
+    replace(
+      formSlot,
+      el(
+        'dl',
+        { class: 'kv' },
+        el('dt', null, 'Socket'),
+        el('dd', { class: 'mono' }, `${item.protocol} ${sockAddr(item)}`),
+        el('dt', null, 'Owner'),
+        el('dd', null, `${item.comm ?? 'unknown process'}${item.pid ? ` (pid ${item.pid})` : ''} · ${item.systemd_unit ?? 'no unit'} · uid ${item.uid}`),
+        el('dt', null, 'Host'),
+        el('dd', { class: 'mono' }, host_id),
+      ),
+      field(
+        'Applies to',
+        seg('Rule scope', [['watch', 'This watch'], ['all', 'Every socket watch']], d.watchOnly ? 'watch' : 'all', (v) => {
+          d.watchOnly = v === 'watch';
+          changed({ rerender: true });
+        }),
+        el('span', { class: 'hint' }, d.watchOnly ? ['Only ', el('span', { class: 'mono' }, watch_id), ' on this host.'] : `Every set_diff sockets.listening watch on ${host_id}, including ones added later.`),
+      ),
+      denySlot('scope'),
+      el(
+        'div',
+        { class: 'field' },
+        el('span', { class: 'lbl' }, 'Match when all of these hold', el('span', { class: 'muted' }, 'untick to widen')),
+        el('div', { class: 'clause-list' }, d.clauses.map(clauseRow)),
+        denySlot('clauses'),
+      ),
+      field(
+        'Effect',
+        seg('Effect', Object.entries(EFFECTS).map(([k, v]) => [k, v.label]), d.effect, (v) => {
+          d.effect = v;
+          changed({ rerender: true });
+        }),
+        el('span', { class: 'hint' }, EFFECTS[d.effect].help),
+      ),
+      field(
+        'Expiry',
+        seg('Expiry', EXPIRY_CHOICES, d.expiry, (v) => {
+          d.expiry = v;
+          d.expires_at = expiryIso(v);
+          changed({ rerender: true });
+        }),
+        el('span', { class: 'hint' }, d.expires_at ? `Stops applying ${fmtTime(d.expires_at)}; it then moves to History as expired.` : 'Stays active until an operator revokes it.'),
+      ),
+      denySlot('expiry'),
+      field('Rationale (recorded with the rule)', rationale),
+      denySlot('rationale'),
+      identityLine(d, 'actor', 'Created by'),
+    );
+  }
+
+  createBtn.addEventListener('click', async () => {
+    if (missing()) return;
+    createBtn.disabled = true;
+    const s = spec();
+    try {
+      const res = await api('/api/admin/rules', { method: 'POST', body: { rule: s, actor: d.actor } });
+      if (!res.allowed) {
+        bt = { key: JSON.stringify(s), status: 'done', res: { allowed: false, decision: res.decision }, err: null };
+        drawResult();
+        recheck();
+        return;
+      }
+      rememberOperator(d.actor);
+      drawer().close();
+      toast(`Rule active for ${service} on ${host_id}; it applies from the next observation`, 'ok');
+      await loadRules();
+      renderShell();
+      if (incident) reloadWorkspace(incident.incident_id);
+    } catch (err) {
+      replace(resultSlot, errorBox(err));
+      recheck();
+    }
+  });
+
+  drawForm();
+  replace(sentenceSlot, ruleSentenceNode(spec()));
+  openDrawer(
+    'Allow for this service',
+    'Drafts an expectation rule from this socket. control-d backtests it against recent observations before you create it.',
+    [sentenceSlot, formSlot, resultSlot],
+    [footNote, el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), rerunBtn, createBtn],
+  );
+  drawer().addEventListener('close', () => {
+    clearTimeout(timer);
+    seq += 1;
+  }, { once: true });
+  run();
 }
 
 // ---------------------------------------------------------------------------

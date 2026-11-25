@@ -115,6 +115,7 @@ const ICONS = {
   arrow: ['M5 12h14', 'M13 6l6 6-6 6'],
   cpu: ['M7 7h10v10H7z', 'M10 3v4', 'M14 3v4', 'M10 17v4', 'M14 17v4', 'M3 10h4', 'M3 14h4', 'M17 10h4', 'M17 14h4'],
   stream: ['M4 7h10', 'M4 12h16', 'M4 17h7'],
+  rules: ['M4 5h16l-6.5 7.5V18l-3 1.5v-7L4 5Z'],
 };
 
 export function icon(name) {

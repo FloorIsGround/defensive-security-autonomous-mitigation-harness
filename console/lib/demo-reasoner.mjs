@@ -142,6 +142,9 @@ export function buildDemoReasoner({ now, ids }) {
       phases: [phase(a0 - MIN, 'pending'), leased(a0, 900), phase(runA.ends, 'done', { reason: `completed by ${runA.run_id}` })] },
     { event_id: 4119, incident_id: 'inc-2026-0042', host_id: 'edge-vm-07', watch_id: 'base-sockets-listening', retry_count: 0,
       phases: [phase(ago(41), 'pending'), leased(b0, 1800), phase(runB.ends, 'done', { reason: `completed by ${runB.run_id}: budget exhausted` })] },
+    // control-d appends "(k suppressed by rules)" to a set_diff trigger reason when active expectation rules filtered items.
+    { event_id: 4124, incident_id: 'inc-2026-0042', host_id: 'edge-vm-07', watch_id: 'base-sockets-listening', retry_count: 0,
+      phases: [phase(ago(11), 'pending'), phase(ago(11) + 4 * S_, 'done', { reason: "set 'sockets' diff: +1 -0 ~0 (1 suppressed by rules)" })] },
     { event_id: 4121, incident_id: 'inc-2026-0042', host_id: 'edge-vm-07', watch_id: 'ephem-0042-cron-scan', retry_count: 0,
       phases: [phase(ago(42), 'pending'), leased(ago(41) + 20 * S_, 120), phase(ago(40), 'pending', { retry_count: 1, reason: 'backend error: HTTP 529 overloaded' }), leased(ago(33), 120), phase(ago(31), 'pending', { retry_count: 2, reason: 'backend error: HTTP 529 overloaded' }), leased(ago(27), 120), phase(ago(25), 'dead_letter', { retry_count: 3, reason: 'retry budget exhausted (3 attempts): anthropic-direct returned HTTP 529 overloaded' })] },
     { event_id: 4127, incident_id: 'inc-2026-0042', host_id: 'edge-vm-07', watch_id: 'ephem-0042-helper-unit', retry_count: 0,
