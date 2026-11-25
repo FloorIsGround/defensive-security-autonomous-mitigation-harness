@@ -10,6 +10,26 @@ Telemetry is untrusted: the reasoner wraps it in `<untrusted_telemetry>` envelop
 
 Containment is disabled by default. Autonomous containment requires opt-in at both control and executor. Dual-signed actions require an independent operator key; protect it separately from the control key. The executor's persistent nonce store supports replay rejection; preserve that state across restarts. Dry-run is the default, and enforcement can disrupt workloads. Validate rollback and recovery in your environment before use.
 
+## Operator MCP and delegated runs
+
+An investigator token needs an explicit run-spawn grant. The control daemon
+scopes each delegated child to one open incident and its host, copies the
+parent's collector scope, caps the lifetime, and enforces four active children
+per parent principal. The child cannot delegate or manage trigger leases.
+Cancellation by the run token or by an in-scope investigator acting as the
+parent principal revokes the run token. The ledger keeps token hashes for
+credential lookup, and the run-start audit records the delegation metadata
+without the child token.
+
+The operator MCP adapter uses its base token for fleet reads and selects each
+child token by explicit run ID for run-scoped tools. The adapter keeps child
+credentials in memory. The control and edge policy gates govern temporary
+watches, expectation rules require operator approval, and actions proposed
+from a delegated run require an independent operator signature. Codex shell
+tools have their own security boundary. Run Codex under a dedicated OS user
+with a read-only sandbox and empty working directory. Keep admin and signing
+access outside that account. See the [operator setup](operator-agent.md).
+
 ## Limitations and verification
 
 Polling can miss short-lived events and is not syscall-level eBPF monitoring. Unprivileged socket ownership and journal visibility can be incomplete. Unix sockets and peer credentials are local; fleet mTLS, PKI, remote transport and external telemetry adapters are planned. A hash chain detects changes within the verified sequence but needs an independently retained checkpoint to make replacement or truncation evident.
