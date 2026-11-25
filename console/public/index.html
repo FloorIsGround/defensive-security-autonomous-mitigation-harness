@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
   <title>Defensive Security Autonomous Mitigation Harness — Console</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -14,43 +14,58 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <div id="gate" class="gate" hidden></div>
   <div class="shell" id="shell" hidden>
-    <aside class="rail" aria-label="Primary">
-      <div class="brand">
-        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
-          <path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.6 11.5 14.3 6.6-1.7 11.5-7.2 11.5-14.3V7L16 2.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
-          <path d="M10.5 16.2 14.4 20l7.1-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <div class="brand-text">
-          <span class="brand-name">Defensive Security Autonomous Mitigation Harness</span>
-          <span class="brand-sub">Operator Console</span>
-        </div>
+    <aside class="side" id="side" aria-label="Primary">
+      <div class="side-head">
+        <a class="brand" href="#/fleet" title="Defensive Security Autonomous Mitigation Harness">
+          <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+            <path d="M16 2.5 4.5 7v8.2c0 7.1 4.9 12.6 11.5 14.3 6.6-1.7 11.5-7.2 11.5-14.3V7L16 2.5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+            <path d="M10.5 16.2 14.4 20l7.1-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="brand-text">
+            <span class="brand-name">DefSec Harness</span>
+            <span class="brand-sub">Operator console</span>
+          </span>
+        </a>
+        <button type="button" class="btn btn-ghost btn-icon side-close" id="nav-close" aria-label="Close navigation"><span data-icon="close"></span></button>
       </div>
       <nav class="nav" id="nav">
-        <a href="#/fleet" data-view="fleet"><span class="nav-ico" data-icon="fleet"></span><span>Fleet &amp; Posture</span></a>
-        <a href="#/investigations" data-view="investigations"><span class="nav-ico" data-icon="incident"></span><span>Investigations</span><span class="nav-count" id="nav-incidents"></span></a>
-        <a href="#/mitigations" data-view="mitigations"><span class="nav-ico" data-icon="bolt"></span><span>Mitigations</span><span class="nav-count warn" id="nav-mitigations" title="Awaiting dual-signed approval"></span></a>
-        <a href="#/baselines" data-view="baselines"><span class="nav-ico" data-icon="baseline"></span><span>Baselines &amp; Telemetry</span></a>
-        <a href="#/audit" data-view="audit"><span class="nav-ico" data-icon="audit"></span><span>Policy &amp; Audit</span></a>
+        <a href="#/fleet" data-view="fleet"><span class="nav-ico" data-icon="fleet"></span><span class="nav-label">Fleet &amp; posture</span></a>
+        <a href="#/investigations" data-view="investigations"><span class="nav-ico" data-icon="incident"></span><span class="nav-label">Investigations</span><span class="nav-count" id="nav-incidents" title="Open incidents"></span></a>
+        <a href="#/mitigations" data-view="mitigations"><span class="nav-ico" data-icon="bolt"></span><span class="nav-label">Mitigations</span><span class="nav-count warn" id="nav-mitigations" title="Awaiting dual-signed approval"></span></a>
+        <a href="#/baselines" data-view="baselines"><span class="nav-ico" data-icon="baseline"></span><span class="nav-label">Baselines &amp; telemetry</span></a>
+        <a href="#/audit" data-view="audit"><span class="nav-ico" data-icon="audit"></span><span class="nav-label">Policy &amp; audit</span></a>
       </nav>
-      <div class="rail-foot" id="rail-status" aria-live="polite"></div>
+      <div class="side-foot">
+        <div class="side-status" id="rail-status" aria-live="polite"></div>
+        <div class="theme-switch" id="theme-switch" role="group" aria-label="Colour theme">
+          <button type="button" data-theme-choice="light" aria-pressed="true">Light</button>
+          <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+        </div>
+      </div>
     </aside>
 
-    <div class="stage">
-      <header class="topbar">
-        <div class="topbar-title">
-          <h1 id="view-title">Fleet &amp; Posture</h1>
-          <p id="view-sub" class="muted"></p>
+    <header class="topbar">
+      <button type="button" class="btn btn-ghost btn-icon menu-btn" id="nav-open" aria-label="Open navigation" aria-controls="side" aria-expanded="false"><span data-icon="menu"></span></button>
+      <div class="topbar-ctx" id="topbar-ctx"></div>
+      <div class="topbar-actions">
+        <div id="chain-pill"></div>
+        <div id="user-slot" class="user-slot"></div>
+        <button type="button" class="btn btn-ghost" id="refresh-btn" title="Refresh (r)">
+          <span data-icon="refresh"></span><span class="btn-label">Refresh</span>
+        </button>
+      </div>
+    </header>
+
+    <main id="main" class="sheet" tabindex="-1">
+      <div class="page-head">
+        <div class="page-title">
+          <h1 id="view-title">Fleet &amp; posture</h1>
+          <p id="view-sub"></p>
         </div>
-        <div class="topbar-actions">
-          <div id="chain-pill"></div>
-          <div id="user-slot" class="user-slot"></div>
-          <button type="button" class="btn btn-ghost" id="refresh-btn" title="Refresh (r)">
-            <span data-icon="refresh"></span><span>Refresh</span>
-          </button>
-        </div>
-      </header>
-      <main id="main" tabindex="-1"></main>
-    </div>
+        <div class="page-actions" id="page-actions"></div>
+      </div>
+      <div id="view"></div>
+    </main>
   </div>
 
   <dialog id="drawer" class="drawer" aria-labelledby="drawer-title"></dialog>

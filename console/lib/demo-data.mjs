@@ -7,13 +7,17 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
-import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, signingInfo, summaryOf } from './demo-actions.mjs';
+import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
   COLLECTOR_TYPES,
+  automationSummary,
+  buildIncidentChanges,
   buildWatchSpec,
   deriveThreeState,
   int,
+  isStreamWatch,
+  parseActionBody,
   parseFindingBody,
   requireIdent,
   requireText,
@@ -68,6 +72,8 @@ const unitColl = (unit) => ({ type: 'systemd.unit_state', parameters: { unit, ha
 const unitTrig = { type: 'field_changed', compare_against: 'accepted_baseline', fields: ['active_state', 'sub_state', 'exec_start_hash'] };
 const filesColl = (paths) => ({ type: 'files.metadata', parameters: { paths, compute_hash: true } });
 const filesTrig = { type: 'set_diff', compare_against: 'accepted_baseline', set_field: 'files', identity_key: 'path' };
+const journalColl = (unit) => ({ type: 'journal.unit_events', parameters: { unit, min_priority: 6, max_events_per_batch: 50, max_message_bytes: 512 } });
+const healthTrig = { type: 'collector_stale_or_error', max_stale_seconds: 300, consecutive_errors: 3 };
 
 // ---------------------------------------------------------------------------
 // Observation payload fixtures
@@ -140,10 +146,10 @@ function buildState(now, signer) {
   const iso = (ago) => new Date(now - ago).toISOString();
 
   const hosts = [
-    { host_id: 'edge-vm-07', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 6, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
+    { host_id: 'edge-vm-07', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 7, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
     { host_id: 'edge-vm-03', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 9, hb: 12_000, health: { rss_bytes: 19_116_032, spool_bytes_used: 401_408, spool_bytes_cap: 67_108_864, active_watches: 3, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-11' },
     { host_id: 'edge-vm-11', agent_version: '0.1.9', liveness_status: 'stale', active_bundle_version: 7, hb: 4 * MIN + 12_000, health: { rss_bytes: 31_870_976, spool_bytes_used: 58_720_256, spool_bytes_cap: 67_108_864, active_watches: 1, dropped_events_total: 214 }, vm: 'vSphere / cl-edge-b / esx-02' },
-    { host_id: 'edge-vm-12', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 2, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
+    { host_id: 'edge-vm-12', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 4, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
     { host_id: 'edge-db-02', agent_version: '0.1.9', liveness_status: 'offline', active_bundle_version: 6, hb: 3 * HOUR + 7 * MIN, health: null, vm: 'vSphere / cl-data / esx-21' },
   ];
 
@@ -190,6 +196,9 @@ function buildState(now, signer) {
     baselineWatch('edge-vm-11', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-vm-12', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-vm-12', 'base-sshd-unit', unitColl('sshd.service'), unitTrig),
+    baselineWatch('edge-vm-12', 'base-cron-config', filesColl(['/etc/cron.d/popularity-contest', '/etc/cron.d/e2scrub_all']), filesTrig, 300, 20),
+    baselineWatch('edge-vm-12', 'base-timesyncd-unit', unitColl('systemd-timesyncd.service'), unitTrig),
+    baselineWatch('edge-vm-07', 'base-sshd-journal', journalColl('sshd.service'), healthTrig),
     baselineWatch('edge-db-02', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-db-02', 'base-postgres-unit', unitColl('postgresql.service'), unitTrig),
   ];
@@ -272,6 +281,32 @@ function buildState(now, signer) {
     ['v12_sock', 'edge-vm-12', 'base-sockets-listening', 9 * MIN, 'ok', snap(sockSnap(BASE_SOCKETS.slice(0, 2)))],
     ['v12_sshd_old', 'edge-vm-12', 'base-sshd-unit', 2 * DAY, 'ok', snap(unitSnap('sshd.service', 790, '/usr/sbin/sshd -D', '[Service]\nExecStart=/usr/sbin/sshd -D\n', 538))],
     ['v12_sshd', 'edge-vm-12', 'base-sshd-unit', 8 * MIN, 'ok', snap(unitSnap('sshd.service', 1402, '/usr/sbin/sshd -D', '[Service]\nExecStart=/usr/sbin/sshd -D\n', 538))],
+    ['v12_cron', 'edge-vm-12', 'base-cron-config', 7 * MIN, 'ok', snap({ count: 2, files: [
+      fileEntry('/etc/cron.d/popularity-contest', 'SHELL=/bin/sh\n17 4 * * * root test -x /etc/cron.daily/popularity-contest\n', 312, 120 * DAY, now),
+      fileEntry('/etc/cron.d/e2scrub_all', '30 3 * * 0 root test -e /run/systemd/system || /usr/sbin/e2scrub_all\n', 201, 90 * DAY, now),
+    ] })],
+    ['v12_tsync', 'edge-vm-12', 'base-timesyncd-unit', 6 * MIN, 'ok', snap(unitSnap('systemd-timesyncd.service', 655, '/usr/lib/systemd/systemd-timesyncd', '[Service]\nExecStart=/usr/lib/systemd/systemd-timesyncd\n', 1630))],
+    ['sshj_1', 'edge-vm-07', 'base-sshd-journal', 30 * MIN, 'ok', {
+      kind: 'stream_batch',
+      events: [
+        jEvent(now, 31 * MIN, 21, 811, 6, 'Accepted publickey for deploy from 10.20.8.15 port 51022 ssh2: ED25519 SHA256:[REDACTED]', { redacted: true, unit: 'sshd.service' }),
+        jEvent(now, 31 * MIN - 2_000, 22, 811, 6, 'pam_unix(sshd:session): session opened for user deploy(uid=1001) by (uid=0)', { unit: 'sshd.service' }),
+      ],
+      cursor_before: 's=8c1f42;i=4a200',
+      cursor_after: 's=8c1f42;i=4a202',
+      gap_detected: false,
+    }],
+    ['sshj_2', 'edge-vm-07', 'base-sshd-journal', 9 * MIN, 'ok', {
+      kind: 'stream_batch',
+      events: [
+        jEvent(now, 10 * MIN, 23, 811, 5, 'Connection closed by authenticating user root 203.0.113.47 port 40188 [preauth]', { unit: 'sshd.service' }),
+        jEvent(now, 10 * MIN - 800, 24, 811, 5, 'Connection closed by authenticating user root 203.0.113.47 port 40190 [preauth]', { unit: 'sshd.service' }),
+        jEvent(now, 10 * MIN - 1_500, 25, 811, 6, 'pam_unix(sshd:session): session closed for user deploy', { unit: 'sshd.service' }),
+      ],
+      cursor_before: 's=8c1f42;i=4a202',
+      cursor_after: 's=8c1f42;i=4a205',
+      gap_detected: false,
+    }],
 
     ['db_sock', 'edge-db-02', 'base-sockets-listening', 3 * HOUR + 9 * MIN, 'ok', snap(sockSnap([sock('tcp', '10.20.4.12', 5432, 113, 33120, 950, 'postgres', 'postgresql.service'), BASE_SOCKETS[0]]))],
     ['db_pg', 'edge-db-02', 'base-postgres-unit', 3 * HOUR + 9 * MIN, 'ok', snap(unitSnap('postgresql.service', 950, '/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main', '[Service]\nExecStart=/usr/lib/postgresql/16/bin/postgres\n', 703))],
@@ -570,6 +605,9 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
             liveness_status: hst.liveness_status,
             active_bundle_version: hst.active_bundle_version,
             last_heartbeat_at: last === null ? null : new Date(last).toISOString(),
+            watch_count: hostWatches(hst.host_id).length,
+            baseline_watch_count: hostWatches(hst.host_id).filter((w) => w.class === 'baseline').length,
+            stream_watch_count: hostWatches(hst.host_id).filter((w) => isStreamWatch(w)).length,
             health: hst.health ?? undefined,
             placement: hst.vm ?? undefined,
           };
@@ -731,6 +769,41 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       appendAudit(S.audit, 'finding_recorded', 'console-operator', { finding_id, run_id: run.run_id, incident_id: incidentId, finding, evidence_hashes: evidence });
       inc.updated_at = new Date(now()).toISOString();
       return { finding_id, verified_evidence_count: Object.keys(evidence).length };
+    },
+
+    async proposeAction(incidentId, body = {}) {
+      const inc = incidentRow(incidentId);
+      const a = parseActionBody(body);
+      const run = resolveRun(incidentId, a.run_id);
+      if (inc.status !== 'open') throw new ApiError(403, 'forbidden', 'incident is not open');
+      advance();
+      // scoped_evidence: every cited observation must exist on this host and inside the incident's scope.
+      const evidenceOk = a.evidence_observation_ids.every((id) => {
+        const o = S.observations.find((x) => x.observation_id === id);
+        const w = o && S.watches.find((x) => x.host_id === o.host_id && x.id === o.watch_id);
+        return o && o.host_id === inc.host_id && !(w?.incident_id && w.incident_id !== incidentId);
+      });
+      const { run_id: _r, ...proposal } = a;
+      const res = proposeDemoAction(S, { incident: inc, run, actor: 'console-operator', proposal, evidenceOk, signer, nowMs: now(), appendAudit });
+      inc.updated_at = new Date(now()).toISOString();
+      return res;
+    },
+
+    async changes(incidentId) {
+      const inc = incidentRow(incidentId);
+      const ws = hostWatches(inc.host_id).filter((w) => (!w.incident_id || w.incident_id === incidentId) && !isStreamWatch(w));
+      const observationsByWatch = new Map(ws.map((w) => [w.id, S.observations.filter((o) => o.host_id === inc.host_id && o.watch_id === w.id)]));
+      return {
+        incident_id: incidentId,
+        host_id: inc.host_id,
+        changes: buildIncidentChanges({ incident: publicIncident(inc), watches: ws.map(publicWatch), baselines: currentBaselines(inc.host_id), observationsByWatch }),
+      };
+    },
+
+    async automation() {
+      if (!enableAdmin) return { available: false, reason: 'admin_disabled' };
+      advance();
+      return { available: true, ...automationSummary(S.audit.slice(-500)) };
     },
 
     async audit({ limit = 200 } = {}) {

@@ -7,9 +7,14 @@ import { verifyEntries } from './audit-chain.mjs';
 import { parseOperatorApproval, signingInfo } from './demo-actions.mjs';
 import {
   ApiError,
+  COLLECTOR_TYPES,
+  automationSummary,
+  buildIncidentChanges,
   buildWatchSpec,
   deriveThreeState,
   int,
+  isStreamWatch,
+  parseActionBody,
   parseFindingBody,
   requireIdent,
   requireText,
@@ -37,21 +42,30 @@ function unwrap(resp, tag, expected) {
   return resp;
 }
 
+const RUN_TOKEN_TTL_SECONDS = 3600;
+
 export function createLiveBackend({ investigateSock, token, adminSock = null, enableAdmin = false, timeoutMs = 5000 }) {
+  // The shared browse token is only ever used for reads. StartInvestigationRun
+  // permanently narrows the calling token to one run/incident/host inside
+  // control-d, so every run gets its own freshly minted, incident-scoped token.
   const inv = new InvestigationClient({ socketPath: investigateSock, token, timeoutMs });
   const admin = enableAdmin && adminSock ? new AdminClient({ socketPath: adminSock, timeoutMs }) : null;
-  // incident_id -> run metadata started through this console process.
+  // incident_id -> { run_id, incident_id, host_id, expires_at, client }. The
+  // client holds the per-run token in a private field; it never leaves this map.
   const runs = new Map();
 
-  async function invCall(request, expected) {
+  async function clientCall(client, request, expected) {
     let resp;
     try {
-      resp = await inv.call(request);
+      resp = await client.call(request);
     } catch (err) {
       throw transportError(err);
     }
     return unwrap(resp, 'result', expected);
   }
+
+  const invCall = (request, expected) => clientCall(inv, request, expected);
+  const publicRun = (r) => (r ? { run_id: r.run_id, incident_id: r.incident_id, expires_at: r.expires_at } : null);
 
   async function adminCall(request, expected) {
     if (!admin) throw new ApiError(403, 'admin_disabled', 'admin interface is disabled (start the console with --enable-admin --admin-sock)');
@@ -85,10 +99,20 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
     return ctx.incident;
   }
 
-  function resolveRun(incidentId, body) {
-    const runId = body?.run_id ?? runs.get(incidentId)?.run_id;
-    if (!runId) throw new ApiError(409, 'run_required', 'start an investigation run for this incident first');
-    return runId;
+  /** The live per-run entry (and its dedicated client) for an incident. */
+  function resolveRun(incidentId, runId = null) {
+    const run = runs.get(incidentId);
+    if (!run) throw new ApiError(409, 'run_required', 'start an investigation run for this incident first');
+    if (runId && runId !== run.run_id) throw new ApiError(409, 'run_mismatch', 'run_id does not match the active console run for this incident');
+    if (Date.parse(run.expires_at) <= Date.now()) {
+      runs.delete(incidentId);
+      throw new ApiError(409, 'run_required', 'the investigation run expired; start a new one');
+    }
+    return run;
+  }
+
+  async function auditEntries(limit = 500) {
+    return (await adminCall({ admin_op: 'list_audit_entries', limit }, 'audit_entries')).entries;
   }
 
   /** Rejected action proposals never get an intent row; their full context lives in the audit log. */
@@ -140,7 +164,16 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
 
     async hosts() {
       const r = await invCall({ op: 'list_hosts', limit: 500 }, 'hosts');
-      return { hosts: r.hosts };
+      // HostSummary carries no watch count; ask control-d per host (bounded fan-out).
+      const counts = await Promise.allSettled(r.hosts.map((h) => invCall({ op: 'list_active_watches', host_id: h.host_id }, 'watches')));
+      return {
+        hosts: r.hosts.map((h, i) => {
+          const w = counts[i].status === 'fulfilled' ? counts[i].value.watches : null;
+          return w
+            ? { ...h, watch_count: w.length, baseline_watch_count: w.filter((x) => x.class === 'baseline').length, stream_watch_count: w.filter((x) => isStreamWatch(x)).length }
+            : { ...h, watch_count: null };
+        }),
+      };
     },
 
     async watches(hostId) {
@@ -202,36 +235,61 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
         active_watches: r.active_watches,
         recent_observations: r.recent_observations,
         findings: r.findings,
-        run: runs.get(incidentId) ?? null,
+        run: publicRun(runs.has(incidentId) && Date.parse(runs.get(incidentId).expires_at) > Date.now() ? runs.get(incidentId) : null),
       };
     },
 
     async startRun(incidentId, body = {}) {
       requireIdent(incidentId, 'incident_id');
-      const r = await invCall(
+      const backend_id = requireText(body.backend_id ?? 'operator-console', 'backend_id', 128);
+      const model_id = requireText(body.model_id ?? 'human-operator', 'model_id', 128);
+      const prompt_schema_version = requireText(body.prompt_schema_version ?? 'console.v1', 'prompt_schema_version', 128);
+      if (!admin) {
+        throw new ApiError(
+          403,
+          'admin_required_for_runs',
+          'Starting per-incident runs from a multi-incident console requires --enable-admin so each run gets an isolated capability token without narrowing the console\'s browse session.',
+        );
+      }
+      const existing = runs.get(incidentId);
+      if (existing && Date.parse(existing.expires_at) > Date.now()) return publicRun(existing);
+
+      const incident = await incidentSummary(incidentId);
+      let collectors = [...COLLECTOR_TYPES];
+      try {
+        const caps = (await invCall({ op: 'list_collector_capabilities', host_id: incident.host_id }, 'capabilities')).capabilities;
+        if (caps.length) collectors = caps.map((c) => c.collector_type);
+      } catch {
+        /* fall back to the full catalog; control-d still enforces its policy */
+      }
+      const minted = await adminCall(
         {
-          op: 'start_investigation_run',
+          admin_op: 'mint_capability_token',
+          principal_id: `console-run-${incidentId.slice(0, 8)}`,
+          role: 'investigator',
+          allowed_hosts: [incident.host_id],
+          allowed_collectors: collectors,
           incident_id: incidentId,
-          backend_id: requireText(body.backend_id ?? 'operator-console', 'backend_id', 128),
-          model_id: requireText(body.model_id ?? 'human-operator', 'model_id', 128),
-          prompt_schema_version: requireText(body.prompt_schema_version ?? 'console.v1', 'prompt_schema_version', 128),
+          ttl_seconds: RUN_TOKEN_TTL_SECONDS,
         },
-        'run_started',
+        'token_minted',
       );
-      const run = { run_id: r.run_id, incident_id: r.incident_id, expires_at: r.expires_at };
-      runs.set(incidentId, run);
-      return run;
+      const client = new InvestigationClient({ socketPath: investigateSock, token: minted.token, timeoutMs });
+      const r = await clientCall(client, { op: 'start_investigation_run', incident_id: incidentId, backend_id, model_id, prompt_schema_version }, 'run_started');
+      runs.set(incidentId, { run_id: r.run_id, incident_id: r.incident_id, host_id: incident.host_id, expires_at: r.expires_at, client });
+      return publicRun(runs.get(incidentId));
     },
 
     async propose(incidentId, body = {}) {
       requireIdent(incidentId, 'incident_id');
-      const runId = resolveRun(incidentId, body);
+      const run = resolveRun(incidentId, body.run_id);
       const incident = await incidentSummary(incidentId);
       const spec = buildWatchSpec(body, incident);
-      const r = await invCall(
+      const r = await clientCall(
+        run.client,
         {
           op: 'propose_ephemeral_watch',
-          run_id: runId,
+          run_id: run.run_id,
           idempotency_key: requireText(body.idempotency_key ?? `console-${spec.id}`, 'idempotency_key', 128),
           spec,
           rationale: requireText(body.rationale, 'rationale', 4096),
@@ -244,9 +302,63 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
     async recordFinding(incidentId, body = {}) {
       requireIdent(incidentId, 'incident_id');
       const f = parseFindingBody(body, incidentId);
-      f.run_id = resolveRun(incidentId, f);
-      const r = await invCall({ op: 'record_hypothesis_or_finding', ...f }, 'finding_recorded');
+      const run = resolveRun(incidentId, f.run_id);
+      f.run_id = run.run_id;
+      const r = await clientCall(run.client, { op: 'record_hypothesis_or_finding', ...f }, 'finding_recorded');
       return { finding_id: r.finding_id, verified_evidence_count: r.verified_evidence_count };
+    },
+
+    async proposeAction(incidentId, body = {}) {
+      requireIdent(incidentId, 'incident_id');
+      const a = parseActionBody(body);
+      const run = resolveRun(incidentId, a.run_id);
+      const r = await clientCall(
+        run.client,
+        {
+          op: 'propose_action',
+          run_id: run.run_id,
+          incident_id: incidentId,
+          idempotency_key: a.idempotency_key,
+          verb: a.verb,
+          evidence_observation_ids: a.evidence_observation_ids,
+          expected_effect: a.expected_effect,
+          blast_radius: a.blast_radius,
+          rollback_plan: a.rollback_plan,
+        },
+        'action_proposal_evaluated',
+      );
+      return {
+        decision: r.decision,
+        proposal_id: r.proposal_id ?? null,
+        intent_id: r.intent_id ?? null,
+        auth_mode: r.auth_mode ?? null,
+        status: r.status ?? null,
+        authorized: Boolean(r.authorized_intent),
+        verb: a.verb,
+        idempotency_key: a.idempotency_key,
+      };
+    },
+
+    async changes(incidentId) {
+      requireIdent(incidentId, 'incident_id');
+      const ctx = await invCall({ op: 'get_incident_context', incident_id: incidentId }, 'incident_context');
+      const host = ctx.incident.host_id;
+      const snapshotWatches = ctx.active_watches.filter((w) => !isStreamWatch(w));
+      const [base, ...perWatch] = await Promise.all([
+        invCall({ op: 'get_host_baseline_summary', host_id: host }, 'baseline_summary'),
+        ...snapshotWatches.map((w) => invCall({ op: 'query_observations', host_id: host, watch_id: w.id, limit: 100 }, 'observations')),
+      ]);
+      const observationsByWatch = new Map(snapshotWatches.map((w, i) => [w.id, perWatch[i].observations]));
+      return {
+        incident_id: incidentId,
+        host_id: host,
+        changes: buildIncidentChanges({ incident: ctx.incident, watches: snapshotWatches, baselines: base.baselines, observationsByWatch }),
+      };
+    },
+
+    async automation() {
+      if (!admin) return { available: false, reason: 'admin_disabled' };
+      return { available: true, ...automationSummary(await auditEntries(500)) };
     },
 
     async audit({ limit = 200 } = {}) {

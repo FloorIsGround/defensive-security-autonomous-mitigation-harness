@@ -9,6 +9,7 @@
 // leave it; they exist only so the offline demo produces verifiable envelopes.
 
 import crypto from 'node:crypto';
+import net from 'node:net';
 import { canonicalJson, sha256Hex } from './audit-chain.mjs';
 import { ApiError, requireIdent, requireText } from './domain.mjs';
 
@@ -380,3 +381,187 @@ export function approveDemoAction(S, { intentId, body, signer, nowMs, incidentOp
 }
 
 export const DEMO_EXEC_DELAY_MS = EXEC_DELAY_MS;
+
+// ---------------------------------------------------------------------------
+// Action gate mirror (crates/policy/src/action_gate.rs). The demo runs the
+// `with_bounded_autonomous_containment` profile its fixtures were built from:
+// nft_block_ip and non-protected systemd_stop_unit auto-authorize up to 30 min,
+// host_isolate is always dual-signed.
+// ---------------------------------------------------------------------------
+
+const PROTECTED_UNITS = new Set([
+  'sshd.service', 'ssh.service', 'systemd-journald.service', 'systemd-networkd.service', 'systemd-resolved.service',
+  'NetworkManager.service', 'dbus.service', 'agent-d.service', 'control-d.service', 'action-exec-d.service',
+]);
+const PROTECTED_CIDRS = ['127.0.0.0/8', '::1/128', '169.254.0.0/16', 'fe80::/10', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'];
+const AUTONOMOUS_VERBS = new Set(['nft_block_ip', 'systemd_stop_unit']);
+const UNIT_SUFFIXES = ['.service', '.socket', '.timer', '.target', '.path', '.mount', '.scope', '.slice'];
+
+function ipFamily(ip) {
+  const v = net.isIP(ip);
+  return v === 4 ? 'ipv4' : v === 6 ? 'ipv6' : null;
+}
+
+function inCidr(ip, cidr) {
+  const [base, prefix] = cidr.split('/');
+  const fam = ipFamily(ip);
+  if (!fam || fam !== ipFamily(base)) return false;
+  const list = new net.BlockList();
+  list.addSubnet(base, Number(prefix), fam);
+  return list.check(ip, fam);
+}
+
+function validCidr(cidr) {
+  const [base, prefix, extra] = String(cidr).split('/');
+  if (extra !== undefined || !/^\d{1,3}$/.test(prefix ?? '')) return false;
+  const fam = ipFamily(base);
+  return Boolean(fam) && Number(prefix) <= (fam === 'ipv4' ? 32 : 128);
+}
+
+function unitError(unit) {
+  if (!unit || unit.length > 128) return 'systemd unit name must be 1..=128 bytes';
+  if (unit.startsWith('-') || unit.includes('..')) return `unsafe systemd unit name '${unit}'`;
+  if (!/^[A-Za-z0-9_.@:-]+$/.test(unit)) return `systemd unit name '${unit}' contains forbidden characters`;
+  if (!UNIT_SUFFIXES.some((x) => unit.endsWith(x))) return `systemd unit name '${unit}' must end with an allowed unit suffix`;
+  return null;
+}
+
+function verbError(v) {
+  const max = ACTION_SAFETY.max_dual_signed_ttl_seconds;
+  switch (v.verb) {
+    case 'nft_block_ip': {
+      const fam = ipFamily(v.ip);
+      if (!fam) return ['action.invalid_ip', `invalid IP address '${v.ip}'`];
+      if (v.ip === '0.0.0.0' || v.ip === '::' || inCidr(v.ip, '224.0.0.0/4') || inCidr(v.ip, 'ff00::/8')) {
+        return ['action.protected_ip', `blocking unspecified or multicast IP '${v.ip}' is forbidden`];
+      }
+      const hit = PROTECTED_CIDRS.find((c) => inCidr(v.ip, c));
+      if (hit) return ['action.protected_ip', `IP '${v.ip}' falls inside protected CIDR '${hit}'`];
+      if (!v.ttl_seconds || v.ttl_seconds > max) return ['action.ttl_exceeded', `nft_block_ip ttl_seconds ${v.ttl_seconds} must be within 1..=${max}`];
+      return null;
+    }
+    case 'systemd_stop_unit': {
+      const e = unitError(v.unit);
+      if (e) return ['action.invalid_unit', e];
+      if (PROTECTED_UNITS.has(v.unit)) return ['action.protected_unit', `unit '${v.unit}' is protected and cannot be stopped`];
+      if (v.ttl_seconds != null && (!v.ttl_seconds || v.ttl_seconds > max)) return ['action.ttl_exceeded', `systemd_stop_unit ttl_seconds ${v.ttl_seconds} must be within 1..=${max}`];
+      return null;
+    }
+    case 'host_isolate': {
+      const list = v.preserve_mgmt_cidrs ?? [];
+      if (!list.length || list.length > 16) return ['action.mgmt_cidr_required', 'host_isolate must preserve 1..=16 valid management CIDRs to prevent lockout'];
+      const bad = list.find((c) => !validCidr(c));
+      if (bad) return ['action.invalid_cidr', `invalid management CIDR '${bad}'`];
+      if (!v.ttl_seconds || v.ttl_seconds > max) return ['action.ttl_exceeded', `host_isolate ttl_seconds ${v.ttl_seconds} must be within 1..=${max}`];
+      return null;
+    }
+    default:
+      return ['action.verb_disabled', `verb '${v.verb}' is disabled by policy`];
+  }
+}
+
+/** Deterministic action gate verdict: { decision, auth_mode }. */
+export function evaluateDemoAction({ verb, evidenceCount, hostActionsLastHour, lastHostActionAt, nowMs }) {
+  const decision = (allowed, rule_id, reason) => ({ allowed, rule_id, reason, policy_version: 1 });
+  const deny = (rule, reason) => ({ decision: decision(false, rule, reason), auth_mode: null });
+  if (!evidenceCount) return deny('action.evidence_required', 'action proposals must cite at least one verified observation ID');
+  if (hostActionsLastHour >= ACTION_SAFETY.max_actions_per_host_per_hour) {
+    return deny('action.rate_limit', `host reached hourly action cap (${ACTION_SAFETY.max_actions_per_host_per_hour})`);
+  }
+  if (lastHostActionAt != null && nowMs < lastHostActionAt + ACTION_SAFETY.causal_loop_cooldown_seconds * 1000) {
+    return deny('action.causal_cooldown', `causal feedback-loop cooldown (${ACTION_SAFETY.causal_loop_cooldown_seconds}s) active after recent mitigation on this host`);
+  }
+  const err = verbError(verb);
+  if (err) return deny(...err);
+  const ttl = verb.ttl_seconds ?? null;
+  if (verb.verb !== 'host_isolate' && AUTONOMOUS_VERBS.has(verb.verb) && ttl && ttl <= ACTION_SAFETY.max_autonomous_ttl_seconds) {
+    return { decision: decision(true, 'action.autonomous_authorized', `verb '${verb.verb}' meets human-owned bounded autonomous containment policy`), auth_mode: 'policy_bounded_autonomous' };
+  }
+  return { decision: decision(true, 'action.pending_dual_approval', `verb '${verb.verb}' requires independent operator Ed25519 approval signature`), auth_mode: 'dual_signed_operator' };
+}
+
+/** Mirror of ControlService::propose_action for the demo backend. */
+export function proposeDemoAction(S, { incident, run, actor, proposal, evidenceOk, signer, nowMs, appendAudit }) {
+  const at = new Date(nowMs).toISOString();
+  const hourAgo = nowMs - HOUR;
+  const hostIntents = S.actions.intents.filter((r) => r.payload.host_id === incident.host_id);
+  const lastAt = hostIntents.length ? Math.max(...hostIntents.map((r) => Date.parse(r.updated_at))) : null;
+  const idemKey = `${run.run_id}\u0000${proposal.idempotency_key}`;
+  S.actions.idempotency ??= new Map();
+  const prior = S.actions.idempotency.get(idemKey);
+  if (prior) {
+    if (prior.fingerprint !== canonicalJson(proposal)) throw new ApiError(400, 'invalid_request', 'idempotency key was reused with a different action proposal');
+    return prior.response;
+  }
+  const ev = evidenceOk
+    ? evaluateDemoAction({
+        verb: proposal.verb,
+        evidenceCount: proposal.evidence_observation_ids.length,
+        hostActionsLastHour: hostIntents.filter((r) => Date.parse(r.updated_at) > hourAgo).length,
+        lastHostActionAt: lastAt,
+        nowMs,
+      })
+    : {
+        decision: { allowed: false, rule_id: 'action.evidence_out_of_scope', reason: 'observation evidence is missing or outside incident scope', policy_version: 1 },
+        auth_mode: null,
+      };
+  const proposal_id = S.actions.nextProposalId++;
+  let status = 'rejected';
+  let intent_id = null;
+  if (ev.auth_mode) {
+    const ttl = proposal.verb.ttl_seconds ?? 900;
+    const payload = {
+      schema_version: 1,
+      intent_id: crypto.randomUUID(),
+      nonce: crypto.randomUUID(),
+      host_id: incident.host_id,
+      incident_id: incident.incident_id,
+      proposal_id,
+      auth_mode: ev.auth_mode,
+      verb: proposal.verb,
+      policy_version: 1,
+      issued_at: at,
+      expires_at: new Date(nowMs + ttl * 1000).toISOString(),
+      rollback_plan: proposal.rollback_plan,
+      evidence_observation_ids: proposal.evidence_observation_ids,
+    };
+    status = ev.auth_mode === 'policy_bounded_autonomous' ? 'authorized' : 'pending_approval';
+    intent_id = payload.intent_id;
+    S.actions.intents.push({
+      payload,
+      control_envelope: signer.signControl(payload),
+      operator_approval: null,
+      status,
+      approver: null,
+      expected_effect: proposal.expected_effect,
+      blast_radius: proposal.blast_radius,
+      created_at: at,
+      updated_at: at,
+      receipts: [],
+      execute_at: status === 'authorized' ? nowMs + EXEC_DELAY_MS : null,
+    });
+  } else {
+    S.actions.denied.push({
+      proposal_id,
+      host_id: incident.host_id,
+      incident_id: incident.incident_id,
+      verb: proposal.verb,
+      decision: ev.decision,
+      expected_effect: proposal.expected_effect,
+      blast_radius: proposal.blast_radius,
+      rollback_plan: proposal.rollback_plan,
+      evidence_observation_ids: proposal.evidence_observation_ids,
+      actor,
+      created_at: at,
+    });
+  }
+  appendAudit(S.audit, 'action_proposed', actor, {
+    proposal_id, run_id: run.run_id, host_id: incident.host_id, incident_id: incident.incident_id, intent_id, auth_mode: ev.auth_mode,
+    verb: proposal.verb, evidence_observation_ids: proposal.evidence_observation_ids, expected_effect: proposal.expected_effect,
+    blast_radius: proposal.blast_radius, rollback_plan: proposal.rollback_plan, decision: ev.decision, status,
+  }, at);
+  S.policyDecisions.push({ decision_id: S.nextDecisionId++, proposal_id: null, actor, request_id: `console-${crypto.randomUUID()}`, decision: ev.decision, created_at: at });
+  const response = { decision: ev.decision, proposal_id, intent_id, auth_mode: ev.auth_mode, status, authorized: status === 'authorized', verb: proposal.verb, idempotency_key: proposal.idempotency_key };
+  S.actions.idempotency.set(idemKey, { fingerprint: canonicalJson(proposal), response });
+  return response;
+}

@@ -110,6 +110,11 @@ const ICONS = {
   logout: ['M14 4h5v16h-5', 'M10 8l-4 4 4 4', 'M6 12h10'],
   terminal: ['M3.5 5h17v14h-17z', 'M7.5 10l3 2-3 2', 'M12.5 15h4'],
   check: ['M5 12.5l4.2 4.2L19 7'],
+  menu: ['M4 7h16', 'M4 12h16', 'M4 17h16'],
+  search: ['M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z', 'M20 20l-4-4'],
+  arrow: ['M5 12h14', 'M13 6l6 6-6 6'],
+  cpu: ['M7 7h10v10H7z', 'M10 3v4', 'M14 3v4', 'M10 17v4', 'M14 17v4', 'M3 10h4', 'M3 14h4', 'M17 10h4', 'M17 14h4'],
+  stream: ['M4 7h10', 'M4 12h16', 'M4 17h7'],
 };
 
 export function icon(name) {

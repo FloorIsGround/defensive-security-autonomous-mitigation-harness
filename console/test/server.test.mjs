@@ -8,6 +8,8 @@
 // 5. Phase 8 mitigations in demo mode (signed intents, approval rules, lifecycle)
 // 6. Access gate: --create-user, local sessions, rate limiting, roles
 // 7. Access gate: trusted reverse-proxy identity headers
+// 8. Mitigation proposals (demo + exact mock frames), stream watches, per-run
+//    token isolation against the real control-d (fake agent opens incidents)
 
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,6 +27,7 @@ import { canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from '../li
 import { SESSION_COOKIE, createAuth, createPeerMatcher, normalizeIp, readUsersFile, upsertUser } from '../lib/auth.mjs';
 import { createDemoBackend } from '../lib/demo-data.mjs';
 import { createLiveBackend } from '../lib/live-backend.mjs';
+import { deriveThreeState } from '../lib/domain.mjs';
 import { createConsoleServer, parseArgs, runCreateUser } from '../server.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -88,6 +91,16 @@ async function waitFor(fn, timeoutMs = 20_000, stepMs = 50) {
     await new Promise((r) => setTimeout(r, stepMs));
   }
   return false;
+}
+
+/** SIGTERM a daemon and wait for it to exit, so its shutdown cannot race temp-dir removal. */
+async function stopChild(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+  await exited;
+  clearTimeout(timer);
 }
 
 function mockUdsServer(sockPath, handler) {
@@ -323,8 +336,8 @@ describe('live integration with target/debug/control-d', { skip: !fs.existsSync(
     token = minted.token;
   });
 
-  after(() => {
-    child?.kill('SIGTERM');
+  after(async () => {
+    await stopChild(child);
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -527,6 +540,305 @@ describe('live integration with target/debug/control-d', { skip: !fs.existsSync(
     } finally {
       await a.app.close();
       await s.app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Per-run token isolation against the compiled control-d
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal agent-d stand-in on control-d's agent socket: one persistent
+ * connection, Register first, then hashed observation deltas. Enough to make
+ * control-d open genuine incidents through its own trigger evaluation.
+ */
+class FakeAgent {
+  constructor(socketPath, hostId) {
+    this.socketPath = socketPath;
+    this.hostId = hostId;
+    this.session = `sess-${crypto.randomBytes(4).toString('hex')}`;
+    this.seq = 0;
+    this.frames = [];
+    this.waiters = new Set();
+  }
+
+  connect() {
+    return new Promise((resolve, reject) => {
+      const decoder = new FrameDecoder();
+      this.sock = net.createConnection({ path: this.socketPath }, resolve);
+      this.sock.on('error', reject);
+      this.sock.on('data', (chunk) => {
+        for (const f of decoder.push(chunk)) {
+          this.frames.push(f);
+          for (const w of this.waiters) w();
+        }
+      });
+    });
+  }
+
+  waitFrame(match, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        const f = this.frames.find(match);
+        if (!f) return;
+        this.waiters.delete(check);
+        clearTimeout(timer);
+        resolve(f);
+      };
+      const timer = setTimeout(() => {
+        this.waiters.delete(check);
+        reject(new Error(`agent frame timeout; got ${JSON.stringify(this.frames.map((x) => x.msg))}`));
+      }, timeoutMs);
+      this.waiters.add(check);
+      check();
+    });
+  }
+
+  async register() {
+    this.sock.write(encodeFrame({
+      msg: 'register', protocol_version: 1, host_id: this.hostId, agent_version: 'fake-0.0.1',
+      boot_id: 'boot-fake', session_id: this.session, active_bundle_version: 0, active_bundle_digest: null, sent_at: new Date().toISOString(),
+    }));
+    const ack = await this.waitFrame((f) => f.msg === 'register_ack');
+    assert.equal(ack.accepted, true, JSON.stringify(ack));
+  }
+
+  async push(watchId, collectorType, payload, { observedAt = new Date() } = {}) {
+    const seq = ++this.seq;
+    const hashed = payload.kind === 'snapshot' ? payload.data : payload.events;
+    this.sock.write(encodeFrame({
+      msg: 'push_observation_delta',
+      observation: {
+        host_id: this.hostId, session_id: this.session, seq_no: seq, watch_id: watchId, spec_version: 1, collector_type: collectorType,
+        observed_at: observedAt.toISOString(), status: 'ok', state_hash: sha256Hex(canonicalJson(hashed)), payload, is_reconciliation: false, partial_reasons: [],
+      },
+    }));
+    await this.waitFrame((f) => f.msg === 'observation_ack' && f.acked_seq_no >= seq);
+  }
+
+  close() {
+    this.sock?.destroy();
+  }
+}
+
+const liveSocket = (port, comm, unit, inode) => ({
+  socket_key: `tcp:0.0.0.0:${port}:uid=0`, protocol: 'tcp', local_addr: '0.0.0.0', local_port: port, uid: 0, inode, pid: 4000 + port % 1000, comm, systemd_unit: unit,
+});
+const sockSnapshot = (list) => ({ kind: 'snapshot', data: { count: list.length, partial_attribution: false, sockets: list } });
+
+describe('per-run token isolation with target/debug/control-d', { skip: !fs.existsSync(CONTROL_D) && 'control-d binary not built (cargo build -p control-d)' }, () => {
+  const HOST = 'edge-live-01';
+  let dir;
+  let child;
+  let adminSock;
+  let invSock;
+  let agentSock;
+  let agent;
+  let browseToken;
+  let stderr = '';
+
+  const baselineSpec = (id, collector, trigger) => ({
+    id, version: 1, host_id: HOST, class: 'baseline', incident_id: null, collector,
+    schedule: { interval_seconds: 60, timeout_seconds: 10 }, trigger,
+    wake_policy: { cooldown_seconds: 60, max_wakeups_per_hour: 30 }, lifecycle: { enabled: true, expires_at: null, max_runs: null },
+  });
+
+  before(async () => {
+    dir = shortTmp('dsr-');
+    adminSock = path.join(dir, 'ad.sock');
+    invSock = path.join(dir, 'iv.sock');
+    agentSock = path.join(dir, 'ag.sock');
+    child = spawn(CONTROL_D, ['--data-dir', path.join(dir, 'data'), '--agent-sock', agentSock, '--admin-sock', adminSock, '--investigate-sock', invSock], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, RUST_LOG: 'warn' },
+    });
+    child.stderr.on('data', (c) => {
+      stderr += c;
+    });
+    assert.ok(await waitFor(() => fs.existsSync(adminSock) && fs.existsSync(invSock) && fs.existsSync(agentSock)), `control-d did not start:\n${stderr}`);
+
+    const admin = new AdminClient({ socketPath: adminSock });
+    assert.equal((await admin.call({ admin_op: 'enroll_host', host_id: HOST, agent_public_key_hex: null })).admin_result, 'host_enrolled');
+    for (const spec of [
+      baselineSpec('base-sockets', { type: 'sockets.listening', parameters: { include_tcp: true, include_udp: true, include_ipv6: true, resolve_process: true } }, { type: 'set_diff', compare_against: 'last_observed', set_field: 'sockets', identity_key: 'socket_key' }),
+      baselineSpec('base-sshd-journal', { type: 'journal.unit_events', parameters: { unit: 'sshd.service' } }, { type: 'collector_stale_or_error', max_stale_seconds: 600, consecutive_errors: 3 }),
+    ]) {
+      const r = await admin.call({ admin_op: 'apply_baseline_watch', spec, actor: 'it-operator', rationale: 'integration fixture' });
+      assert.equal(r.admin_result, 'watch_applied', JSON.stringify(r));
+    }
+
+    agent = new FakeAgent(agentSock, HOST);
+    await agent.connect();
+    await agent.register();
+    const ssh = liveSocket(22, 'sshd', 'ssh.service', 101);
+    const rogue = liveSocket(4444, 'helperd', 'custom-helper.service', 202);
+    const second = liveSocket(5555, 'beacond', 'beacon.service', 303);
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh]), { observedAt: new Date(Date.now() - 60_000) });
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh, rogue])); // incident A
+    await new Promise((r) => setTimeout(r, 2_300));
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh, rogue, second])); // incident B
+    const event = (i, msg) => ({
+      cursor: `s=fake;i=${i}`, timestamp_us: Date.now() * 1000, unit: 'sshd.service', priority: 6, pid: 811, uid: 0,
+      message_redacted: msg, truncated: false, redaction_applied: false, classification: 'bounded_redacted_text',
+    });
+    for (const [i, msg] of [[1, 'Accepted publickey for deploy'], [2, 'session closed for user deploy']]) {
+      await agent.push('base-sshd-journal', 'journal.unit_events', { kind: 'stream_batch', events: [event(i, msg)], cursor_before: null, cursor_after: `s=fake;i=${i}`, gap_detected: false });
+    }
+
+    const minted = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-browse', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 900 });
+    assert.equal(minted.admin_result, 'token_minted');
+    browseToken = minted.token;
+  });
+
+  after(async () => {
+    agent?.close();
+    await stopChild(child);
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('starting a run never narrows the console browse session, before or after closing it', async () => {
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: true });
+    const { app, port } = await startConsole(backend);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    try {
+      const list = track(await get(port, '/api/incidents'));
+      assert.equal(list.status, 200, list.text);
+      const open = list.json.incidents.filter((i) => i.status === 'open' && i.host_id === HOST).sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+      assert.equal(open.length, 2, `fake agent should have opened two incidents: ${list.text}\n${stderr}`);
+      const [A, B] = open;
+
+      // Premise check: a token that calls StartInvestigationRun itself is
+      // permanently narrowed by control-d to that run's incident and host.
+      const admin = new AdminClient({ socketPath: adminSock });
+      const victim = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-premise-check', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 300 });
+      const direct = new InvestigationClient({ socketPath: invSock, token: victim.token });
+      const started = await direct.call({ op: 'start_investigation_run', incident_id: A.incident_id, backend_id: 'operator-console', model_id: 'premise-check', prompt_schema_version: 'v1' });
+      assert.equal(started.result, 'run_started', JSON.stringify(started));
+      const narrowed = await direct.call({ op: 'get_incident_context', incident_id: B.incident_id });
+      assert.equal(narrowed.result, 'error', 'control-d narrows the calling token');
+      assert.match(narrowed.message, /scope/);
+
+      const hosts = track(await get(port, '/api/hosts'));
+      assert.equal(hosts.status, 200, hosts.text);
+      assert.equal(hosts.json.hosts[0].watch_count, 2, 'host card shows the real active watch count');
+      assert.equal(hosts.json.hosts[0].stream_watch_count, 1);
+
+      const run = track(await post(port, `/api/incidents/${A.incident_id}/runs`, {}));
+      assert.equal(run.status, 200, run.text);
+      assert.deepEqual(Object.keys(run.json).sort(), ['expires_at', 'incident_id', 'run_id'], 'no token is returned');
+      const again = track(await post(port, `/api/incidents/${A.incident_id}/runs`, {}));
+      assert.equal(again.json.run_id, run.json.run_id, 'an active run is reused');
+
+      // The browse token still reads every incident and host (this used to be 403).
+      const ctxB = track(await get(port, `/api/incidents/${B.incident_id}`));
+      assert.equal(ctxB.status, 200, ctxB.text);
+      assert.equal(ctxB.json.run, null);
+      assert.equal(track(await get(port, '/api/hosts')).status, 200);
+      const ctxA = track(await get(port, `/api/incidents/${A.incident_id}`));
+      assert.equal(ctxA.json.run.run_id, run.json.run_id);
+
+      // Mutations go through the per-run token, so control-d binds them to run A.
+      const evidence = ctxA.json.recent_observations.filter((o) => o.watch_id === 'base-sockets').map((o) => o.observation_id);
+      assert.ok(evidence.length, 'incident A has socket evidence');
+      const finding = track(await post(port, `/api/incidents/${A.incident_id}/findings`, { kind: 'hypothesis', summary: 'helperd opened 4444', evidence_observation_ids: evidence.slice(0, 1) }));
+      assert.equal(finding.status, 200, finding.text);
+      const watch = track(await post(port, `/api/incidents/${A.incident_id}/proposals`, { collector_type: 'systemd.unit_state', parameters: { unit: 'custom-helper.service' }, interval_seconds: 30, timeout_seconds: 5, ttl_seconds: 1800, max_runs: 60, rationale: 'track the helper unit' }));
+      assert.equal(watch.status, 200, watch.text);
+      assert.equal(typeof watch.json.decision.allowed, 'boolean');
+
+      // ProposeAction: exact schema, real gate verdicts.
+      const action = (verb, ids = evidence.slice(0, 1)) => post(port, `/api/incidents/${A.incident_id}/actions`, {
+        verb, evidence_observation_ids: ids, expected_effect: 'contain helperd', blast_radius: 'one host', rollback_plan: 'TTL expiry',
+      });
+      const protectedIp = track(await action({ verb: 'nft_block_ip', ip: '10.1.2.3', direction: 'both', ttl_seconds: 600 }));
+      assert.equal(protectedIp.status, 200, protectedIp.text);
+      assert.equal(protectedIp.json.decision.allowed, false);
+      assert.equal(protectedIp.json.decision.rule_id, 'action.protected_ip');
+      assert.equal(protectedIp.json.status, 'rejected');
+      assert.equal(protectedIp.json.intent_id, null);
+      const noEvidence = track(await action({ verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 600 }, []));
+      assert.equal(noEvidence.json.decision.rule_id, 'action.evidence_required');
+      const isolate = track(await action({ verb: 'host_isolate', preserve_mgmt_cidrs: '10.20.0.0/24, 10.20.8.15/32', ttl_seconds: 3600 }));
+      assert.equal(isolate.status, 200, isolate.text);
+      assert.equal(isolate.json.decision.allowed, true, isolate.text);
+      assert.equal(isolate.json.decision.rule_id, 'action.pending_dual_approval');
+      assert.equal(isolate.json.auth_mode, 'dual_signed_operator');
+      assert.equal(isolate.json.status, 'pending_approval');
+      assert.match(isolate.json.intent_id, /^[0-9a-f-]{36}$/);
+      assert.deepEqual(isolate.json.verb, { verb: 'host_isolate', preserve_mgmt_cidrs: ['10.20.0.0/24', '10.20.8.15/32'], ttl_seconds: 3600 });
+      const listed = track(await get(port, '/api/actions'));
+      assert.ok(listed.json.actions.some((a) => a.intent_id === isolate.json.intent_id && a.status === 'pending_approval'));
+      assert.ok(listed.json.denied.some((d) => d.decision.rule_id === 'action.protected_ip'));
+      assert.equal(track(await post(port, `/api/incidents/${A.incident_id}/actions`, { verb: { verb: 'rm_rf' }, expected_effect: 'x', blast_radius: 'y', rollback_plan: 'z' })).status, 400);
+      const noRun = track(await post(port, `/api/incidents/${B.incident_id}/actions`, { verb: { verb: 'nft_block_ip', ip: '203.0.113.9', ttl_seconds: 60 }, expected_effect: 'x', blast_radius: 'y', rollback_plan: 'z' }));
+      assert.equal(noRun.status, 409);
+      assert.equal(noRun.json.error.code, 'run_required');
+
+      // What changed + stream derivation + automation status.
+      const changes = track(await get(port, `/api/incidents/${B.incident_id}/changes`));
+      assert.equal(changes.status, 200, changes.text);
+      const sockChange = changes.json.changes.find((c) => c.watch_id === 'base-sockets');
+      assert.equal(sockChange.basis, 'before_incident');
+      assert.deepEqual(sockChange.diff.added.map((s) => s.local_port), [5555]);
+      const changesA = track(await get(port, `/api/incidents/${A.incident_id}/changes`));
+      assert.deepEqual(changesA.json.changes.find((c) => c.watch_id === 'base-sockets').diff.added.map((s) => s.local_port).sort(), [4444, 5555]);
+      const tri = track(await get(port, `/api/hosts/${HOST}/baselines`)).json.three_state;
+      const journal = tri.find((r) => r.watch_id === 'base-sshd-journal');
+      assert.equal(journal.state, 'stream');
+      assert.equal(journal.promotable_observation_id, null);
+      assert.equal(journal.stream.batches_in_window, 2);
+      assert.equal(tri.find((r) => r.watch_id === 'base-sockets').state, 'baseline_absent');
+      const auto = track(await get(port, '/api/automation'));
+      assert.equal(auto.json.available, true);
+      assert.equal(auto.json.reasoner_runs, 0);
+      assert.ok(auto.json.console_runs >= 1);
+
+      // Closing A ends its run but must not brick the console.
+      const closed = track(await post(port, `/api/admin/incidents/${A.incident_id}/close`, { actor: 'it-operator', resolution: 'contained' }));
+      assert.equal(closed.status, 200, closed.text);
+      for (const p of ['/api/hosts', '/api/incidents', `/api/incidents/${B.incident_id}`, `/api/incidents/${A.incident_id}`, `/api/hosts/${HOST}/watches`]) {
+        const r = track(await get(port, p));
+        assert.equal(r.status, 200, `${p} after closing A: ${r.text}`);
+      }
+      const after = track(await post(port, `/api/incidents/${A.incident_id}/findings`, { kind: 'hypothesis', summary: 'late' }));
+      assert.equal(after.status, 409, 'closed incident run was dropped');
+      const runB = track(await post(port, `/api/incidents/${B.incident_id}/runs`, {}));
+      assert.equal(runB.status, 200, runB.text);
+      assert.notEqual(runB.json.run_id, run.json.run_id);
+      assert.equal(track(await get(port, '/api/incidents')).status, 200);
+
+      // Each run used its own minted, incident-scoped principal.
+      const audit = track(await get(port, '/api/admin/audit?limit=500')).json;
+      const minted = audit.entries.filter((e) => e.event_type === 'capability_minted').map((e) => JSON.stringify(e.payload));
+      assert.ok(minted.some((p) => p.includes(`console-run-${A.incident_id.slice(0, 8)}`) && p.includes(A.incident_id)), minted.join('\n'));
+      assert.ok(minted.some((p) => p.includes(`console-run-${B.incident_id.slice(0, 8)}`)));
+      const starts = audit.entries.filter((e) => e.event_type === 'run_started');
+      assert.ok(!starts.some((e) => e.actor === 'console-browse'), 'the browse principal never started a run');
+      assert.equal(starts.filter((e) => e.actor.startsWith('console-run-')).length, 2);
+      assert.equal(audit.independent.valid, true);
+      for (const text of bodies) assert.ok(!text.includes(browseToken), 'browse token leaked');
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('without --enable-admin, runs are refused instead of narrowing the shared token', async () => {
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: false });
+    const { app, port } = await startConsole(backend);
+    try {
+      const open = (await get(port, '/api/incidents')).json.incidents.filter((i) => i.status === 'open');
+      assert.ok(open.length);
+      const r = await post(port, `/api/incidents/${open[0].incident_id}/runs`, {});
+      assert.equal(r.status, 403);
+      assert.equal(r.json.error.code, 'admin_required_for_runs');
+      assert.match(r.json.error.message, /--enable-admin/);
+      assert.equal((await get(port, '/api/incidents')).status, 200, 'browse session untouched');
+      const auto = await get(port, '/api/automation');
+      assert.equal(auto.json.available, false);
+    } finally {
+      await app.close();
     }
   });
 });
@@ -1346,5 +1658,195 @@ describe('access gate: --auth-mode proxy-header', () => {
     const o = parseArgs(['--demo', '--auth-mode', 'proxy-header', '--trusted-proxy-ips', '127.0.0.1,10.0.0.0/8', '--proxy-role-header', 'X-Forwarded-Groups', '--proxy-admin-group', 'defsec-admins'], {});
     assert.deepEqual(o.trustedProxyIps, ['127.0.0.1', '10.0.0.0/8']);
     assert.equal(o.proxyRoleHeader, 'x-forwarded-groups');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Mitigation proposals, stream watches and automation status
+// ---------------------------------------------------------------------------
+
+describe('deriveThreeState: append-only streams are never drift', () => {
+  const watch = (id, type, cls = 'baseline') => ({ id, class: cls, collector: { type, parameters: {} } });
+  const obs = (id, watchId, payload, hash = `h${id}`) => ({ observation_id: id, host_id: 'h', watch_id: watchId, spec_version: 1, observed_at: new Date(Date.now() - (100 - id) * 1000).toISOString(), status: 'ok', state_hash: hash, payload });
+  const batch = (n) => ({ kind: 'stream_batch', events: Array.from({ length: n }, (_, i) => ({ cursor: `c${i}` })), cursor_before: null, cursor_after: 'c', gap_detected: false });
+
+  test('journal.unit_events and stream_batch watches derive as stream, unpromotable', () => {
+    const rows = deriveThreeState(
+      [watch('j', 'journal.unit_events'), watch('s', 'sockets.listening'), watch('x', 'files.metadata')],
+      [{ watch_id: 's', revision_id: 1, state_hash: 'h1' }],
+      [obs(1, 's', { kind: 'snapshot', data: {} }), obs(2, 's', { kind: 'snapshot', data: {} }), obs(3, 'j', batch(2)), obs(4, 'j', batch(3)), obs(5, 'x', batch(1))],
+    );
+    const j = rows.find((r) => r.watch_id === 'j');
+    assert.equal(j.state, 'stream');
+    assert.equal(j.promotable_observation_id, null);
+    assert.equal(j.changed_since_last, false);
+    assert.deepEqual([j.stream.latest_observation_id, j.stream.latest_event_count, j.stream.events_in_window, j.stream.batches_in_window], [4, 3, 5, 2]);
+    // Any watch whose observations are stream batches is a stream, whatever its collector label.
+    assert.equal(rows.find((r) => r.watch_id === 'x').state, 'stream');
+    // Snapshot watches keep their three-state semantics.
+    const s = rows.find((r) => r.watch_id === 's');
+    assert.equal(s.state, 'drift');
+    assert.equal(s.promotable_observation_id, 2);
+    assert.equal(deriveThreeState([watch('j', 'journal.unit_events')], [], [])[0].state, 'no_data');
+  });
+
+  test('demo: baseline journal watch is a stream and never offered for promotion', async () => {
+    const backend = createDemoBackend();
+    const tri = (await backend.baselines('edge-vm-07')).three_state;
+    for (const r of tri.filter((x) => x.collector_type === 'journal.unit_events')) {
+      assert.equal(r.state, 'stream', r.watch_id);
+      assert.equal(r.promotable_observation_id, null);
+    }
+    assert.ok(tri.some((r) => r.watch_id === 'base-sshd-journal' && r.class === 'baseline'));
+    const v12 = (await backend.baselines('edge-vm-12')).three_state;
+    assert.equal(v12.filter((r) => r.state === 'baseline_absent' && r.promotable_observation_id != null).length, 2, 'two never-accepted snapshot baselines');
+  });
+});
+
+describe('POST /api/incidents/:id/actions (demo)', () => {
+  let app;
+  let port;
+  const INC = 'inc-2026-0039';
+  before(async () => {
+    ({ app, port } = await startConsole(createDemoBackend()));
+  });
+  after(() => app.close());
+
+  const body = (verb, extra = {}) => ({ verb, evidence_observation_ids: [], expected_effect: 'contain', blast_radius: 'one host', rollback_plan: 'TTL', ...extra });
+
+  test('needs a run, validates the closed verb catalog and returns the gate verdict', async () => {
+    const ctx = (await get(port, `/api/incidents/${INC}`)).json;
+    const evidence = ctx.recent_observations.map((o) => o.observation_id);
+    assert.ok(evidence.length);
+    const noRun = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }));
+    assert.equal(noRun.status, 409);
+    assert.equal(noRun.json.error.code, 'run_required');
+    assert.equal((await post(port, `/api/incidents/${INC}/runs`, {})).status, 200);
+
+    for (const [verb, re] of [
+      [{ verb: 'shell_exec', cmd: 'id' }, /verb\.verb must be one of/],
+      [{ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'sideways', ttl_seconds: 60 }, /direction/],
+      [{ verb: 'nft_block_ip', ip: '198.51.100.7' }, /ttl_seconds/],
+      [{ verb: 'systemd_stop_unit' }, /verb\.unit/],
+    ]) {
+      const r = await post(port, `/api/incidents/${INC}/actions`, body(verb, { evidence_observation_ids: evidence.slice(0, 1) }));
+      assert.equal(r.status, 400, JSON.stringify(verb));
+      assert.match(r.json.error.message, re);
+    }
+    assert.equal((await post(port, `/api/incidents/${INC}/actions`, { verb: { verb: 'host_isolate', preserve_mgmt_cidrs: ['10.0.0.0/8'], ttl_seconds: 60 } })).status, 400, 'justification is required');
+
+    const cite = { evidence_observation_ids: evidence.slice(0, 1) };
+    const prot = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'systemd_stop_unit', unit: 'ssh.service', ttl_seconds: 600 }, cite));
+    assert.equal(prot.status, 200, prot.text);
+    assert.equal(prot.json.decision.rule_id, 'action.protected_unit');
+    assert.equal(prot.json.status, 'rejected');
+    assert.equal(prot.json.intent_id, null);
+    const foreign = (await get(port, '/api/hosts/edge-vm-07/observations?limit=1')).json.observations[0].observation_id;
+    const outside = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { evidence_observation_ids: [foreign] }));
+    assert.equal(outside.json.decision.rule_id, 'action.evidence_out_of_scope');
+
+    const auto = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(auto.status, 200, auto.text);
+    assert.equal(auto.json.decision.rule_id, 'action.autonomous_authorized');
+    assert.equal(auto.json.auth_mode, 'policy_bounded_autonomous');
+    assert.equal(auto.json.status, 'authorized');
+    assert.match(auto.json.intent_id, /^[0-9a-f-]{36}$/);
+    const replay = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(replay.json.intent_id, auto.json.intent_id, 'same idempotency key replays the verdict');
+    const reused = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.8', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(reused.status, 400);
+    const cooldown = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'host_isolate', preserve_mgmt_cidrs: '10.20.0.0/24', ttl_seconds: 3600 }, cite));
+    assert.equal(cooldown.json.decision.rule_id, 'action.causal_cooldown');
+
+    const list = (await get(port, `/api/actions?incident_id=${INC}`)).json;
+    const intent = list.actions.find((a) => a.intent_id === auto.json.intent_id);
+    assert.deepEqual(Object.keys(intent).sort(), SUMMARY_KEYS);
+    assert.ok(list.denied.some((d) => d.decision.rule_id === 'action.protected_unit'));
+    const detail = (await get(port, `/api/admin/actions/${auto.json.intent_id}`)).json;
+    assert.deepEqual(Object.keys(detail.payload).sort(), PAYLOAD_KEYS);
+    const audit = (await get(port, '/api/admin/audit?limit=500')).json;
+    assert.equal(audit.independent.valid, true);
+    assert.ok(audit.entries.some((e) => e.event_type === 'action_proposed' && e.payload.intent_id === auto.json.intent_id));
+  });
+
+  test('host watch counts, incident changes and automation status', async () => {
+    const hosts = (await get(port, '/api/hosts')).json.hosts;
+    const h07 = hosts.find((h) => h.host_id === 'edge-vm-07');
+    assert.ok(h07.watch_count >= 7);
+    assert.equal(h07.stream_watch_count, 2);
+    const changes = (await get(port, '/api/incidents/inc-2026-0042/changes')).json.changes;
+    const sock = changes.find((c) => c.watch_id === 'base-sockets-listening');
+    assert.equal(sock.basis, 'accepted_baseline');
+    assert.deepEqual(sock.diff.added.map((s) => s.local_port), [4444]);
+    assert.ok(!changes.some((c) => c.collector_type === 'journal.unit_events'), 'streams are not diffed');
+    const auto = (await get(port, '/api/automation')).json;
+    assert.equal(auto.available, true);
+    assert.equal(auto.reasoner_runs, 2);
+    assert.equal(auto.last_run.model_id, 'claude-sonnet-5-5');
+  });
+});
+
+describe('ProposeAction frames over a mock control-d', () => {
+  test('runs mint an isolated incident-scoped token and every run mutation uses it', async () => {
+    const dir = shortTmp('dsm-');
+    const inv = path.join(dir, 'iv.sock');
+    const adm = path.join(dir, 'ad.sock');
+    const seen = [];
+    const incident = { incident_id: '5bc7e050-0000-4000-8000-000000000001', host_id: 'edge-x', status: 'open', priority: 'medium', summary: 's', created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const invSrv = await mockUdsServer(inv, (frame) => {
+      seen.push({ sock: 'inv', token: frame.capability_token, request: frame.request });
+      switch (frame.request.op) {
+        case 'get_incident_context':
+          return { result: 'incident_context', incident, active_watches: [], recent_observations: [], findings: [] };
+        case 'list_collector_capabilities':
+          return { result: 'capabilities', capabilities: [{ collector_type: 'sockets.listening' }, { collector_type: 'journal.unit_events' }] };
+        case 'start_investigation_run':
+          return { result: 'run_started', run_id: 'run-1', incident_id: incident.incident_id, expires_at: new Date(Date.now() + 3_600_000).toISOString() };
+        case 'propose_action':
+          return { result: 'action_proposal_evaluated', decision: { allowed: true, rule_id: 'action.pending_dual_approval', reason: 'r', policy_version: 1 }, proposal_id: 7, intent_id: 'i-1', auth_mode: 'dual_signed_operator', status: 'pending_approval', authorized_intent: null };
+        default:
+          return { result: 'error', code: 'invalid_request', message: 'unexpected' };
+      }
+    });
+    const admSrv = await mockUdsServer(adm, (frame) => {
+      seen.push({ sock: 'admin', request: frame });
+      return frame.admin_op === 'mint_capability_token' ? { admin_result: 'token_minted', token: 'run-scoped-token', expires_at: new Date(Date.now() + 3_600_000).toISOString() } : { admin_result: 'error', code: 'invalid_request', message: 'unexpected' };
+    });
+    const { app, port } = await startConsole(createLiveBackend({ investigateSock: inv, token: 'browse-token', adminSock: adm, enableAdmin: true }));
+    try {
+      const run = await post(port, `/api/incidents/${incident.incident_id}/runs`, {});
+      assert.equal(run.status, 200, run.text);
+      const mint = seen.find((x) => x.sock === 'admin').request;
+      assert.deepEqual(mint, {
+        admin_op: 'mint_capability_token', principal_id: 'console-run-5bc7e050', role: 'investigator', allowed_hosts: ['edge-x'],
+        allowed_collectors: ['sockets.listening', 'journal.unit_events'], incident_id: incident.incident_id, ttl_seconds: 3600,
+      });
+      const start = seen.find((x) => x.request.op === 'start_investigation_run');
+      assert.equal(start.token, 'run-scoped-token', 'the run starts on its own token');
+      const r = await post(port, `/api/incidents/${incident.incident_id}/actions`, {
+        verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900, extra: 'dropped' },
+        evidence_observation_ids: [3, '2', 3],
+        expected_effect: 'e',
+        blast_radius: 'b',
+        rollback_plan: 'r',
+        idempotency_key: 'idem-1',
+      });
+      assert.equal(r.status, 200, r.text);
+      assert.deepEqual(r.json, { decision: { allowed: true, rule_id: 'action.pending_dual_approval', reason: 'r', policy_version: 1 }, proposal_id: 7, intent_id: 'i-1', auth_mode: 'dual_signed_operator', status: 'pending_approval', authorized: false, verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900 }, idempotency_key: 'idem-1' });
+      const frame = seen.find((x) => x.request.op === 'propose_action');
+      assert.equal(frame.token, 'run-scoped-token');
+      assert.deepEqual(frame.request, {
+        op: 'propose_action', run_id: 'run-1', incident_id: incident.incident_id, idempotency_key: 'idem-1',
+        verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900 },
+        evidence_observation_ids: [2, 3], expected_effect: 'e', blast_radius: 'b', rollback_plan: 'r',
+      });
+      assert.ok(seen.filter((x) => x.sock === 'inv' && x.token === 'browse-token').every((x) => !['start_investigation_run', 'propose_action'].includes(x.request.op)), 'the browse token never starts runs or proposes');
+      assert.ok(!r.text.includes('run-scoped-token') && !run.text.includes('run-scoped-token'), 'run token never leaves the BFF');
+    } finally {
+      await app.close();
+      invSrv.close();
+      admSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

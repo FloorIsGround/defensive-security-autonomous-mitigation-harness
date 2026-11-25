@@ -11,24 +11,65 @@ const state = {
   status: null,
   hosts: [],
   incidents: [],
+  automation: null,
   capabilities: new Map(),
   evidence: new Map(), // incident_id -> Set<observation_id>
-  drafts: new Map(), // incident_id -> { proposal, finding }
+  drafts: new Map(), // incident_id -> { proposal, finding, action }
   decisions: new Map(), // incident_id -> [{decision, watch_id, spec, at}]
+  actionResults: new Map(), // incident_id -> [{decision, intent_id, ...}]
+  wsTab: new Map(), // incident_id -> side-panel tab
   expanded: new Set(),
+  tableFilters: new Map(), // observation_id -> socket filter text
+  inv: { q: '', host: '' },
   baselines: { host: null, watch: '', limit: 50 },
   audit: { tab: 'decisions', ruleFilter: null, verdict: 'all', newestFirst: true },
   auth: null, // { auth_mode, authenticated, user }
   actions: { list: [], denied: null, source: null, admin_sock: null, error: null, loaded: false },
   mit: { filter: 'all', host: '', incident: null },
   approval: { approver: '', keyFile: '~/.config/defsec/operator.key', keyId: 'operator-01', note: '', envelope: '' },
+  changeIndex: new Map(), // `${incident_id}:${observation_id}` -> { addedKeys, removed } from "What changed"
   lastRefresh: null,
 };
 
 const FLOOR = { min_interval: 15, max_timeout: 30, max_ttl_min: 240, max_runs: 1000 };
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 const VALID_OBS = new Set(['ok', 'partial']);
+const ALL_COLLECTORS = ['sockets.listening', 'systemd.unit_state', 'files.metadata', 'journal.unit_events'];
 
+// ----- per-viewer conveniences (browser storage may be unavailable) -----
+
+function stored(key, fallback = null) {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function store(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* private window or blocked storage: keep the in-memory value only */
+  }
+}
+
+/** The name an operator signs mutations with; remembered so it is typed once. */
+function operatorName() {
+  return state.auth?.user?.username || stored('defsec.operator') || 'operator';
+}
+
+function rememberOperator(name) {
+  const v = String(name ?? '').trim();
+  if (v) store('defsec.operator', v);
+}
+
+function applyTheme(theme) {
+  const t = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = t;
+  for (const b of document.querySelectorAll('[data-theme-choice]')) b.setAttribute('aria-pressed', String(b.dataset.themeChoice === t));
+}
+applyTheme(stored('defsec.theme', 'light'));
 class HttpError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -115,6 +156,10 @@ function bytes(n) {
 
 const shortHash = (h) => (h ? `${h.slice(0, 10)}…${h.slice(-4)}` : '—');
 
+/** UUIDs read as 8 characters (#5bc7e050); readable IDs such as inc-2026-0042 stay whole. */
+const isUuid = (id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id ?? ''));
+const shortId = (id) => (isUuid(id) ? `#${String(id).slice(0, 8)}` : String(id ?? '—'));
+
 function hashHue(h) {
   return parseInt(String(h).slice(0, 6), 16) % 360;
 }
@@ -141,34 +186,48 @@ async function copy(text, node) {
 }
 
 function hashChip(hash, { full = false, label = null } = {}) {
-  if (!hash) return el('span', { class: 'hash is-null' }, '— none —');
+  if (!hash) return el('span', { class: 'hash is-null' }, 'none');
   const sw = el('span', { class: 'sw' });
-  sw.style.setProperty('background', `hsl(${hashHue(hash)} 68% 58%)`);
-  const node = el('button', { class: 'hash', type: 'button', title: `SHA-256 ${hash}\nClick to copy`, attrs: { 'aria-label': `Copy hash ${hash}` } }, sw, label ?? (full ? hash : shortHash(hash)));
+  sw.style.setProperty('background', `hsl(${hashHue(hash)} 38% 52%)`);
+  const node = el('button', { class: 'hash', type: 'button', title: `SHA-256 ${hash}\nClick to copy`, attrs: { 'aria-label': `Copy hash ${hash}` } }, sw, el('span', { class: 'hash-text' }, label ?? (full ? hash : shortHash(hash))));
   node.addEventListener('click', (e) => {
     e.stopPropagation();
+    e.preventDefault();
     copy(hash, node);
   });
   return node;
 }
 
-const sevBadge = (s) => el('span', { class: ['badge', 'sev', `sev-${s}`] }, s);
+/** Short identifier that copies the full value on click. */
+function idChip(id, { title = null } = {}) {
+  const node = el('button', { class: 'id-chip', type: 'button', title: `${title ?? 'ID'} ${id}\nClick to copy`, attrs: { 'aria-label': `Copy ${title ?? 'ID'} ${id}` } }, shortId(id), isUuid(id) ? icon('copy') : null);
+  node.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    copy(String(id), node);
+  });
+  return node;
+}
+
+const SEV_LABEL = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' };
+const sevBadge = (s) => el('span', { class: ['badge', `sev-${s}`] }, SEV_LABEL[s] ?? s);
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 function livenessBadge(status) {
   const map = { online: 'ok', healthy: 'ok', connected: 'ok', stale: 'warn', degraded: 'warn', pending: 'warn', offline: 'bad', lost: 'bad' };
   const cls = map[status] ?? '';
-  return el('span', { class: ['badge', cls] }, el('span', { class: ['dot', cls] }), status || 'unknown');
+  return el('span', { class: ['badge', cls] }, el('span', { class: ['dot', cls] }), cap(status || 'unknown'));
 }
 
 function obsStatusBadge(status) {
   const cls = status === 'ok' ? 'ok' : status === 'partial' ? 'warn' : 'bad';
-  return el('span', { class: ['badge', cls] }, status.replace(/_/g, ' '));
+  return el('span', { class: ['badge', cls] }, status === 'ok' ? 'OK' : cap(status.replace(/_/g, ' ')));
 }
 
 function classBadge(cls) {
   return cls === 'baseline'
     ? el('span', { class: 'badge solid', title: 'Immutable operator-approved baseline watch' }, icon('lock'), 'Baseline')
-    : el('span', { class: 'badge eph', title: 'Bounded, incident-scoped ephemeral watch' }, icon('clock'), 'Ephemeral');
+    : el('span', { class: 'badge ghost', title: 'Bounded, incident-scoped ephemeral watch' }, icon('clock'), 'Ephemeral');
 }
 
 function rulePill(decision) {
@@ -193,13 +252,17 @@ function meter(fraction, cls = '') {
   return el('div', { class: ['meter', cls] }, bar);
 }
 
-function card(title, sub, body, actions = null) {
+function card(title, sub, body, actions = null, extraClass = null) {
   return el(
     'section',
-    { class: 'card' },
-    el('div', { class: 'card-head' }, el('div', null, el('h2', null, title), sub ? el('div', { class: 'sub' }, sub) : null), actions),
+    { class: ['card', extraClass] },
+    el('div', { class: 'card-head' }, el('div', null, el('h2', null, title), sub ? el('div', { class: 'sub' }, sub) : null), actions ? el('div', { class: 'card-head-actions' }, actions) : null),
     body,
   );
+}
+
+function notice(kind, iconName, text, action = null) {
+  return el('div', { class: ['notice', kind], attrs: kind === 'bad' ? { role: 'alert' } : null }, icon(iconName), el('div', { class: 'notice-text' }, text), action);
 }
 
 function loading(lines = 3) {
@@ -219,48 +282,43 @@ async function loadStatus() {
   renderShell();
 }
 
+function sockState(info, enabled = true) {
+  if (!enabled) return ['', 'off'];
+  if (info.simulated) return ['accent', 'simulated'];
+  if (info.reachable && info.authorized !== false) return ['ok', `${info.latency_ms ?? 0} ms`];
+  if (info.reachable) return ['warn', 'unauthorized'];
+  return ['bad', 'unreachable'];
+}
+
 function renderShell() {
   const s = state.status;
-  const rail = document.getElementById('rail-status');
   const inv = s?.sockets?.investigate ?? {};
   const adm = s?.sockets?.admin ?? {};
-  const sockLine = (label, info, enabled = true) => {
-    let cls = 'bad';
-    let txt = 'unreachable';
-    if (!enabled) {
-      cls = '';
-      txt = 'disabled';
-    } else if (info.simulated) {
-      cls = 'eph';
-      txt = 'simulated';
-    } else if (info.reachable && info.authorized !== false) {
-      cls = 'ok';
-      txt = `${info.latency_ms ?? 0} ms`;
-    } else if (info.reachable) {
-      cls = 'warn';
-      txt = 'unauthorized';
-    }
-    return el('div', { class: 'rail-row' }, el('span', { class: 'row' }, el('span', { class: ['dot', cls] }), label), el('span', { class: 'mono' }, txt));
-  };
+  const row = (label, [cls, txt]) => el('div', { class: 'status-row' }, el('span', null, el('span', { class: ['dot', cls] }), label), el('span', { class: 'mono' }, txt));
+  const mode = s?.mode === 'live' ? 'Live' : s?.mode === 'demo' ? 'Demo' : 'Unknown';
   replace(
-    rail,
-    el(
-      'div',
-      { class: 'rail-row' },
-      el('span', { class: 'eyebrow' }, 'Mode'),
-      el('span', { class: ['badge', s?.mode === 'live' ? 'ok' : s?.mode === 'demo' ? 'eph' : 'bad'] }, s?.mode ?? '…'),
-    ),
-    sockLine('investigate.sock', inv),
-    sockLine('admin.sock', adm, Boolean(s?.admin_enabled)),
-    el('div', { class: 'rail-row' }, el('span', null, 'Admin interface'), el('span', { class: ['badge', s?.admin_enabled ? 'warn' : ''] }, s?.admin_enabled ? 'enabled' : 'off')),
+    document.getElementById('rail-status'),
+    el('div', { class: 'status-row' }, el('span', null, el('span', { class: ['dot', s?.mode === 'live' ? 'ok' : s?.mode === 'demo' ? 'accent' : 'bad'] }), `${mode} mode`), el('span', { class: 'mono' }, s?.admin_enabled ? 'admin on' : 'admin off')),
+    row('investigate.sock', sockState(inv)),
+    row('admin.sock', sockState(adm, Boolean(s?.admin_enabled))),
+  );
+
+  const route = parseRoute();
+  const [invCls, invTxt] = sockState(inv);
+  replace(
+    document.getElementById('topbar-ctx'),
+    el('span', { class: 'ctx-title' }, VIEWS[route.view].title),
+    el('span', { class: 'ctx-item' }, el('span', { class: ['dot', invCls] }), s?.mode === 'demo' ? 'Demo data · no daemons' : `control-d · ${invTxt}`),
+    state.lastRefresh ? el('span', { class: 'ctx-sep' }, '·') : null,
+    state.lastRefresh ? el('span', { class: 'ctx-item' }, 'Updated ', relTime(new Date(state.lastRefresh).toISOString())) : null,
   );
 
   const pill = document.getElementById('chain-pill');
   const a = s?.audit;
   if (!a) {
-    replace(pill, el('a', { class: 'chain-pill', href: '#/audit', title: 'Audit chain requires the admin interface' }, icon('lock'), 'Audit chain unavailable'));
+    replace(pill, el('a', { class: 'chain-pill', href: '#/audit', title: 'Audit chain requires the admin interface' }, icon('lock'), 'Audit chain not visible'));
   } else if (a.valid) {
-    replace(pill, el('a', { class: 'chain-pill ok', href: '#/audit', title: `Chain head ${a.latest_hash}` }, el('span', { class: 'dot ok' }), 'Chain verified', el('span', { class: 'mono' }, `${a.entries_checked} · ${String(a.latest_hash ?? '').slice(0, 8)}`)));
+    replace(pill, el('a', { class: 'chain-pill', href: '#/audit', title: `Chain head ${a.latest_hash}` }, el('span', { class: 'dot ok' }), 'Chain verified', el('span', { class: 'mono' }, `${a.entries_checked} · ${String(a.latest_hash ?? '').slice(0, 8)}`)));
   } else {
     replace(pill, el('a', { class: 'chain-pill bad', href: '#/audit', title: a.error ?? '' }, el('span', { class: 'dot bad' }), 'Audit chain broken'));
   }
@@ -277,19 +335,26 @@ function renderShell() {
 // ---------------------------------------------------------------------------
 
 const VIEWS = {
-  fleet: { title: 'Fleet & Posture', sub: 'Edge agent liveness, bundle state and audit integrity', render: renderFleet },
+  fleet: { title: 'Fleet & posture', sub: 'Edge agent liveness, automation and audit integrity', render: renderFleet },
   investigations: { title: 'Investigations', sub: 'Observed facts, model hypotheses and verified findings', render: renderInvestigations },
   mitigations: { title: 'Mitigations', sub: 'Typed, TTL-bounded containment: autonomous within policy, dual-signed beyond it', render: renderMitigations },
-  baselines: { title: 'Baselines & Telemetry', sub: 'Accepted baseline vs. last observed vs. current observed', render: renderBaselines },
-  audit: { title: 'Policy Gate & Audit', sub: 'Deterministic policy decisions and the tamper-evident audit chain', render: renderAudit },
+  baselines: { title: 'Baselines & telemetry', sub: 'Accepted baseline against last and current observed state', render: renderBaselines },
+  audit: { title: 'Policy & audit', sub: 'Deterministic policy decisions and the tamper-evident audit chain', render: renderAudit },
 };
 
 function parseRoute() {
-  const [, view = 'fleet', arg = null] = (location.hash || '#/fleet').split('/');
-  return { view: VIEWS[view] ? view : 'fleet', arg: arg ? decodeURIComponent(arg) : null };
+  const raw = location.hash || '#/fleet';
+  const [pathPart, queryPart = ''] = raw.split('?');
+  const [, view = 'fleet', arg = null] = pathPart.split('/');
+  return { view: VIEWS[view] ? view : 'fleet', arg: arg ? decodeURIComponent(arg) : null, query: new URLSearchParams(queryPart) };
+}
+
+function setPageActions(...nodes) {
+  replace(document.getElementById('page-actions'), nodes);
 }
 
 let renderToken = 0;
+let lastView = null;
 async function render() {
   const route = parseRoute();
   const v = VIEWS[route.view];
@@ -299,15 +364,22 @@ async function render() {
     if (a.dataset.view === route.view) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   }
+  const ctxTitle = document.querySelector('#topbar-ctx .ctx-title');
+  if (ctxTitle) ctxTitle.textContent = v.title;
   const token = ++renderToken;
-  const main = document.getElementById('main');
+  const view = document.getElementById('view');
+  if (route.view !== lastView) {
+    lastView = route.view;
+    setPageActions();
+  }
   try {
-    const node = await v.render(route.arg, () => token !== renderToken);
+    const node = await v.render(route.arg, () => token !== renderToken, route);
     if (token !== renderToken || !node) return;
-    replace(main, node);
+    replace(view, node);
   } catch (err) {
     if (token !== renderToken) return;
-    replace(main, errorBox(err));
+    setPageActions();
+    replace(view, errorBox(err));
   }
 }
 
@@ -319,9 +391,17 @@ async function refreshAll() {
 }
 
 async function loadCore() {
-  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions()]);
+  const [h, i] = await Promise.allSettled([api('/api/hosts'), api('/api/incidents'), loadActions(), loadAutomation()]);
   if (h.status === 'fulfilled') state.hosts = h.value.hosts;
   if (i.status === 'fulfilled') state.incidents = i.value.incidents;
+}
+
+async function loadAutomation() {
+  try {
+    state.automation = await api('/api/automation');
+  } catch (err) {
+    state.automation = { available: false, reason: err.code, error: err };
+  }
 }
 
 async function loadActions() {
@@ -337,42 +417,33 @@ async function loadActions() {
 // View: Fleet & Posture
 // ---------------------------------------------------------------------------
 
-function integrityBanner(audit) {
+function integrityNotice(audit) {
   if (!audit) {
-    return el(
-      'div',
-      { class: 'banner' },
-      el('div', { class: 'banner-ico' }, icon('lock')),
-      el('div', null, el('div', { class: 'banner-title' }, 'Audit chain not visible'), el('div', { class: 'banner-meta' }, 'VerifyAuditChain runs on the separate admin interface. Start the console with --enable-admin --admin-sock to show integrity here.')),
-    );
+    return notice('', 'lock', [el('strong', null, 'Audit chain not visible.'), el('span', null, 'VerifyAuditChain runs on the separate admin interface; start the console with --enable-admin --admin-sock to check integrity here.')]);
   }
   if (audit.valid) {
-    return el(
-      'div',
-      { class: 'banner ok' },
-      el('div', { class: 'banner-ico' }, icon('shield')),
-      el(
-        'div',
-        null,
-        el('div', { class: 'banner-title' }, 'Audit chain intact'),
-        el('div', { class: 'banner-meta' }, el('span', null, el('span', { class: 'num' }, String(audit.entries_checked)), ' entries verified from genesis'), el('span', null, 'head ', hashChip(audit.latest_hash))),
-      ),
-      el('span', { class: 'spacer' }),
-      el('a', { class: 'btn btn-sm', href: '#/audit' }, 'Inspect chain'),
+    return notice(
+      '',
+      'shield',
+      [el('strong', null, 'Audit chain intact'), el('span', null, `${audit.entries_checked} entries verified from genesis`), el('span', { class: 'row' }, 'head', hashChip(audit.latest_hash))],
+      el('a', { class: 'btn btn-sm', href: '#/audit' }, 'Inspect'),
     );
   }
-  return el(
-    'div',
-    { class: 'banner bad', attrs: { role: 'alert' } },
-    el('div', { class: 'banner-ico' }, icon('alert')),
-    el('div', null, el('div', { class: 'banner-title' }, 'Tamper evidence: audit chain verification failed'), el('div', { class: 'banner-meta' }, el('span', { class: 'mono' }, audit.error ?? 'unknown error'))),
-    el('span', { class: 'spacer' }),
-    el('a', { class: 'btn btn-sm btn-danger', href: '#/audit' }, 'Investigate'),
-  );
+  return notice('bad', 'alert', [el('strong', null, 'Audit chain verification failed.'), el('span', { class: 'mono' }, audit.error ?? 'unknown error')], el('a', { class: 'btn btn-sm btn-danger', href: '#/audit' }, 'Investigate'));
 }
 
 function kpi(label, value, foot) {
   return el('div', { class: 'kpi' }, el('div', { class: 'label' }, label), el('div', { class: 'value' }, value), foot ? el('div', { class: 'foot' }, foot) : null);
+}
+
+const sum = (list, f) => list.reduce((n, x) => n + (f(x) ?? 0), 0);
+const hostWatchCount = (h) => h.watch_count ?? h.health?.active_watches ?? null;
+
+function sevSummary(incidents) {
+  return SEV_ORDER.map((s) => [s, incidents.filter((i) => i.priority === s).length])
+    .filter(([, n]) => n)
+    .map(([s, n]) => `${n} ${s}`)
+    .join(' · ');
 }
 
 async function renderFleet() {
@@ -380,90 +451,126 @@ async function renderFleet() {
   const open = state.incidents.filter((i) => i.status === 'open');
   const online = hosts.filter((h) => h.liveness_status === 'online').length;
   const degraded = hosts.filter((h) => h.liveness_status !== 'online');
-  const sevCounts = SEV_ORDER.map((s) => [s, open.filter((i) => i.priority === s).length]).filter(([, n]) => n);
+  const counts = hosts.map(hostWatchCount);
+  const knownCounts = counts.filter((c) => c != null);
+
+  setPageActions(adminEnabled() ? el('button', { class: 'btn', type: 'button', on: { click: openEnrollDrawer } }, icon('plus'), 'Enroll host') : null);
 
   const kpis = el(
     'div',
     { class: 'kpis' },
-    kpi('Agents online', [String(online), el('small', null, ` / ${hosts.length}`)], hosts.length ? `${Math.round((online / hosts.length) * 100)}% of enrolled fleet` : 'no hosts enrolled'),
-    kpi('Degraded or offline', String(degraded.length), degraded.length ? degraded.map((h) => el('span', { class: 'mono' }, h.host_id)) : 'all agents heart-beating'),
-    kpi('Open incidents', String(open.length), sevCounts.length ? sevCounts.map(([s, n]) => el('span', null, `${n} ${s}`)) : 'quiet'),
+    kpi('Agents online', [String(online), el('small', null, ` / ${hosts.length}`)], degraded.length ? degraded.map((h) => el('span', { class: 'mono' }, `${h.host_id} ${h.liveness_status}`)) : hosts.length ? 'All agents heart-beating' : 'No hosts enrolled'),
+    kpi('Open incidents', String(open.length), open.length ? sevSummary(open) : 'Quiet'),
     mitigationKpi(),
+    kpi('Active watches', knownCounts.length ? String(sum(knownCounts, (x) => x)) : el('span', { class: 'muted' }, '—'), knownCounts.length ? `${hosts.length} host${hosts.length === 1 ? '' : 's'} · ${sum(hosts, (h) => h.stream_watch_count)} stream` : 'Watch counts unavailable'),
   );
-
-  const enroll = adminEnabled() ? el('button', { class: 'btn btn-sm', type: 'button', on: { click: openEnrollDrawer } }, icon('plus'), 'Enroll host') : null;
 
   const grid = hosts.length
     ? el('div', { class: 'host-grid' }, hosts.map((h) => hostCard(h, open.filter((i) => i.host_id === h.host_id))))
-    : emptyState('No hosts in scope', 'The capability token may not include any hosts, or none are enrolled yet.');
+    : el('div', { class: 'empty-slot' }, 'No hosts in scope. The capability token may not include any hosts, or none are enrolled yet.');
 
   return el(
     'div',
     null,
-    integrityBanner(state.status?.audit),
-    approvalBanner(),
+    integrityNotice(state.status?.audit),
+    approvalNotice(),
     kpis,
-    el('div', { class: 'section-title' }, el('h2', null, 'Edge fleet'), el('div', { class: 'row' }, el('span', { class: 'muted' }, `${hosts.length} enrolled`), enroll)),
+    automationCard(),
+    el('div', { class: 'section-title' }, el('h2', null, 'Edge fleet'), el('span', { class: 'muted' }, `${hosts.length} enrolled`)),
     grid,
   );
+}
+
+/** Honest status of the automated side: deterministic monitoring always, reasoner-d only if seen. */
+function automationCard() {
+  const a = state.automation;
+  const hosts = state.hosts;
+  const watches = sum(hosts, hostWatchCount);
+  const cell = (k, dotCls, v, s) => el('div', { class: 'auto-cell' }, el('div', { class: 'k' }, el('span', { class: ['dot', dotCls] }), k), el('div', { class: 'v' }, v), el('div', { class: 's' }, s));
+  const monitoring = cell(
+    'Deterministic monitoring',
+    hosts.some((h) => h.liveness_status === 'online') ? 'ok' : 'warn',
+    hosts.some((h) => h.liveness_status === 'online') ? 'Active' : 'No agent online',
+    `${watches} watch${watches === 1 ? '' : 'es'} on ${hosts.length} host${hosts.length === 1 ? '' : 's'}. control-d evaluates triggers and opens incidents without any model.`,
+  );
+  let reasoner;
+  let proposals;
+  if (!a?.available) {
+    reasoner = cell('reasoner-d worker', '', 'Not visible', 'Worker runs are read from the audit log over the admin interface. Start the console with --enable-admin to see them.');
+    proposals = cell('Model-proposed actions', '', '—', 'Needs the admin interface.');
+  } else if (!a.reasoner_runs) {
+    reasoner = cell(
+      'reasoner-d worker',
+      '',
+      'No automated runs seen yet',
+      `Deterministic monitoring is active, but no reasoner-d run appears in the last ${a.window_entries} audit entries. Incidents wait for an operator until reasoner-d is started.`,
+    );
+    proposals = cell('Model-proposed actions', '', '0', 'Operators can propose mitigations from any active investigation run.');
+  } else {
+    const last = a.last_run;
+    reasoner = cell(
+      'reasoner-d worker',
+      'ok',
+      ['Last run ', relTime(last.at)],
+      [`${a.reasoner_runs} run${a.reasoner_runs === 1 ? '' : 's'} in window · `, el('span', { class: 'mono' }, last.model_id ?? 'model'), ` via ${last.backend_id ?? 'backend'}`, last.incident_id ? [' on ', el('a', { class: 'mono', href: `#/investigations/${encodeURIComponent(last.incident_id)}` }, shortId(last.incident_id))] : null],
+    );
+    proposals = cell(
+      'Model-proposed actions',
+      a.action_proposals ? 'accent' : '',
+      `${a.action_proposals} proposed`,
+      a.action_proposals
+        ? `${a.watch_proposals} watch proposals and ${a.findings} findings from reasoner-d in the same window.`
+        : 'reasoner-d proposes mitigations only when action proposals are enabled in its run budgets (off by default).',
+    );
+  }
+  return card('Automation', null, el('div', { class: 'auto-grid' }, monitoring, reasoner, proposals), state.automation?.available ? el('span', { class: 'muted small' }, 'From the audit log') : null);
 }
 
 function hostCard(h, incidents) {
   const ageS = h.last_heartbeat_at ? (Date.now() - Date.parse(h.last_heartbeat_at)) / 1000 : Infinity;
   const freshCls = ageS < 45 ? '' : ageS < 600 ? 'warn' : 'bad';
-  const cardCls = h.liveness_status === 'online' ? '' : h.liveness_status === 'offline' ? 'is-bad' : 'is-warn';
   const health = h.health;
   const spoolFrac = health ? health.spool_bytes_used / Math.max(1, health.spool_bytes_cap) : 0;
-  const worst = incidents.map((i) => i.priority).sort((a, b) => SEV_ORDER.indexOf(a) - SEV_ORDER.indexOf(b))[0];
-
+  const watches = hostWatchCount(h);
   const freshMeter = meter(Math.max(0.04, 1 - ageS / 120), freshCls);
   freshMeter.dataset.hb = h.last_heartbeat_at ?? '';
+  const stat = (k, v) => el('div', { class: 'stat' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, v));
 
   return el(
     'article',
-    { class: ['card', 'host-card', cardCls] },
-    el(
-      'div',
-      { class: 'host-top' },
-      el('div', null, el('div', { class: 'host-id' }, h.host_id), h.placement ? el('div', { class: 'host-place' }, h.placement) : null),
-      livenessBadge(h.liveness_status),
-    ),
+    { class: ['card', 'host-card'] },
+    el('div', { class: 'host-top' }, el('div', { class: 'host-name' }, el('div', { class: 'host-id' }, h.host_id), h.placement ? el('div', { class: 'host-place' }, h.placement) : null), livenessBadge(h.liveness_status)),
     el(
       'div',
       { class: 'host-stats' },
-      el('div', { class: 'stat' }, el('div', { class: 'k' }, 'Agent'), el('div', { class: 'v' }, h.agent_version)),
-      el('div', { class: 'stat' }, el('div', { class: 'k' }, 'Bundle'), el('div', { class: 'v' }, `v${h.active_bundle_version}`)),
-      el('div', { class: 'stat' }, el('div', { class: 'k' }, health ? 'Agent RSS' : 'Watches'), el('div', { class: 'v' }, health ? bytes(health.rss_bytes) : '—')),
+      stat('Agent', h.agent_version),
+      stat('Bundle', `v${h.active_bundle_version}`),
+      stat('Watches', watches == null ? el('span', { class: 'muted' }, '—') : [String(watches), h.stream_watch_count ? el('span', { class: 'unit' }, ` · ${h.stream_watch_count} stream`) : null]),
     ),
-    el(
-      'div',
-      { class: 'fresh' },
-      el('div', { class: 'fresh-row' }, el('span', null, 'Heartbeat'), relTime(h.last_heartbeat_at)),
-      freshMeter,
-    ),
+    el('div', { class: 'fresh' }, el('div', { class: 'fresh-row' }, el('span', null, 'Heartbeat'), relTime(h.last_heartbeat_at)), freshMeter),
     health
       ? el(
           'div',
           { class: 'fresh' },
-          el('div', { class: 'fresh-row' }, el('span', null, 'Spool'), el('span', { class: 'num' }, `${bytes(health.spool_bytes_used)} / ${bytes(health.spool_bytes_cap)}`)),
+          el('div', { class: 'fresh-row' }, el('span', null, `Spool · RSS ${bytes(health.rss_bytes)}`), el('span', { class: 'num' }, `${bytes(health.spool_bytes_used)} / ${bytes(health.spool_bytes_cap)}`)),
           meter(spoolFrac, spoolFrac > 0.8 ? 'bad' : spoolFrac > 0.5 ? 'warn' : ''),
-          el(
-            'div',
-            { class: 'fresh-row' },
-            el('span', null, `${health.active_watches} active watches`),
-            el('span', { class: health.dropped_events_total ? 'num' : 'num muted' }, health.dropped_events_total ? `${health.dropped_events_total} dropped events` : '0 dropped'),
-          ),
+          health.dropped_events_total ? el('div', { class: 'fresh-row' }, el('span', { class: 'warn-text' }, `${health.dropped_events_total} dropped events`)) : null,
         )
       : null,
     el(
       'div',
       { class: 'host-foot' },
       incidents.length
-        ? incidents.map((i) => el('a', { class: 'chip', href: `#/investigations/${encodeURIComponent(i.incident_id)}`, title: i.summary }, el('span', { class: ['dot', i.priority === 'high' || i.priority === 'critical' ? 'bad' : 'warn'] }), el('span', { class: 'mono' }, i.incident_id)))
+        ? el(
+            'a',
+            { class: 'inc-summary', href: `#/investigations?host=${encodeURIComponent(h.host_id)}`, title: `Show the ${incidents.length} open incident${incidents.length === 1 ? '' : 's'} on ${h.host_id}` },
+            el('span', { class: ['dot', incidents.some((i) => i.priority === 'high' || i.priority === 'critical') ? 'bad' : 'warn'] }),
+            el('span', { class: 'num' }, `${incidents.length} open`),
+            el('span', { class: 'sevs' }, sevSummary(incidents)),
+          )
         : el('span', { class: 'muted' }, 'No open incidents'),
       el('span', { class: 'spacer' }),
-      worst ? sevBadge(worst) : null,
-      el('a', { class: 'btn btn-sm btn-ghost', href: `#/baselines/${encodeURIComponent(h.host_id)}` }, 'Telemetry'),
+      el('a', { class: 'btn btn-sm btn-ghost', href: `#/baselines/${encodeURIComponent(h.host_id)}` }, 'Telemetry', icon('arrow')),
     ),
   );
 }
@@ -472,46 +579,86 @@ function hostCard(h, incidents) {
 // View: Investigations
 // ---------------------------------------------------------------------------
 
-async function renderInvestigations(arg) {
-  const incidents = [...state.incidents].sort((a, b) => {
+function sortIncidents(list) {
+  return [...list].sort((a, b) => {
     if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
     const s = SEV_ORDER.indexOf(a.priority) - SEV_ORDER.indexOf(b.priority);
     return s || Date.parse(b.updated_at) - Date.parse(a.updated_at);
   });
-  if (!arg && incidents.length) {
-    history.replaceState(null, '', `#/investigations/${encodeURIComponent(incidents[0].incident_id)}`);
-    arg = incidents[0].incident_id;
+}
+
+function incidentMatches(i) {
+  const f = state.inv;
+  if (f.host && i.host_id !== f.host) return false;
+  const q = f.q.trim().toLowerCase();
+  return !q || [i.incident_id, i.summary, i.host_id, i.priority].some((v) => String(v).toLowerCase().includes(q));
+}
+
+function incidentItem(i, current) {
+  return el(
+    'a',
+    { class: ['inc-item', i.status !== 'open' && 'closed'], href: `#/investigations/${encodeURIComponent(i.incident_id)}`, title: i.incident_id, attrs: { 'aria-current': i.incident_id === current ? 'true' : null } },
+    el('div', { class: 'top' }, sevBadge(i.priority), el('span', { class: 'id' }, shortId(i.incident_id)), el('span', { class: 'spacer' }), i.status !== 'open' ? el('span', { class: 'badge ghost' }, cap(i.status)) : null),
+    el('div', { class: 'summary' }, i.summary),
+    el('div', { class: 'meta' }, el('span', { class: 'mono' }, i.host_id), el('span', null, 'updated ', relTime(i.updated_at))),
+  );
+}
+
+async function renderInvestigations(arg, _stale, route) {
+  const hostQ = route?.query?.get('host');
+  if (hostQ !== null && hostQ !== undefined) state.inv.host = hostQ;
+  const all = sortIncidents(state.incidents);
+  const visible = () => all.filter(incidentMatches);
+  const phone = window.matchMedia('(max-width: 760px)').matches;
+  if (!arg && visible().length && !phone) {
+    arg = visible()[0].incident_id;
+    history.replaceState(null, '', `#/investigations/${encodeURIComponent(arg)}`);
   }
+
+  const scroll = el('div', { class: 'inc-scroll' });
+  const drawList = () => {
+    const shown = visible();
+    replace(
+      scroll,
+      ['open', 'closed'].map((status) => {
+        const group = shown.filter((i) => (status === 'open' ? i.status === 'open' : i.status !== 'open'));
+        if (!group.length) return null;
+        return [el('div', { class: 'inc-group' }, `${status === 'open' ? 'Open' : 'Closed'} · ${group.length}`), group.map((i) => incidentItem(i, arg))];
+      }),
+      shown.length ? null : emptyState(all.length ? 'No matching incidents' : 'No incidents', all.length ? 'Clear the filter to see every incident.' : 'No active incidents in this capability scope.'),
+    );
+  };
+  const search = el('input', { type: 'search', placeholder: 'Filter incidents', value: state.inv.q, attrs: { 'aria-label': 'Filter incidents by summary, ID or host' } });
+  search.addEventListener('input', () => {
+    state.inv.q = search.value;
+    drawList();
+  });
+  const hosts = [...new Set(all.map((i) => i.host_id))].sort();
+  const hostSel = el('select', { attrs: { 'aria-label': 'Filter incidents by host' } }, el('option', { value: '' }, 'All hosts'), hosts.map((h) => el('option', { value: h, selected: state.inv.host === h }, h)));
+  hostSel.addEventListener('change', () => {
+    state.inv.host = hostSel.value;
+    drawList();
+  });
+  drawList();
   const list = el(
     'nav',
     { class: 'card inc-list', attrs: { 'aria-label': 'Incidents' } },
-    ['open', 'closed'].map((status) => {
-      const group = incidents.filter((i) => (status === 'open' ? i.status === 'open' : i.status !== 'open'));
-      if (!group.length) return null;
-      return [
-        el('div', { class: 'inc-group eyebrow' }, `${status} · ${group.length}`),
-        group.map((i) =>
-          el(
-            'a',
-            { class: ['inc-item', i.status !== 'open' && 'closed'], href: `#/investigations/${encodeURIComponent(i.incident_id)}`, attrs: { 'aria-current': i.incident_id === arg ? 'true' : null } },
-            el('div', { class: 'top' }, sevBadge(i.priority), el('span', { class: 'id' }, i.incident_id), el('span', { class: 'spacer' }), i.status !== 'open' ? el('span', { class: 'badge ghost' }, i.status) : null),
-            el('div', { class: 'summary' }, i.summary),
-            el('div', { class: 'meta' }, el('span', { class: 'mono' }, i.host_id), el('span', null, 'updated ', relTime(i.updated_at))),
-          ),
-        ),
-      ];
-    }),
-    incidents.length ? null : emptyState('No incidents', 'No active incidents in this capability scope.'),
+    el('div', { class: 'inc-tools' }, el('label', { class: 'search' }, icon('search'), search), hosts.length > 1 || state.inv.host ? hostSel : null),
+    scroll,
   );
 
-  const workspace = el('div', { class: 'workspace' }, arg ? loading(6) : emptyState('Select an incident', ''));
+  const workspace = el('div', { class: 'workspace' }, arg ? el('div', { class: 'card' }, loading(6)) : el('div', { class: 'empty-slot' }, 'Select an incident to open its workspace.'));
   if (arg) loadWorkspace(arg, workspace);
-  return el('div', { class: 'split' }, list, workspace);
+  return el('div', { class: ['split', arg && 'has-selection'] }, list, workspace);
 }
 
 async function loadWorkspace(incidentId, container) {
   try {
-    const ctx = await api(`/api/incidents/${encodeURIComponent(incidentId)}`);
+    const [ctx, changes] = await Promise.all([
+      api(`/api/incidents/${encodeURIComponent(incidentId)}`),
+      api(`/api/incidents/${encodeURIComponent(incidentId)}/changes`).catch((error) => ({ error })),
+    ]);
+    ctx.changes = changes;
     let caps = state.capabilities.get(ctx.incident.host_id);
     if (!caps) {
       try {
@@ -521,16 +668,19 @@ async function loadWorkspace(incidentId, container) {
         caps = [];
       }
     }
-    if (!container.isConnected && parseRoute().arg !== incidentId) return;
+    const r = parseRoute();
+    if (r.view !== 'investigations' || r.arg !== incidentId) return;
+    const known = state.incidents.find((i) => i.incident_id === incidentId);
+    if (known) Object.assign(known, ctx.incident);
     replace(container, workspaceView(ctx, caps));
   } catch (err) {
-    replace(container, errorBox(err));
+    if (parseRoute().arg === incidentId) replace(container, errorBox(err));
   }
 }
 
 function reloadWorkspace(incidentId) {
   const container = document.querySelector('.workspace');
-  if (container) loadWorkspace(incidentId, container);
+  if (container && parseRoute().view === 'investigations') loadWorkspace(incidentId, container);
 }
 
 function draftsFor(id) {
@@ -550,6 +700,7 @@ function draftsFor(id) {
         rationale: '',
       },
       finding: { kind: 'hypothesis', severity: 'medium', summary: '', uncertainty: '', escalation_requested: false },
+      action: null,
     });
   }
   return state.drafts.get(id);
@@ -559,6 +710,13 @@ function evidenceFor(id) {
   if (!state.evidence.has(id)) state.evidence.set(id, new Set());
   return state.evidence.get(id);
 }
+
+const WS_TABS = [
+  ['watches', 'Watches', 'Watches in scope'],
+  ['propose', 'Propose watch', 'Propose an ephemeral watch'],
+  ['finding', 'Finding', 'Record a hypothesis or verified finding'],
+  ['action', 'Mitigation', 'Propose mitigation'],
+];
 
 function workspaceView(ctx, caps) {
   const inc = ctx.incident;
@@ -570,7 +728,12 @@ function workspaceView(ctx, caps) {
   const hyps = findings.filter((f) => f.kind === 'hypothesis');
   const vers = findings.filter((f) => f.kind === 'verified_finding');
   const selected = evidenceFor(inc.incident_id);
-  const findingComposer = findingComposerView(inc, ctx.run, obsMap);
+  const evidenceListeners = new Set();
+  const onEvidence = () => {
+    for (const fn of evidenceListeners) fn();
+  };
+  // Built first: it indexes added/removed sockets that the fact tables below mark.
+  const changesSlot = changesCard(inc, ctx.changes);
 
   const incActions = state.actions.list.filter((a) => a.incident_id === inc.incident_id);
   const incPending = incActions.filter(isAwaiting).length;
@@ -585,82 +748,106 @@ function workspaceView(ctx, caps) {
     : null;
 
   const runControls = !isOpen
-    ? el('span', { class: 'badge' }, 'closed · runs ended')
+    ? el('span', { class: 'badge ghost' }, 'Closed · runs ended')
     : !canMutate()
-      ? el('span', { class: 'badge', title: 'Observer accounts are read-only' }, icon('eye'), 'read-only')
-    : ctx.run
-      ? el('span', { class: 'run-chip', title: `Run ${ctx.run.run_id}` }, el('span', { class: 'dot eph' }), 'Run ', el('span', { class: 'mono' }, ctx.run.run_id.slice(0, 8)), ' · ', relTime(ctx.run.expires_at, { until: true }))
-      : el('button', { class: 'btn btn-primary btn-sm', type: 'button', on: { click: () => startRun(inc.incident_id) } }, icon('flask'), 'Start investigation run');
+      ? el('span', { class: 'badge ghost', title: 'Observer accounts are read-only' }, icon('eye'), 'Read-only')
+      : ctx.run
+        ? el('span', { class: 'run-chip', title: `Run ${ctx.run.run_id}` }, el('span', { class: 'dot accent' }), 'Run ', el('span', { class: 'mono' }, ctx.run.run_id.slice(0, 8)), el('span', { class: 'muted' }, '·'), relTime(ctx.run.expires_at, { until: true }))
+        : el('button', { class: 'btn btn-primary btn-sm', type: 'button', on: { click: (e) => startRun(inc.incident_id, e.currentTarget) } }, icon('flask'), 'Start investigation run');
 
   const head = el(
-    'section',
-    { class: 'card ws-head' },
+    'header',
+    { class: 'ws-head' },
     el(
       'div',
       { class: 'row' },
       sevBadge(inc.priority),
-      el('span', { class: ['badge', isOpen ? 'bad' : ''] }, inc.status),
-      el('span', { class: 'mono dim' }, inc.incident_id),
+      el('span', { class: ['badge', isOpen ? '' : 'ghost'] }, cap(inc.status)),
+      idChip(inc.incident_id, { title: 'Incident' }),
       el('span', { class: 'muted' }, 'on'),
       el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(inc.host_id)}` }, inc.host_id),
       el('span', { class: 'spacer' }),
       mitChip,
-      runControls,
-      isOpen && adminEnabled() ? el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => openCloseDrawer(inc) } }, 'Close incident') : null,
     ),
     el('h2', { class: 'ws-title' }, inc.summary),
     el(
       'div',
-      { class: 'row' },
-      el('span', { class: 'muted' }, 'Opened ', el('span', { class: 'num dim' }, fmtTime(inc.created_at))),
-      el('span', { class: 'muted' }, '· updated ', relTime(inc.updated_at)),
+      { class: 'ws-meta' },
+      el('span', null, 'Opened ', el('span', { class: 'num' }, fmtTime(inc.created_at))),
+      el('span', null, 'Updated ', relTime(inc.updated_at)),
       el('span', { class: 'spacer' }),
-      el('div', { class: 'legend' }, el('span', null, el('i', { class: 'l-fact' }), 'Observed fact'), el('span', null, el('i', { class: 'l-hyp' }), 'Model hypothesis'), el('span', null, el('i', { class: 'l-ver' }), 'Verified finding')),
+      el('div', { class: 'ws-actions' }, runControls, isOpen && adminEnabled() ? el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: () => openCloseDrawer(inc) } }, 'Close incident') : null),
     ),
   );
+  const backLink = el('a', { class: 'btn btn-sm btn-ghost back-link', href: '#/investigations?all=1' }, icon('chevron'), 'All incidents');
 
   const lane = (title, cls, items, emptyText) =>
     el(
       'div',
       null,
-      el('div', { class: 'lane-head' }, el('span', { class: ['eyebrow'] }, title), el('span', { class: 'count' }, String(items.length))),
-      items.length ? items.map((f) => findingCard(f, cls, obsMap)) : el('div', { class: 'card' }, emptyState('None recorded', emptyText)),
+      el('div', { class: 'lane-head' }, title, el('span', { class: 'count' }, String(items.length))),
+      items.length ? items.map((f) => findingCard(f, cls, obsMap)) : el('div', { class: 'empty-slot' }, emptyText),
     );
 
   const factList = el(
     'div',
     { class: 'fact-list' },
-    obs.length ? obs.map((o) => factRow(o, watchMap, obs, selected, findingComposer.refreshEvidence)) : emptyState('No observations in window', 'No observations since the incident opened.'),
+    obs.length ? obs.map((o) => factRow(o, watchMap, obs, selected, onEvidence, inc.incident_id)) : emptyState('No observations in window', 'No observations since the incident opened.'),
   );
+
 
   const main = el(
     'div',
-    { class: 'stack' },
+    { class: 'ws-main' },
+    changesSlot,
     el('div', { class: 'assess' }, lane('Model hypotheses', 'hyp', hyps, 'Unverified model or operator assertions appear here.'), lane('Verified findings', 'ver', vers, 'Evidence-bound conclusions appear here.')),
     card(
       'Observed facts',
-      'Immutable observation slices from control-d. Tick facts to cite them as evidence.',
+      `${obs.length} immutable observation slice${obs.length === 1 ? '' : 's'} from control-d. Tick facts to cite them as evidence.`,
       el('div', { class: 'card-body flush' }, factList),
-      el('span', { class: 'badge eph' }, `${obs.length} slices`),
+      el('div', { class: 'legend' }, el('span', null, el('i', { class: 'l-fact' }), 'Fact'), el('span', null, el('i', { class: 'l-hyp' }), 'Hypothesis'), el('span', null, el('i', { class: 'l-ver' }), 'Verified')),
     ),
   );
 
-  const side = el(
-    'div',
-    { class: 'ws-side' },
-    watchesCard(ctx.active_watches, ctx.watch_runtime ?? {}, inc),
+  // Side panel: underline tabs, panels built lazily and kept while the workspace lives.
+  const tabState = state.wsTab.get(inc.incident_id) ?? 'watches';
+  const panels = new Map();
+  const panelSlot = el('div');
+  const evidenceCtx = { selected, obs, obsMap, listeners: evidenceListeners };
+  const buildPanel = (id) => {
+    if (id === 'watches') return watchesPanel(ctx.active_watches, ctx.watch_runtime ?? {}, inc);
+    if (!isOpen) return tabPanel('Incident closed. Its ephemeral watches were retired; runs, proposals and findings are no longer accepted.', null);
+    if (!canMutate()) return tabPanel('Observer accounts can review evidence, findings and mitigations, but cannot start runs, propose watches or actions, or record findings.', null);
+    if (id === 'propose') return proposalComposer(inc, ctx.run, caps);
+    if (id === 'finding') return findingComposerView(inc, ctx.run, obsMap, evidenceCtx);
+    return actionComposer(inc, ctx.run, evidenceCtx);
+  };
+  const tabButtons = WS_TABS.map(([id, label, full]) =>
     el(
-      'div',
-      { class: 'ws-compose' },
-      !isOpen
-        ? card('Ephemeral watch proposals', null, el('div', { class: 'card-body muted' }, 'Incident closed. Its ephemeral watches were retired; no new proposals are accepted.'))
-        : !canMutate()
-          ? card('Read-only access', null, el('div', { class: 'card-body muted' }, 'Observer accounts can review evidence, findings and mitigations, but cannot start runs, propose watches or record findings.'))
-          : [proposalComposer(inc, ctx.run, caps), findingComposer.node],
+      'button',
+      { type: 'button', id: `wstab-${id}`, title: full, attrs: { role: 'tab', 'aria-selected': String(tabState === id), 'aria-controls': 'ws-tabpanel', 'aria-label': full }, on: { click: () => selectTab(id) } },
+      label,
+      id === 'watches' ? el('span', { class: 'tab-count' }, String(ctx.active_watches.length)) : null,
     ),
   );
+  function selectTab(id) {
+    state.wsTab.set(inc.incident_id, id);
+    for (const b of tabButtons) b.setAttribute('aria-selected', String(b.id === `wstab-${id}`));
+    if (!panels.has(id)) panels.set(id, buildPanel(id));
+    replace(panelSlot, panels.get(id));
+    panelSlot.setAttribute('aria-labelledby', `wstab-${id}`);
+  }
+  panelSlot.id = 'ws-tabpanel';
+  panelSlot.setAttribute('role', 'tabpanel');
+  selectTab(tabState);
 
-  return el('div', null, head, el('div', { class: 'ws-grid' }, main, side));
+  const side = el('aside', { class: 'ws-side' }, el('section', { class: 'card ws-panel' }, el('div', { class: 'tabs', attrs: { role: 'tablist', 'aria-label': 'Investigation tools' } }, tabButtons), panelSlot));
+
+  return el('div', null, backLink, head, el('div', { class: 'ws-grid' }, main, side));
+}
+
+function tabPanel(sub, body, flush = false) {
+  return el('div', { class: ['tab-panel', flush && 'flush'] }, sub ? el('p', { class: 'panel-sub' }, sub) : null, body);
 }
 
 function findingCard(f, cls, obsMap) {
@@ -671,7 +858,7 @@ function findingCard(f, cls, obsMap) {
     el(
       'div',
       { class: 'row' },
-      el('span', { class: 'kind' }, cls === 'hyp' ? 'Model hypothesis · unverified' : 'Verified finding · evidence-bound'),
+      el('span', { class: 'kind' }, el('span', { class: ['dot', cls === 'hyp' ? 'warn' : 'ok'] }), cls === 'hyp' ? 'Hypothesis · unverified' : 'Verified finding · evidence-bound'),
       el('span', { class: 'spacer' }),
       sevBadge(f.severity),
       f.escalation_requested ? el('span', { class: 'badge bad' }, 'escalation') : null,
@@ -744,10 +931,10 @@ function prevOf(o, list) {
     .sort((a, b) => b.observation_id - a.observation_id)[0];
 }
 
-function factRow(o, watchMap, list, selected, onSelect) {
+function factRow(o, watchMap, list, selected, onSelect, incidentId = null) {
   const key = `fact:${o.observation_id}`;
   const detail = el('div', { class: 'fact-detail', hidden: !state.expanded.has(key) });
-  if (state.expanded.has(key)) append(detail, payloadView(o, prevOf(o, list)));
+  if (state.expanded.has(key)) append(detail, payloadView(o, prevOf(o, list), incidentId));
   const toggle = el('button', { class: 'toggle', type: 'button', attrs: { 'aria-expanded': state.expanded.has(key) ? 'true' : 'false', 'aria-label': `Toggle observation ${o.observation_id} detail` } }, icon('chevron'));
   toggle.addEventListener('click', () => {
     const open = toggle.getAttribute('aria-expanded') !== 'true';
@@ -755,7 +942,7 @@ function factRow(o, watchMap, list, selected, onSelect) {
     detail.hidden = !open;
     if (open) {
       state.expanded.add(key);
-      if (!detail.firstChild) append(detail, payloadView(o, prevOf(o, list)));
+      if (!detail.firstChild) append(detail, payloadView(o, prevOf(o, list), incidentId));
     } else state.expanded.delete(key);
   });
   const box = el('input', { type: 'checkbox', checked: selected.has(o.observation_id), title: 'Cite as evidence', attrs: { 'aria-label': `Cite observation ${o.observation_id} as evidence` } });
@@ -790,13 +977,13 @@ function factRow(o, watchMap, list, selected, onSelect) {
 
 const JPRIO = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug'];
 
-function payloadView(o, prev) {
+function payloadView(o, prev, incidentId = null) {
   const p = o.payload ?? {};
   const parts = [];
   if (p.kind === 'snapshot' || p.kind === 'delta') {
     const d = p.data ?? {};
     if (p.kind === 'delta') parts.push(el('div', { class: 'row' }, el('span', { class: 'muted' }, 'delta against'), hashChip(p.base_hash)));
-    if (Array.isArray(d.sockets)) parts.push(socketsTable(d, prev?.payload?.data?.sockets));
+    if (Array.isArray(d.sockets)) parts.push(socketsTable(d, prev?.payload?.data?.sockets, o.observation_id, incidentId));
     else if (d.unit && d.active_state) parts.push(unitView(d));
     else if (Array.isArray(d.files)) parts.push(filesTable(d.files));
     else parts.push(jsonBlock(d));
@@ -811,61 +998,90 @@ function payloadView(o, prev) {
     el(
       'dl',
       { class: 'kv' },
-      el('dt', null, 'observed_at'),
-      el('dd', { class: 'num' }, o.observed_at),
-      el('dt', null, 'spec_version'),
+      el('dt', null, 'Observed'),
+      el('dd', { class: 'mono' }, o.observed_at),
+      el('dt', null, 'Spec version'),
       el('dd', { class: 'num' }, String(o.spec_version)),
-      el('dt', null, 'state_hash'),
+      el('dt', null, 'State hash'),
       el('dd', null, hashChip(o.state_hash, { full: true })),
     ),
   );
   return el('div', { class: 'stack' }, parts);
 }
 
-function socketsTable(d, prevSockets) {
+const sockAddr = (s) => `${String(s.local_addr).includes(':') ? `[${s.local_addr}]` : s.local_addr}:${s.local_port}`;
+
+function socketsTable(d, prevSockets, filterKey = null, incidentId = null) {
+  // Compare with the previous sample in the window, or else with the reference
+  // this incident's "What changed" panel used (accepted baseline / state before it opened).
+  const markers = !prevSockets && incidentId && filterKey != null ? state.changeIndex.get(`${incidentId}:${filterKey}`) : null;
   const prevKeys = prevSockets ? new Set(prevSockets.map((s) => s.socket_key)) : null;
-  const rows = [...d.sockets].sort((a, b) => a.local_port - b.local_port);
+  const curKeys = new Set(d.sockets.map((s) => s.socket_key));
+  const byPort = (a, b) => a.local_port - b.local_port || String(a.protocol).localeCompare(String(b.protocol));
+  const isAdded = (s) => (prevKeys ? !prevKeys.has(s.socket_key) : Boolean(markers?.addedKeys.has(s.socket_key)));
+  const added = d.sockets.filter(isAdded).sort(byPort);
+  const removed = (prevSockets ? prevSockets.filter((s) => !curKeys.has(s.socket_key)) : markers?.removed ?? []).sort(byPort);
+  const rest = d.sockets.filter((s) => !isAdded(s)).sort(byPort);
+  const rows = [...added.map((s) => [s, 'new']), ...removed.map((s) => [s, 'gone']), ...rest.map((s) => [s, null])];
+
+  const tbody = el('tbody');
+  const countNode = el('span', { class: 'count' });
+  const text = (s) => [s.protocol, sockAddr(s), s.pid, s.comm, s.systemd_unit, s.uid].filter((v) => v != null).join(' ').toLowerCase();
+  const draw = (q = '') => {
+    const needle = q.trim().toLowerCase();
+    const shown = needle ? rows.filter(([s]) => text(s).includes(needle)) : rows;
+    replace(
+      tbody,
+      shown.map(([s, mark]) =>
+        el(
+          'tr',
+          { class: mark === 'new' ? 'is-new' : mark === 'gone' ? 'is-gone' : null },
+          el('td', null, s.protocol),
+          el('td', null, sockAddr(s)),
+          el('td', null, s.pid ?? '—'),
+          el('td', null, s.comm ?? '—'),
+          el('td', null, s.systemd_unit ?? '—'),
+          el('td', null, String(s.uid)),
+          el('td', null, mark === 'new' ? el('span', { class: 'badge ok' }, 'Added') : mark === 'gone' ? el('span', { class: 'badge bad' }, 'Removed') : ''),
+        ),
+      ),
+      shown.length ? null : el('tr', null, el('td', { attrs: { colspan: '7' }, class: 'muted' }, 'No sockets match this filter.')),
+    );
+    const delta = prevKeys || markers ? ` · ${added.length} added · ${removed.length} removed${markers ? ' vs reference' : ''}` : '';
+    countNode.textContent = needle ? `${shown.length} of ${d.sockets.length} sockets${delta}` : `${d.sockets.length} sockets${delta}`;
+  };
+
+  let tools = el('div', { class: 'ptools' }, countNode);
+  if (rows.length > 12) {
+    const input = el('input', { type: 'search', placeholder: 'Filter port, process, unit…', value: filterKey ? state.tableFilters.get(filterKey) ?? '' : '', attrs: { 'aria-label': 'Filter sockets' } });
+    input.addEventListener('input', () => {
+      if (filterKey) state.tableFilters.set(filterKey, input.value);
+      draw(input.value);
+    });
+    tools = el('div', { class: 'ptools' }, el('label', { class: 'search' }, icon('search'), input), countNode);
+    draw(input.value);
+  } else {
+    draw();
+  }
   return el(
     'div',
-    { class: 'pwrap' },
-    el(
-      'table',
-      { class: 'ptable' },
-      el('thead', null, el('tr', null, ['proto', 'local', 'pid', 'comm', 'unit', 'uid', 'inode', ''].map((h) => el('th', null, h)))),
-      el(
-        'tbody',
-        null,
-        rows.map((s) => {
-          const isNew = prevKeys && !prevKeys.has(s.socket_key);
-          return el(
-            'tr',
-            { class: isNew ? 'is-new' : null },
-            el('td', null, s.protocol),
-            el('td', null, `${s.local_addr.includes(':') ? `[${s.local_addr}]` : s.local_addr}:${s.local_port}`),
-            el('td', null, s.pid ?? '—'),
-            el('td', null, s.comm ?? '—'),
-            el('td', null, s.systemd_unit ?? '—'),
-            el('td', null, String(s.uid)),
-            el('td', null, String(s.inode)),
-            el('td', null, isNew ? el('span', { class: 'badge bad' }, 'new') : ''),
-          );
-        }),
-      ),
-    ),
+    null,
+    tools,
+    el('div', { class: 'pwrap' }, el('table', { class: 'ptable' }, el('thead', null, el('tr', null, ['Proto', 'Local', 'PID', 'Process', 'Unit', 'UID', ''].map((h) => el('th', null, h)))), tbody)),
   );
 }
 
 function unitView(d) {
   const kv = [
-    ['unit', d.unit],
-    ['load / active / sub', `${d.load_state} / ${d.active_state} / ${d.sub_state}`],
-    ['unit_file_state', d.unit_file_state ?? '—'],
-    ['main_pid', d.main_pid ?? '—'],
+    ['Unit', d.unit],
+    ['Load / active / sub', `${d.load_state} / ${d.active_state} / ${d.sub_state}`],
+    ['Unit file state', d.unit_file_state ?? '—'],
+    ['Main PID', d.main_pid ?? '—'],
   ];
   return el(
     'div',
     { class: 'stack' },
-    el('dl', { class: 'kv' }, kv.map(([k, v]) => [el('dt', null, k), el('dd', { class: 'mono' }, String(v))]), el('dt', null, 'exec_start_hash'), el('dd', null, hashChip(d.exec_start_hash))),
+    el('dl', { class: 'kv' }, kv.map(([k, v]) => [el('dt', null, k), el('dd', { class: 'mono' }, String(v))]), el('dt', null, 'ExecStart hash'), el('dd', null, hashChip(d.exec_start_hash))),
     d.unit_files?.length ? filesTable(d.unit_files) : null,
   );
 }
@@ -877,7 +1093,7 @@ function filesTable(files) {
     el(
       'table',
       { class: 'ptable' },
-      el('thead', null, el('tr', null, ['path', 'status', 'mode', 'uid:gid', 'size', 'sha256', 'mtime'].map((h) => el('th', null, h)))),
+      el('thead', null, el('tr', null, ['Path', 'Status', 'Mode', 'UID:GID', 'Size', 'SHA-256', 'Modified'].map((h) => el('th', null, h)))),
       el(
         'tbody',
         null,
@@ -904,7 +1120,7 @@ function journalView(p) {
     'div',
     null,
     el('p', { class: 'untrusted-note' }, icon('alert'), 'Journal text is untrusted, attacker-influenced data. It is shown verbatim and cannot execute or instruct.'),
-    p.gap_detected ? el('div', { class: 'err-box' }, 'Cursor gap detected — events may be missing between batches.') : null,
+    p.gap_detected ? el('div', { class: 'err-box' }, 'Cursor gap detected: events may be missing between batches.') : null,
     el(
       'div',
       { class: 'journal' },
@@ -952,13 +1168,13 @@ function watchTarget(w) {
   }
 }
 
-function watchesCard(watches, runtime, inc) {
+function watchesPanel(watches, runtime, inc) {
   const sorted = [...watches].sort((a, b) => (a.class === b.class ? a.id.localeCompare(b.id) : a.class === 'ephemeral' ? -1 : 1));
   const eph = sorted.filter((w) => w.class === 'ephemeral');
-  return card(
-    'Watches in scope',
+  return tabPanel(
     `${eph.length} ephemeral · ${sorted.length - eph.length} baseline on ${inc.host_id}`,
-    el('div', { class: 'card-body flush' }, sorted.length ? sorted.map((w) => watchRow(w, runtime[w.id])) : emptyState('No active watches', '')),
+    el('div', null, sorted.length ? sorted.map((w) => watchRow(w, runtime[w.id])) : emptyState('No active watches', '')),
+    true,
   );
 }
 
@@ -966,35 +1182,31 @@ function watchRow(w, rt) {
   const expired = w.lifecycle.expires_at && Date.parse(w.lifecycle.expires_at) <= Date.now();
   const retired = rt && rt.active === false && !expired;
   const runs = rt?.completed_runs;
+  const stream = w.collector.type === 'journal.unit_events';
   return el(
     'div',
     { class: ['watch', (expired || retired) && 'is-expired'] },
-    el('div', { class: 'row' }, classBadge(w.class), expired ? el('span', { class: 'badge' }, 'expired') : null, el('span', { class: 'spacer' }), el('span', { class: 'mono muted' }, `v${w.version}`)),
+    el('div', { class: 'row' }, classBadge(w.class), stream ? el('span', { class: 'badge stream' }, icon('stream'), 'Stream') : null, expired ? el('span', { class: 'badge' }, 'Expired') : null, el('span', { class: 'spacer' }), el('span', { class: 'mono muted' }, `v${w.version}`)),
     el('div', { class: 'wid' }, w.id),
     el('div', { class: 'target' }, el('span', { class: 'muted' }, `${w.collector.type} · `), watchTarget(w)),
     el(
       'div',
       { class: 'bounds' },
-      el('span', { class: 'badge ghost' }, `every ${w.schedule.interval_seconds}s`),
+      el('span', { class: 'badge ghost' }, `Every ${w.schedule.interval_seconds}s`),
       el('span', { class: 'badge ghost' }, w.trigger.type.replace(/_/g, ' ')),
       w.trigger.compare_against ? el('span', { class: 'badge ghost' }, `vs ${w.trigger.compare_against.replace(/_/g, ' ')}`) : null,
-      w.class === 'ephemeral' && w.lifecycle.expires_at ? el('span', { class: ['badge', expired ? '' : 'eph'] }, icon('clock'), relTime(w.lifecycle.expires_at, { until: true })) : null,
+      w.class === 'ephemeral' && w.lifecycle.expires_at ? el('span', { class: 'badge ghost' }, icon('clock'), relTime(w.lifecycle.expires_at, { until: true })) : null,
     ),
     w.class === 'ephemeral' && w.lifecycle.max_runs
-      ? el(
-          'div',
-          { class: 'mini' },
-          el('span', null, 'runs'),
-          meter(runs != null ? runs / w.lifecycle.max_runs : 0, 'eph'),
-          el('span', { class: 'num' }, runs != null ? `${runs} / ${w.lifecycle.max_runs}` : `max ${w.lifecycle.max_runs}`),
-        )
+      ? el('div', { class: 'mini' }, el('span', null, 'Runs'), meter(runs != null ? runs / w.lifecycle.max_runs : 0, 'eph'), el('span', { class: 'num' }, runs != null ? `${runs} / ${w.lifecycle.max_runs}` : `max ${w.lifecycle.max_runs}`))
       : null,
   );
 }
 
 // ----- run lifecycle -----
 
-async function startRun(incidentId) {
+async function startRun(incidentId, btn = null) {
+  if (btn) btn.disabled = true;
   try {
     const run = await api(`/api/incidents/${encodeURIComponent(incidentId)}/runs`, {
       method: 'POST',
@@ -1002,18 +1214,29 @@ async function startRun(incidentId) {
     });
     toast(`Investigation run ${run.run_id.slice(0, 8)} started`, 'ok');
     reloadWorkspace(incidentId);
+    return null;
   } catch (err) {
     toast(`${err.code}: ${err.message}`, 'bad');
+    if (btn) btn.disabled = false;
+    return err;
   }
 }
 
 function runLock(inc, label) {
+  const errSlot = el('div');
+  const btn = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, icon('flask'), 'Start investigation run');
+  btn.addEventListener('click', async () => {
+    replace(errSlot);
+    const err = await startRun(inc.incident_id, btn);
+    if (err) replace(errSlot, errorBox(err));
+  });
   return el(
     'div',
     { class: 'lock-overlay' },
     icon('lock'),
-    el('p', null, `${label} requires an active investigation run. Runs are scoped to this incident and host, and expire automatically.`),
-    el('button', { class: 'btn btn-primary btn-sm', type: 'button', on: { click: () => startRun(inc.incident_id) } }, icon('flask'), 'Start investigation run'),
+    el('p', null, `${label} needs an active investigation run. Each run gets its own token scoped to this incident and host, and expires automatically.`),
+    btn,
+    errSlot,
   );
 }
 
@@ -1082,7 +1305,7 @@ function field(label, control, hint = null) {
 function proposalComposer(inc, run, caps) {
   const d = draftsFor(inc.incident_id).proposal;
   if (!d.trigger) d.trigger = triggerDefaults(d.collector_type);
-  const body = el('div', { class: 'card-body' });
+  const body = el('div', { class: 'stack' });
   const result = el('div', { class: 'stack' });
   const capFor = (t) => caps.find((c) => c.collector_type === t);
 
@@ -1187,10 +1410,10 @@ function proposalComposer(inc, run, caps) {
         ? el(
             'div',
             { class: ['decision', last.decision.allowed ? 'ok' : 'bad'], attrs: { role: 'status' } },
-            el('div', { class: 'row' }, el('span', { class: 'verdict' }, last.decision.allowed ? 'Accepted by policy gate' : 'Denied by policy gate'), el('span', { class: 'spacer' }), el('span', { class: 'mono muted' }, `policy v${last.decision.policy_version}`)),
+            el('div', { class: 'row' }, el('span', { class: 'verdict' }, last.decision.allowed ? 'Accepted by the policy gate' : 'Denied by the policy gate'), el('span', { class: 'spacer' }), el('span', { class: 'mono muted' }, `policy v${last.decision.policy_version}`)),
             el('div', { class: 'rule' }, last.decision.rule_id),
             el('div', { class: 'reason' }, last.decision.reason),
-            last.watch_id ? el('div', { class: 'row' }, el('span', { class: 'badge eph' }, 'watch'), el('span', { class: 'mono' }, last.watch_id), last.bundle_version != null ? el('span', { class: 'badge ghost' }, `bundle v${last.bundle_version}`) : null) : null,
+            last.watch_id ? el('div', { class: 'row' }, el('span', { class: 'mono' }, last.watch_id), last.bundle_version != null ? el('span', { class: 'badge ghost' }, `Bundle v${last.bundle_version}`) : null) : null,
             last.spec ? el('details', { class: 'preview' }, el('summary', null, 'Submitted WatchSpec (exact)'), jsonBlock(last.spec)) : null,
           )
         : null,
@@ -1198,7 +1421,7 @@ function proposalComposer(inc, run, caps) {
         ? el(
             'div',
             { class: 'history' },
-            el('span', { class: 'eyebrow' }, 'This session'),
+            el('span', { class: 'eyebrow' }, 'Earlier in this session'),
             log.slice(1, 6).map((x) => el('div', { class: 'h-item' }, el('span', { class: ['dot', x.decision.allowed ? 'ok' : 'bad'] }), el('span', { class: 'mono' }, x.decision.rule_id), el('span', { class: 'num muted' }, fmtTime(x.at)))),
           )
         : null,
@@ -1230,8 +1453,8 @@ function proposalComposer(inc, run, caps) {
     const classSeg = el(
       'div',
       { class: 'seg', attrs: { role: 'group', 'aria-label': 'Watch class' } },
-      el('button', { type: 'button', class: 'emerald', attrs: { 'aria-pressed': String(d.class === 'ephemeral') }, on: { click: () => { d.class = 'ephemeral'; draw(); } } }, 'Ephemeral'),
-      el('button', { type: 'button', class: 'crimson', attrs: { 'aria-pressed': String(d.class === 'baseline') }, on: { click: () => { d.class = 'baseline'; draw(); } } }, 'Baseline (policy test)'),
+      el('button', { type: 'button', attrs: { 'aria-pressed': String(d.class === 'ephemeral') }, on: { click: () => { d.class = 'ephemeral'; draw(); } } }, 'Ephemeral'),
+      el('button', { type: 'button', attrs: { 'aria-pressed': String(d.class === 'baseline') }, on: { click: () => { d.class = 'baseline'; draw(); } } }, 'Baseline (policy test)'),
     );
     const capButtons = el(
       'div',
@@ -1266,14 +1489,14 @@ function proposalComposer(inc, run, caps) {
       'form',
       { class: 'form', attrs: { novalidate: true } },
       field('Watch class', classSeg, d.class === 'baseline' ? el('span', { class: 'hint bad' }, 'Investigator identities cannot create baseline watches — expect baseline.protected.') : el('span', { class: 'hint' }, 'Bounded by TTL and max runs; retired on incident closure.')),
-      el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Collector capability', el('span', { class: 'muted' }, `${inc.host_id} catalog`)), capButtons),
+      el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Collector', el('span', { class: 'muted' }, `${inc.host_id} catalog`)), capButtons),
       paramsFields(),
       triggerFields(),
       el('div', { class: 'grid-2' }, field('Interval (s)', iv), field('Timeout (s)', to), field('TTL (min)', ttl), field('Max runs', mr)),
       hintNode,
       field('Rationale', textArea(d, 'rationale', { placeholder: 'Why this temporary watch is needed for the investigation…', rows: 2 })),
       el('details', { class: 'preview' }, el('summary', null, 'Request preview'), jsonBlock({ ...requestBody(), run_id: run?.run_id ? `${run.run_id.slice(0, 8)}…` : null })),
-      el('div', { class: 'form-actions' }, submitBtn),
+      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
     );
     form.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -1291,15 +1514,23 @@ function proposalComposer(inc, run, caps) {
   } else {
     draw();
   }
-  return card('Propose ephemeral watch', 'Constrained to the host capability catalog; control-d returns the deterministic PolicyDecision.', body);
+  return tabPanel('Constrained to the host capability catalog. control-d returns the deterministic PolicyDecision.', body);
 }
 
 // ----- finding composer -----
 
-function findingComposerView(inc, run, obsMap) {
+function evidenceToggle(id, on, ev) {
+  if (on) ev.selected.add(id);
+  else ev.selected.delete(id);
+  const box = document.querySelector(`#fact-${id} input[type="checkbox"]`);
+  if (box) box.checked = on;
+  for (const fn of ev.listeners) fn();
+}
+
+function findingComposerView(inc, run, obsMap, ev) {
   const d = draftsFor(inc.incident_id).finding;
-  const selected = evidenceFor(inc.incident_id);
-  const body = el('div', { class: 'card-body' });
+  const selected = ev.selected;
+  const body = el('div', { class: 'stack' });
   const evNode = el('div', { class: 'ev-row' });
   const evHint = el('span', { class: 'hint' });
 
@@ -1312,7 +1543,7 @@ function findingComposerView(inc, run, obsMap) {
             const o = obsMap.get(id);
             return el(
               'button',
-              { class: 'ev-badge', type: 'button', title: 'Remove from evidence', on: { click: () => { selected.delete(id); const box = document.querySelector(`#fact-${id} input[type="checkbox"]`); if (box) box.checked = false; refreshEvidence(); } } },
+              { class: 'ev-badge', type: 'button', title: 'Remove from evidence', on: { click: () => evidenceToggle(id, false, ev) } },
               `obs ${id}`,
               o ? el('span', { class: 'h' }, o.state_hash.slice(0, 8)) : null,
               icon('close'),
@@ -1329,10 +1560,10 @@ function findingComposerView(inc, run, obsMap) {
     const seg = el(
       'div',
       { class: 'seg', attrs: { role: 'group', 'aria-label': 'Finding kind' } },
-      el('button', { type: 'button', class: 'amber', attrs: { 'aria-pressed': String(d.kind === 'hypothesis') }, on: { click: () => { d.kind = 'hypothesis'; draw(); } } }, 'Hypothesis'),
-      el('button', { type: 'button', class: 'emerald', attrs: { 'aria-pressed': String(d.kind === 'verified_finding') }, on: { click: () => { d.kind = 'verified_finding'; draw(); } } }, 'Verified finding'),
+      el('button', { type: 'button', attrs: { 'aria-pressed': String(d.kind === 'hypothesis') }, on: { click: () => { d.kind = 'hypothesis'; draw(); } } }, 'Hypothesis'),
+      el('button', { type: 'button', attrs: { 'aria-pressed': String(d.kind === 'verified_finding') }, on: { click: () => { d.kind = 'verified_finding'; draw(); } } }, 'Verified finding'),
     );
-    const btn = el('button', { class: d.kind === 'verified_finding' ? 'btn btn-ok' : 'btn btn-primary', type: 'submit' }, d.kind === 'verified_finding' ? 'Record verified finding' : 'Record hypothesis');
+    const btn = el('button', { class: 'btn btn-primary', type: 'submit' }, d.kind === 'verified_finding' ? 'Record verified finding' : 'Record hypothesis');
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1355,6 +1586,7 @@ function findingComposerView(inc, run, obsMap) {
         d.summary = '';
         d.uncertainty = '';
         selected.clear();
+        state.wsTab.set(inc.incident_id, 'finding');
         reloadWorkspace(inc.incident_id);
       } catch (err) {
         toast(`${err.code}: ${err.message}`, 'bad');
@@ -1366,11 +1598,355 @@ function findingComposerView(inc, run, obsMap) {
   }
 
   if (!run) append(body, runLock(inc, 'Recording a hypothesis or finding'));
-  else draw();
-  return {
-    node: card('Record hypothesis / finding', 'Hypotheses are unverified assertions; verified findings must bind evidence.', body),
-    refreshEvidence: () => (run ? refreshEvidence() : undefined),
+  else {
+    draw();
+    ev.listeners.add(() => refreshEvidence());
+  }
+  return tabPanel('Hypotheses are unverified assertions; verified findings must bind evidence.', body);
+}
+
+// ----- mitigation composer (InvestigationRequest::ProposeAction) -----
+
+const VERB_CHOICES = [
+  ['nft_block_ip', 'Block IP'],
+  ['systemd_stop_unit', 'Stop unit'],
+  ['host_isolate', 'Isolate host'],
+];
+
+/** A unit worth suggesting: the newest non-protected unit seen in this incident's evidence. */
+function suggestedUnit(obs) {
+  const protectedUnits = /^(sshd?|systemd-(journald|networkd|resolved)|NetworkManager|dbus|agent-d|control-d|action-exec-d)\.service$/;
+  for (const o of obs) {
+    const d = o.payload?.data;
+    const units = [d?.unit, ...(d?.sockets ?? []).map((s) => s.systemd_unit)].filter(Boolean);
+    const u = units.find((x) => !protectedUnits.test(x));
+    if (u) return u;
+  }
+  return '';
+}
+
+function actionDefaults(d, host) {
+  const minutes = (m) => `${m} min`;
+  switch (d.verb) {
+    case 'nft_block_ip': {
+      const ip = d.ip.trim() || 'the address';
+      const dir = d.direction === 'inbound' ? `inbound traffic from ${ip}` : d.direction === 'outbound' ? `outbound traffic to ${ip}` : `all traffic to and from ${ip}`;
+      return {
+        expected_effect: `Drop ${dir} on ${host} for ${minutes(d.ip_ttl_min)}.`,
+        blast_radius: `One address on ${host}; no services restart. The gate refuses loopback, link-local and private management ranges.`,
+        rollback_plan: `The rule expires after ${minutes(d.ip_ttl_min)}; action-exec-d deletes it and verifies removal.`,
+      };
+    }
+    case 'systemd_stop_unit': {
+      const unit = d.unit.trim() || 'the unit';
+      return {
+        expected_effect: `Stop ${unit} on ${host} for ${minutes(d.unit_ttl_min)} to contain the suspected process.`,
+        blast_radius: `Only ${unit} and anything that depends on it. Protected units (SSH, journald, networking, the harness itself) are refused by the gate.`,
+        rollback_plan: `action-exec-d restarts ${unit} when the ${minutes(d.unit_ttl_min)} TTL elapses, unless the incident is resolved first.`,
+      };
+    }
+    default: {
+      const keep = d.cidrs.trim() ? d.cidrs.split(/[\s,]+/).filter(Boolean).join(', ') : 'the management ranges';
+      return {
+        expected_effect: `Isolate ${host} from every network except ${keep} for ${minutes(d.iso_ttl_min)} while the incident is analysed.`,
+        blast_radius: `All traffic to and from ${host} outside ${keep} stops, including public services.`,
+        rollback_plan: `action-exec-d removes the isolation rules when the ${minutes(d.iso_ttl_min)} TTL elapses and verifies connectivity.`,
+      };
+    }
+  }
+}
+
+const AUTH_TEXT = { policy_bounded_autonomous: 'Bounded autonomous', dual_signed_operator: 'Dual-signed operator' };
+
+function actionResultView(r, inc) {
+  const allowed = r.decision.allowed;
+  const pending = r.status === 'pending_approval';
+  const kind = !allowed ? 'bad' : pending ? 'warn' : 'ok';
+  const verdict = !allowed ? 'Denied by the action gate' : pending ? 'Intent created · awaiting dual-signed approval' : 'Authorized by bounded policy';
+  const open = r.intent_id
+    ? el(
+        'button',
+        {
+          class: 'btn btn-sm',
+          type: 'button',
+          on: {
+            click: () => {
+              state.mit = { filter: 'all', host: '', incident: inc.incident_id };
+              state.openIntent = r.intent_id;
+              location.hash = '#/mitigations';
+            },
+          },
+        },
+        'Open in Mitigations',
+        icon('arrow'),
+      )
+    : null;
+  return el(
+    'div',
+    { class: ['decision', kind], attrs: { role: 'status' } },
+    el('div', { class: 'verdict' }, verdict),
+    el('div', { class: 'rule' }, r.decision.rule_id, el('span', { class: 'muted' }, ` · policy v${r.decision.policy_version}`)),
+    el('div', { class: 'reason' }, r.decision.reason),
+    el(
+      'dl',
+      { class: 'kv' },
+      el('dt', null, 'Action'),
+      el('dd', null, el('b', null, VERB_LABEL[r.verb?.verb] ?? r.verb?.verb), ' ', el('span', { class: 'mono' }, verbTarget(r.verb))),
+      el('dt', null, 'Status'),
+      el('dd', null, actionStatusBadge(r.status ?? 'rejected')),
+      r.auth_mode ? [el('dt', null, 'Authorization'), el('dd', null, AUTH_TEXT[r.auth_mode] ?? r.auth_mode)] : null,
+      r.proposal_id != null ? [el('dt', null, 'Proposal'), el('dd', { class: 'mono' }, `#${r.proposal_id}`)] : null,
+      r.intent_id ? [el('dt', null, 'Intent'), el('dd', null, idChip(r.intent_id, { title: 'Intent' }))] : null,
+    ),
+    open ? el('div', { class: 'row' }, open) : null,
+  );
+}
+
+function actionComposer(inc, run, ev) {
+  const drafts = draftsFor(inc.incident_id);
+  drafts.action ??= {
+    verb: 'nft_block_ip',
+    ip: '',
+    direction: 'outbound',
+    ip_ttl_min: 15,
+    unit: suggestedUnit(ev.obs),
+    unit_ttl_min: 30,
+    cidrs: '',
+    iso_ttl_min: 60,
+    expected_effect: '',
+    blast_radius: '',
+    rollback_plan: '',
+    edited: {},
   };
+  const d = drafts.action;
+  const body = el('div', { class: 'stack' });
+  const result = el('div', { class: 'stack' });
+  const texts = {};
+
+  function syncDefaults() {
+    const def = actionDefaults(d, inc.host_id);
+    for (const k of ['expected_effect', 'blast_radius', 'rollback_plan']) {
+      if (d.edited[k] && d[k].trim()) continue;
+      d[k] = def[k];
+      d.edited[k] = false;
+      if (texts[k]) texts[k].value = def[k];
+    }
+  }
+
+  function renderResult() {
+    const log = state.actionResults.get(inc.incident_id) ?? [];
+    replace(
+      result,
+      log[0] ? actionResultView(log[0], inc) : null,
+      log.length > 1
+        ? el('div', { class: 'history' }, el('span', { class: 'eyebrow' }, 'Earlier in this session'), log.slice(1, 6).map((x) => el('div', { class: 'h-item' }, el('span', { class: ['dot', x.decision.allowed ? 'ok' : 'bad'] }), el('span', { class: 'mono' }, x.decision.rule_id), el('span', { class: 'num muted' }, fmtTime(x.at)))))
+        : null,
+    );
+  }
+
+  const evNode = el('div', { class: 'ev-row' });
+  const evHint = el('span', { class: 'hint' });
+  function refreshEvidence() {
+    const ids = [...ev.selected].sort((a, b) => a - b);
+    replace(
+      evNode,
+      ids.length
+        ? ids.map((id) => {
+            const o = ev.obsMap.get(id);
+            return el('button', { class: 'ev-badge', type: 'button', title: 'Remove from evidence', on: { click: () => evidenceToggle(id, false, ev) } }, `obs ${id}`, o ? el('span', { class: 'h' }, o.state_hash.slice(0, 8)) : null, icon('close'));
+          })
+        : el('span', { class: 'muted small' }, 'None cited yet.'),
+    );
+    evHint.className = ids.length ? 'hint' : 'hint warn';
+    evHint.textContent = ids.length ? `${ids.length} observation${ids.length === 1 ? '' : 's'} bound by ID; control-d checks each is inside this incident's scope.` : 'The gate denies proposals without evidence (action.evidence_required). Tick facts on the left or cite the latest.';
+  }
+
+  function textField(key, label, rows = 3) {
+    const t = el('textarea', { rows, value: d[key] });
+    t.addEventListener('input', () => {
+      d[key] = t.value;
+      d.edited[key] = true;
+    });
+    texts[key] = t;
+    return field(label, t);
+  }
+
+  function verbFields() {
+    const onChange = () => syncDefaults();
+    const ttl = (key) => numInput(d, key, { min: 1, onInput: onChange });
+    switch (d.verb) {
+      case 'nft_block_ip':
+        return el(
+          'div',
+          { class: 'grid-2' },
+          field('IP address', textInput(d, 'ip', { placeholder: '203.0.113.47', mono: true, onInput: onChange })),
+          field('Direction', selectInput(d, 'direction', [['outbound', 'Outbound'], ['inbound', 'Inbound'], ['both', 'Both']], onChange)),
+          field('TTL (min)', ttl('ip_ttl_min')),
+          el('span', { class: 'hint span-2' }, 'Within policy, short blocks may auto-authorize; everything else waits for an operator co-signature.'),
+        );
+      case 'systemd_stop_unit':
+        return el(
+          'div',
+          { class: 'grid-2' },
+          field('Unit', textInput(d, 'unit', { placeholder: 'custom-helper.service', mono: true, onInput: onChange })),
+          field('TTL (min)', ttl('unit_ttl_min')),
+        );
+      default:
+        return el(
+          'div',
+          { class: 'stack' },
+          field('Keep reachable (management CIDRs)', textInput(d, 'cidrs', { placeholder: '10.20.0.0/24, 10.20.8.15/32', mono: true, onInput: onChange }), el('span', { class: 'hint' }, 'Comma separated, 1–16 ranges. Host isolation is always dual-signed.')),
+          el('div', { class: 'grid-2' }, field('TTL (min)', ttl('iso_ttl_min'))),
+        );
+    }
+  }
+
+  function requestBody() {
+    const mins = (m) => Math.round(Number(m) * 60);
+    const verb =
+      d.verb === 'nft_block_ip'
+        ? { verb: d.verb, ip: d.ip.trim(), direction: d.direction, ttl_seconds: mins(d.ip_ttl_min) }
+        : d.verb === 'systemd_stop_unit'
+          ? { verb: d.verb, unit: d.unit.trim(), ttl_seconds: mins(d.unit_ttl_min) }
+          : { verb: d.verb, preserve_mgmt_cidrs: d.cidrs.split(/[\s,]+/).filter(Boolean), ttl_seconds: mins(d.iso_ttl_min) };
+    return { run_id: run?.run_id, verb, evidence_observation_ids: [...ev.selected], expected_effect: d.expected_effect, blast_radius: d.blast_radius, rollback_plan: d.rollback_plan };
+  }
+
+  function draw() {
+    syncDefaults();
+    const seg = el(
+      'div',
+      { class: 'seg', attrs: { role: 'group', 'aria-label': 'Mitigation verb' } },
+      VERB_CHOICES.map(([v, label]) => el('button', { type: 'button', attrs: { 'aria-pressed': String(d.verb === v) }, on: { click: () => { d.verb = v; d.edited = {}; draw(); } } }, label)),
+    );
+    const citeLatest = el(
+      'button',
+      {
+        class: 'btn btn-sm',
+        type: 'button',
+        disabled: !ev.obs.length,
+        title: ev.obs.length ? `Cite observation ${ev.obs[0].observation_id}, the newest in this incident` : 'No observations in this incident window',
+        on: { click: () => ev.obs.length && evidenceToggle(ev.obs[0].observation_id, true, ev) },
+      },
+      'Cite latest',
+    );
+    const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to action gate');
+    const form = el(
+      'form',
+      { class: 'form', attrs: { novalidate: true } },
+      field('Action', seg),
+      verbFields(),
+      el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence', citeLatest), evNode, evHint),
+      textField('expected_effect', 'Expected effect'),
+      textField('blast_radius', 'Blast radius'),
+      textField('rollback_plan', 'Rollback plan'),
+      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
+    );
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      submitBtn.disabled = true;
+      try {
+        const r = await api(`/api/incidents/${encodeURIComponent(inc.incident_id)}/actions`, { method: 'POST', body: requestBody() });
+        const log = state.actionResults.get(inc.incident_id) ?? [];
+        log.unshift({ ...r, at: new Date().toISOString() });
+        state.actionResults.set(inc.incident_id, log);
+        renderResult();
+        toast(r.decision.allowed ? `${r.status === 'pending_approval' ? 'Awaiting approval' : 'Authorized'}: ${r.decision.rule_id}` : `Denied: ${r.decision.rule_id}`, r.decision.allowed ? 'ok' : 'bad');
+        await loadActions();
+        renderShell();
+      } catch (err) {
+        toast(`${err.code}: ${err.message}`, 'bad');
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+    replace(body, form, result);
+    refreshEvidence();
+    renderResult();
+  }
+
+  if (!run) {
+    append(body, runLock(inc, 'Proposing a mitigation'));
+    renderResult();
+    append(body, result);
+  } else {
+    draw();
+    ev.listeners.add(() => refreshEvidence());
+  }
+  return tabPanel([el('strong', null, 'Propose mitigation. '), 'A closed catalog of typed, TTL-bounded verbs. The deterministic action gate signs, queues for co-signature, or denies.'], body);
+}
+
+// ----- what changed -----
+
+function describeEntry(type, x) {
+  if (type === 'sockets.listening') {
+    return [`${x.protocol} ${sockAddr(x)}`, el('span', { class: 'muted' }, ` · ${x.comm ?? 'unknown process'}${x.pid ? ` (pid ${x.pid})` : ''} · ${x.systemd_unit ?? 'no unit'} · uid ${x.uid}`)];
+  }
+  return [x.path, el('span', { class: 'muted' }, ` · ${x.status ?? '?'}${x.size_bytes != null ? ` · ${x.size_bytes} B` : ''}${x.sha256 ? ` · ${x.sha256.slice(0, 10)}…` : ''}`)];
+}
+
+const fmtVal = (v) => (v === null || v === undefined ? '∅' : typeof v === 'string' && /^[0-9a-f]{64}$/.test(v) ? `${v.slice(0, 10)}…` : String(v));
+
+function diffItems(c) {
+  const items = [];
+  const d = c.diff;
+  if (d.kind === 'set') {
+    for (const x of d.added) items.push(['add', 'Added', describeEntry(c.collector_type, x)]);
+    for (const x of d.removed) items.push(['del', 'Removed', describeEntry(c.collector_type, x)]);
+    for (const x of d.changed) items.push(['mod', 'Changed', [x.key, el('span', { class: 'muted' }, ` · ${x.fields.map((f) => `${f.field} ${fmtVal(f.before)} → ${fmtVal(f.after)}`).join(', ')}`)]]);
+  } else if (d.kind === 'fields') {
+    for (const f of d.fields) items.push(['mod', 'Changed', [f.field, el('span', { class: 'muted' }, ` · ${fmtVal(f.before)} → ${fmtVal(f.after)}`)]]);
+    for (const x of d.unit_files.added) items.push(['add', 'Added', describeEntry('files', x)]);
+    for (const x of d.unit_files.removed) items.push(['del', 'Removed', describeEntry('files', x)]);
+    for (const x of d.unit_files.changed) items.push(['mod', 'Changed', [x.key, el('span', { class: 'muted' }, ` · ${x.fields.map((f) => `${f.field} ${fmtVal(f.before)} → ${fmtVal(f.after)}`).join(', ')}`)]]);
+  }
+  return items;
+}
+
+function changeView(c) {
+  const basis =
+    c.basis === 'accepted_baseline'
+      ? [`vs accepted baseline rev ${c.accepted_baseline.revision_id}`, c.accepted_baseline.approver ? ` (${c.accepted_baseline.approver})` : '']
+      : [`vs #${c.reference.observation_id}, just before this incident opened`];
+  const items = diffItems(c);
+  const LIMIT = 8;
+  return el(
+    'div',
+    { class: 'change' },
+    el(
+      'div',
+      { class: 'change-head' },
+      el('span', { class: 'wid' }, c.watch_id),
+      el('span', { class: 'muted' }, c.collector_type),
+      el('span', { class: 'spacer' }),
+      el('span', null, basis, ' → latest ', el('button', { class: 'ev-badge', type: 'button', title: 'Show this observation', on: { click: () => focusFact(c.latest.observation_id) } }, `#${c.latest.observation_id}`)),
+    ),
+    c.diff.kind === 'unavailable'
+      ? el('div', { class: 'empty-slot' }, 'The accepted baseline observation is outside the loaded window, so only hashes can be compared: ', hashChip(c.accepted_baseline.state_hash), ' → ', hashChip(c.latest.state_hash))
+      : items.length
+        ? el('ul', { class: 'diff-list' }, items.slice(0, LIMIT).map(([cls, tag, what]) => el('li', { class: cls }, el('span', { class: 'tag' }, tag), el('span', { class: 'what' }, what))))
+        : el('div', { class: 'empty-slot' }, 'Hashes differ, but no field-level difference is modelled for this collector.'),
+    items.length > LIMIT ? el('div', { class: 'diff-more' }, `${items.length - LIMIT} more difference${items.length - LIMIT === 1 ? '' : 's'} in the observation detail below.`) : null,
+  );
+}
+
+function changesCard(inc, r) {
+  if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
+  {
+    const n = r.changes.length;
+    for (const c of r.changes) {
+      if (c.diff.kind === 'set' && c.collector_type === 'sockets.listening') {
+        state.changeIndex.set(`${inc.incident_id}:${c.latest.observation_id}`, { addedKeys: new Set(c.diff.added.map((x) => x.socket_key)), removed: c.diff.removed });
+      }
+    }
+    return card(
+      'What changed',
+      n ? `${n} snapshot watch${n === 1 ? '' : 'es'} on ${inc.host_id} differ${n === 1 ? 's' : ''} from the accepted baseline or the state before this incident` : null,
+      n ? el('div', { class: 'card-body' }, r.changes.map(changeView)) : el('div', { class: 'card-body' }, el('div', { class: 'empty-slot' }, 'No snapshot differences against an accepted baseline or the state just before this incident opened. Stream watches (journal) are append-only and not compared.')),
+      null,
+      'changes',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,16 +1957,20 @@ const TRI_STATE = {
   in_sync: ['ok', 'In sync'],
   drift: ['warn', 'Drift'],
   collector_error: ['bad', 'Collector error'],
-  no_trusted_baseline: ['eph', 'No trusted baseline'],
-  baseline_absent: ['warn', 'Baseline absent'],
+  no_trusted_baseline: ['', 'No trusted baseline'],
+  baseline_absent: ['', 'Not yet accepted'],
+  stream: ['stream', 'Stream'],
   no_data: ['', 'No data'],
 };
+
+/** Snapshot baseline watches that have never been accepted and can be promoted now. */
+const initialBaselines = (rows) => rows.filter((r) => r.state !== 'stream' && r.class === 'baseline' && !r.accepted_baseline && r.promotable_observation_id != null);
 
 async function renderBaselines(arg, stale) {
   const b = state.baselines;
   if (arg) b.host = arg;
   if (!b.host || !state.hosts.some((h) => h.host_id === b.host)) b.host = state.hosts[0]?.host_id ?? null;
-  if (!b.host) return emptyState('No hosts in scope', '');
+  if (!b.host) return el('div', { class: 'empty-slot' }, 'No hosts in scope.');
   if (arg !== b.host) history.replaceState(null, '', `#/baselines/${encodeURIComponent(b.host)}`);
 
   const host = b.host;
@@ -1417,27 +1997,33 @@ async function renderBaselines(arg, stale) {
       ),
     ),
   );
-  const watchSel = el('select', null, el('option', { value: '' }, 'All watches'), watches.watches.map((w) => el('option', { value: w.id, selected: w.id === b.watch }, `${w.class === 'baseline' ? '◼' : '◇'} ${w.id}`)));
+  const watchSel = el('select', { attrs: { 'aria-label': 'Watch' } }, el('option', { value: '' }, 'All watches'), watches.watches.map((w) => el('option', { value: w.id, selected: w.id === b.watch }, `${w.id} (${w.class})`)));
   watchSel.addEventListener('change', () => {
     b.watch = watchSel.value;
     render();
   });
-  const limitSel = el('select', null, [25, 50, 100, 200, 500].map((n) => el('option', { value: String(n), selected: n === b.limit }, `${n} rows`)));
+  const limitSel = el('select', { attrs: { 'aria-label': 'Rows' } }, [25, 50, 100].map((n) => el('option', { value: String(n), selected: n === b.limit }, `${n} rows`)));
   limitSel.addEventListener('change', () => {
     b.limit = Number(limitSel.value);
     render();
   });
 
   const tri = base.three_state.filter((r) => !b.watch || r.watch_id === b.watch);
+  const initial = initialBaselines(base.three_state);
+  const acceptAll =
+    adminEnabled() && initial.length >= 2
+      ? el('button', { class: 'btn btn-sm', type: 'button', title: 'Promote the current observation of every never-accepted snapshot watch on this host', on: { click: () => openAcceptAllDrawer(host, initial) } }, icon('check'), `Accept all initial baselines (${initial.length})`)
+      : null;
   const triCard = card(
     'Three-state baseline',
-    'accepted_baseline is never advanced automatically; promotion is an attributable admin action.',
+    'The accepted baseline never advances on its own; promotion is an attributable admin action. Stream watches are append-only and have no baseline.',
     el(
       'div',
       { class: 'tri' },
       el('div', { class: 'tri-row head' }, el('div', null, 'Watch'), el('div', null, 'Accepted baseline'), el('div', null, 'Last observed'), el('div', null, 'Current observed'), el('div', { class: 'tri-state' }, 'State')),
       tri.length ? tri.map((r) => triRow(host, r)) : emptyState('No watches', ''),
     ),
+    acceptAll,
   );
 
   const rows = [];
@@ -1454,7 +2040,7 @@ async function renderBaselines(arg, stale) {
       el('td', { class: 'mono' }, `#${o.observation_id}`),
       el('td', { class: 'mono' }, fmtTime(o.observed_at)),
       el('td', { class: 'mono' }, o.watch_id),
-      el('td', null, w ? classBadge(w.class) : el('span', { class: 'muted' }, 'retired')),
+      el('td', null, w ? classBadge(w.class) : el('span', { class: 'muted' }, 'Retired')),
       el('td', null, obsStatusBadge(o.status)),
       el('td', null, hashChip(o.state_hash)),
       el('td', { class: 'sum' }, summarize(o)),
@@ -1476,56 +2062,74 @@ async function renderBaselines(arg, stale) {
 
   const obsCard = card(
     'Observations',
-    'QueryObservations via control-d · bounded, classified evidence slices',
+    'QueryObservations via control-d: bounded, classified evidence slices',
     el(
       'div',
       { class: 'card-body flush table-wrap' },
       sortedObs.length
-        ? el('table', { class: 'obs-table' }, el('thead', null, el('tr', null, ['', 'ID', 'Observed', 'Watch', 'Class', 'Status', 'state_hash', 'Summary'].map((h) => el('th', null, h)))), el('tbody', null, rows))
+        ? el('table', { class: 'obs-table' }, el('thead', null, el('tr', null, ['', 'ID', 'Observed', 'Watch', 'Class', 'Status', 'State hash', 'Summary'].map((h) => el('th', null, h)))), el('tbody', null, rows))
         : emptyState('No observations', 'Nothing collected for this filter yet.'),
     ),
-    el('span', { class: 'badge ghost' }, `${sortedObs.length} rows`),
+    el('span', { class: 'muted small' }, `${sortedObs.length} rows`),
   );
 
   return el(
     'div',
     null,
-    el('div', { class: 'toolbar' }, el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Host'), hostChips), el('span', { class: 'spacer' }), field('Watch', watchSel), field('Limit', limitSel)),
+    el('div', { class: 'toolbar' }, el('div', { class: 'field grow' }, el('span', { class: 'lbl' }, 'Host'), hostChips), field('Watch', watchSel), field('Rows', limitSel)),
     el('div', { class: 'stack' }, triCard, obsCard),
   );
 }
 
-function triCell(entry, extra) {
-  if (!entry) return el('div', { class: 'tri-cell' }, el('span', { class: 'hash is-null' }, '— none —'), el('span', { class: 'meta' }, extra ?? ''));
-  return el('div', { class: 'tri-cell' }, hashChip(entry.state_hash), el('span', { class: 'meta', title: extra ?? '' }, extra));
+function triCell(entry, extra, label) {
+  if (!entry) return el('div', { class: 'tri-cell', dataset: { label } }, el('span', { class: 'hash is-null' }, 'none'), el('span', { class: 'meta' }, extra ?? ''));
+  return el('div', { class: 'tri-cell', dataset: { label } }, hashChip(entry.state_hash), el('span', { class: 'meta', title: extra ?? '' }, extra));
 }
 
 function triRow(host, r) {
   const [cls, label] = TRI_STATE[r.state] ?? ['', r.state];
-  const a = r.accepted_baseline;
+  const watchCell = el('div', { class: 'tri-cell tri-watch' }, el('div', { class: 'row' }, classBadge(r.class)), el('span', { class: 'wid' }, r.watch_id), el('span', { class: 'meta' }, r.collector_type ?? ''));
+  if (r.state === 'stream') {
+    const st = r.stream ?? {};
+    const latestBad = st.latest_status && !VALID_OBS.has(st.latest_status);
+    return el(
+      'div',
+      { class: 'tri-row is-stream' },
+      watchCell,
+      el(
+        'div',
+        { class: 'tri-span stream-line' },
+        el('span', null, 'Append-only cursor stream'),
+        el('span', null, 'latest ', el('span', { class: 'mono' }, `#${st.latest_observation_id}`), ' · ', relTime(st.latest_observed_at)),
+        el('span', null, `${st.latest_event_count} event${st.latest_event_count === 1 ? '' : 's'} in latest batch · ${st.events_in_window} in ${st.batches_in_window} batch${st.batches_in_window === 1 ? '' : 'es'}`),
+        st.gap_detected ? el('span', { class: 'badge warn' }, 'Cursor gap') : null,
+      ),
+      el('div', { class: 'tri-state' }, el('div', { class: 'row' }, el('span', { class: 'badge stream' }, icon('stream'), label), latestBad ? obsStatusBadge(st.latest_status) : null)),
+    );
+  }
   const promote =
     r.promotable_observation_id != null
       ? el(
           'button',
           {
-            class: 'btn btn-sm btn-ok',
+            class: 'btn btn-sm',
             type: 'button',
             disabled: !adminEnabled(),
             title: adminEnabled() ? `Promote observation ${r.promotable_observation_id} to accepted baseline` : 'Admin interface disabled',
             on: { click: () => openPromoteDrawer(host, r) },
           },
           adminEnabled() ? null : icon('lock'),
-          'Promote',
+          r.accepted_baseline ? 'Promote' : 'Accept',
         )
       : null;
   return el(
     'div',
     { class: 'tri-row' },
-    el('div', { class: 'tri-cell tri-watch' }, el('div', { class: 'row' }, classBadge(r.class)), el('span', { class: 'wid' }, r.watch_id), el('span', { class: 'meta' }, r.collector_type ?? '')),
-    triCell(a, a ? `rev ${a.revision_id} · ${a.approver}${a.ticket_ref ? ` · ${a.ticket_ref}` : ''}` : r.class === 'ephemeral' ? 'ephemeral: cannot hold a trusted baseline' : 'never promoted'),
-    triCell(r.last_observed, r.last_observed ? `#${r.last_observed.observation_id} · ${fmtTime(r.last_observed.observed_at)}` : 'no prior valid sample'),
-    triCell(r.current_observed, r.current_observed ? `#${r.current_observed.observation_id} · ${r.current_observed.status} · ${fmtTime(r.current_observed.observed_at)}` : 'no data'),
-    el('div', { class: 'tri-state' }, el('div', { class: 'row' }, el('span', { class: ['badge', cls] }, label), r.changed_since_last ? el('span', { class: 'badge warn', title: 'current_observed differs from last_observed' }, 'changed') : null), promote),
+    watchCell,
+    triCell(r.accepted_baseline, r.accepted_baseline ? `rev ${r.accepted_baseline.revision_id} · ${r.accepted_baseline.approver}${r.accepted_baseline.ticket_ref ? ` · ${r.accepted_baseline.ticket_ref}` : ''}` : r.class === 'ephemeral' ? 'Ephemeral: cannot hold a trusted baseline' : 'Never accepted', 'Accepted baseline'),
+    triCell(r.last_observed, r.last_observed ? `#${r.last_observed.observation_id} · ${fmtTime(r.last_observed.observed_at)}` : 'No prior valid sample', 'Last observed'),
+    triCell(r.current_observed, r.current_observed ? `#${r.current_observed.observation_id} · ${r.current_observed.status} · ${fmtTime(r.current_observed.observed_at)}` : 'No data', 'Current observed'),
+    el('div', { class: 'tri-state' }, el('div', { class: 'row' }, el('span', { class: ['badge', cls] }, label), r.changed_since_last ? el('span', { class: 'badge ghost', title: 'Current observed differs from last observed' }, 'Changed') : null), promote),
   );
 }
 
@@ -1765,10 +2369,21 @@ function openDrawer(title, sub, bodyNodes, footNodes) {
   d.showModal();
 }
 
+const defaultRationale = (r) => (r.accepted_baseline ? 'Accept observed change' : 'Accept initial observed state');
+
+function ticketField(form) {
+  return el(
+    'details',
+    { class: 'more', open: Boolean(form.ticket_ref) },
+    el('summary', null, 'Add change ticket'),
+    field('Change ticket (optional)', textInput(form, 'ticket_ref', { placeholder: 'CHG-4471', mono: true })),
+  );
+}
+
 function openPromoteDrawer(host, r) {
-  const form = { approver: '', rationale: '', ticket_ref: '' };
+  const form = { approver: operatorName(), rationale: defaultRationale(r), ticket_ref: '' };
   const errNode = el('div');
-  const submit = el('button', { class: 'btn btn-ok', type: 'button' }, 'Promote to accepted baseline');
+  const submit = el('button', { class: 'btn btn-primary', type: 'button' }, r.accepted_baseline ? 'Promote to accepted baseline' : 'Accept as baseline');
   submit.addEventListener('click', async () => {
     submit.disabled = true;
     replace(errNode);
@@ -1777,6 +2392,7 @@ function openPromoteDrawer(host, r) {
         method: 'POST',
         body: { host_id: host, watch_id: r.watch_id, observation_id: r.promotable_observation_id, approver: form.approver, rationale: form.rationale, ticket_ref: form.ticket_ref || null },
       });
+      rememberOperator(form.approver);
       drawer().close();
       toast(`Baseline revision ${res.revision_id} accepted for ${res.watch_id}`, 'ok');
       await refreshAll();
@@ -1786,20 +2402,76 @@ function openPromoteDrawer(host, r) {
     }
   });
   openDrawer(
-    'Promote baseline',
-    'Creates a new immutable, attributable revision. The old revision is kept.',
+    r.accepted_baseline ? 'Promote baseline' : 'Accept initial baseline',
+    'Creates a new immutable, attributable revision. Earlier revisions are kept.',
     [
-      el('dl', { class: 'kv' }, el('dt', null, 'host'), el('dd', { class: 'mono' }, host), el('dt', null, 'watch'), el('dd', { class: 'mono' }, r.watch_id), el('dt', null, 'observation'), el('dd', { class: 'mono' }, `#${r.promotable_observation_id}`)),
+      el('dl', { class: 'kv' }, el('dt', null, 'Host'), el('dd', { class: 'mono' }, host), el('dt', null, 'Watch'), el('dd', { class: 'mono' }, r.watch_id), el('dt', null, 'Observation'), el('dd', { class: 'mono' }, `#${r.promotable_observation_id}`)),
       el(
         'div',
         { class: 'diff' },
-        el('div', { class: 'col' }, el('span', { class: 'eyebrow' }, `Accepted${r.accepted_baseline ? ` · rev ${r.accepted_baseline.revision_id}` : ''}`), hashChip(r.accepted_baseline?.state_hash)),
+        el('div', { class: 'col' }, el('span', { class: 'eyebrow' }, r.accepted_baseline ? `Accepted · rev ${r.accepted_baseline.revision_id}` : 'Accepted'), hashChip(r.accepted_baseline?.state_hash)),
         el('span', { class: 'rel-arrow' }, '→'),
         el('div', { class: 'col' }, el('span', { class: 'eyebrow' }, 'New accepted state'), hashChip(r.current_observed?.state_hash)),
       ),
-      field('Approver', textInput(form, 'approver', { placeholder: 'your operator identity' })),
-      field('Rationale', textArea(form, 'rationale', { placeholder: 'Why this observed state is known-good…', rows: 3 })),
-      field('Change ticket (optional)', textInput(form, 'ticket_ref', { placeholder: 'CHG-4471', mono: true })),
+      el('div', { class: 'grid-2' }, field('Approver', textInput(form, 'approver', { placeholder: 'your operator name' })), field('Rationale', textInput(form, 'rationale'))),
+      ticketField(form),
+      errNode,
+    ],
+    [el('span', { class: 'foot-note' }, 'Signed as you; remembered on this browser'), el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
+  );
+}
+
+function openAcceptAllDrawer(host, rows) {
+  const form = { approver: operatorName(), rationale: 'Accept initial observed state', ticket_ref: '' };
+  const errNode = el('div');
+  const marks = new Map(rows.map((r) => [r.watch_id, el('span', { class: 'badge ghost' }, 'Waiting')]));
+  const list = el('ul', { class: 'progress-list' }, rows.map((r) => el('li', null, el('span', { class: 'mono' }, r.watch_id), el('span', { class: 'muted small' }, `#${r.promotable_observation_id}`), marks.get(r.watch_id))));
+  const submit = el('button', { class: 'btn btn-primary', type: 'button' }, `Accept ${rows.length} baselines`);
+  submit.addEventListener('click', async () => {
+    submit.disabled = true;
+    replace(errNode);
+    let ok = 0;
+    for (const r of rows) {
+      const mark = marks.get(r.watch_id);
+      if (mark.dataset.done) {
+        ok += 1;
+        continue;
+      }
+      mark.className = 'badge';
+      mark.textContent = 'Promoting…';
+      try {
+        const res = await api('/api/admin/baselines/promote', {
+          method: 'POST',
+          body: { host_id: host, watch_id: r.watch_id, observation_id: r.promotable_observation_id, approver: form.approver, rationale: form.rationale, ticket_ref: form.ticket_ref || null },
+        });
+        mark.className = 'badge ok';
+        mark.textContent = `rev ${res.revision_id}`;
+        mark.dataset.done = '1';
+        ok += 1;
+      } catch (err) {
+        mark.className = 'badge bad';
+        mark.textContent = 'Failed';
+        replace(errNode, errorBox(err));
+        break;
+      }
+    }
+    if (ok) rememberOperator(form.approver);
+    if (ok === rows.length) {
+      toast(`${ok} initial baselines accepted on ${host}`, 'ok');
+      drawer().close();
+      await refreshAll();
+    } else {
+      submit.disabled = false;
+      submit.textContent = 'Retry remaining';
+    }
+  });
+  openDrawer(
+    'Accept all initial baselines',
+    `Promotes the current observation of ${rows.length} never-accepted snapshot watches on ${host}, one attributable revision each.`,
+    [
+      list,
+      el('div', { class: 'grid-2' }, field('Approver', textInput(form, 'approver', { placeholder: 'your operator name' })), field('Rationale', textInput(form, 'rationale'))),
+      ticketField(form),
       errNode,
     ],
     [el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => drawer().close() } }, 'Cancel'), submit],
@@ -1807,7 +2479,7 @@ function openPromoteDrawer(host, r) {
 }
 
 function openCloseDrawer(inc) {
-  const form = { actor: '', resolution: '' };
+  const form = { actor: operatorName(), resolution: '' };
   const errNode = el('div');
   const submit = el('button', { class: 'btn btn-danger', type: 'button' }, 'Close incident');
   submit.addEventListener('click', async () => {
@@ -1815,8 +2487,9 @@ function openCloseDrawer(inc) {
     replace(errNode);
     try {
       const res = await api(`/api/admin/incidents/${encodeURIComponent(inc.incident_id)}/close`, { method: 'POST', body: form });
+      rememberOperator(form.actor);
       drawer().close();
-      toast(`${res.incident_id} closed · ${res.retired_ephemeral_watches} ephemeral watch${res.retired_ephemeral_watches === 1 ? '' : 'es'} retired`, 'ok');
+      toast(`${shortId(res.incident_id)} closed · ${res.retired_ephemeral_watches} ephemeral watch${res.retired_ephemeral_watches === 1 ? '' : 'es'} retired`, 'ok');
       await refreshAll();
     } catch (err) {
       replace(errNode, errorBox(err));
@@ -1827,9 +2500,9 @@ function openCloseDrawer(inc) {
     'Close incident',
     'Closing ends active runs and retires the incident\'s ephemeral watches.',
     [
-      el('dl', { class: 'kv' }, el('dt', null, 'incident'), el('dd', { class: 'mono' }, inc.incident_id), el('dt', null, 'host'), el('dd', { class: 'mono' }, inc.host_id)),
+      el('dl', { class: 'kv' }, el('dt', null, 'Incident'), el('dd', null, idChip(inc.incident_id, { title: 'Incident' })), el('dt', null, 'Host'), el('dd', { class: 'mono' }, inc.host_id)),
       el('p', { class: 'dim' }, inc.summary),
-      field('Actor', textInput(form, 'actor', { placeholder: 'your operator identity' })),
+      field('Actor', textInput(form, 'actor', { placeholder: 'your operator name' })),
       field('Resolution', textArea(form, 'resolution', { placeholder: 'Outcome, verification performed, follow-ups…', rows: 4 })),
       errNode,
     ],
@@ -1898,7 +2571,7 @@ function brandMark() {
 function showGate({ kind, message = null }) {
   const shell = document.getElementById('shell');
   shell.hidden = true;
-  clear(document.getElementById('main'));
+  clear(document.getElementById('view'));
   if (drawer().open) drawer().close();
   clear(drawer());
   state.hosts = [];
@@ -1906,7 +2579,7 @@ function showGate({ kind, message = null }) {
   state.actions = { list: [], denied: null, source: null, admin_sock: null, error: null, loaded: false };
   state.status = null;
   const gate = document.getElementById('gate');
-  const head = el('div', { class: 'gate-head' }, brandMark(), el('div', null, el('h1', null, PRODUCT), el('p', { class: 'muted' }, 'Operator Console')));
+  const head = el('div', { class: 'gate-head' }, brandMark(), el('div', null, el('h1', null, PRODUCT), el('p', { class: 'muted' }, 'Operator console')));
   let body;
   if (kind === 'login') {
     const form = { username: '', password: '' };
@@ -2007,14 +2680,14 @@ function renderUserSlot() {
 
 const VERB_LABEL = { nft_block_ip: 'Block IP', systemd_stop_unit: 'Stop unit', host_isolate: 'Isolate host' };
 const ACTION_STATUS = {
-  pending_approval: ['warn', 'pending approval'],
-  authorized: ['eph', 'authorized'],
-  executed: ['ok', 'executed'],
-  dry_run_simulated: ['eph', 'dry run'],
-  rolled_back: ['', 'rolled back'],
-  rejected: ['bad', 'rejected'],
-  verification_failed: ['bad', 'verification failed'],
-  expired: ['', 'expired'],
+  pending_approval: ['warn', 'Pending approval'],
+  authorized: ['', 'Authorized'],
+  executed: ['ok', 'Executed'],
+  dry_run_simulated: ['', 'Dry run'],
+  rolled_back: ['', 'Rolled back'],
+  rejected: ['bad', 'Rejected'],
+  verification_failed: ['bad', 'Verification failed'],
+  expired: ['', 'Expired'],
 };
 const ACTIVE_STATUSES = new Set(['authorized', 'executed', 'dry_run_simulated']);
 
@@ -2044,15 +2717,15 @@ const isAwaiting = (a) => a.status === 'pending_approval' && !lapsed(a);
 const awaitingApproval = () => state.actions.list.filter(isAwaiting);
 
 function actionStatusBadge(status, a = null) {
-  if (a && status === 'pending_approval' && lapsed(a)) return el('span', { class: 'badge', title: 'Approval window elapsed' }, 'approval lapsed');
+  if (a && status === 'pending_approval' && lapsed(a)) return el('span', { class: 'badge', title: 'Approval window elapsed' }, 'Approval lapsed');
   const [cls, label] = ACTION_STATUS[status] ?? ['', status];
-  return el('span', { class: ['badge', cls], title: status }, el('span', { class: ['dot', cls] }), label);
+  return el('span', { class: ['badge', cls], title: status }, el('span', { class: ['dot', cls || (status === 'authorized' ? 'accent' : '')] }), label);
 }
 
 function authModeBadge(mode) {
   return mode === 'dual_signed_operator'
     ? el('span', { class: 'badge solid', title: 'Requires control-d signature AND an independent operator Ed25519 approval' }, icon('key'), 'Dual-signed')
-    : el('span', { class: 'badge eph', title: 'Pre-authorised by human-owned, bounded auto-mitigation policy' }, icon('clock'), 'Autonomous · bounded');
+    : el('span', { class: 'badge ghost', title: 'Pre-authorised by human-owned, bounded auto-mitigation policy' }, icon('clock'), 'Autonomous · bounded');
 }
 
 function scopeLinks(a) {
@@ -2060,7 +2733,7 @@ function scopeLinks(a) {
     'div',
     { class: 'act-scope' },
     el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(a.host_id)}` }, a.host_id),
-    el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}` }, a.incident_id),
+    el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}`, title: a.incident_id }, shortId(a.incident_id)),
   );
 }
 
@@ -2072,57 +2745,86 @@ function windowCell(a) {
   if (ACTIVE_STATUSES.has(a.status) && a.verb?.ttl_seconds) {
     return el('div', { class: 'act-window' }, ttl, el('span', null, 'lifts ', relTime(actionDeadline(a))));
   }
-  return el('div', { class: 'act-window' }, ttl, el('span', { class: 'muted' }, relTime(a.created_at)));
+  return el('div', { class: 'act-window' }, ttl, el('span', { class: 'muted' }, 'Proposed ', relTime(a.created_at)));
 }
 
 function mitigationKpi() {
   const a = state.actions;
-  if (a.error) return kpi('Mitigations', '—', el('span', null, a.error.code === 'forbidden' ? 'needs incident scope or admin' : 'unavailable'));
+  if (a.error) return kpi('Active containment', el('span', { class: 'muted' }, '—'), el('span', null, a.error.code === 'forbidden' ? 'Needs incident scope or the admin interface' : 'Unavailable'));
   const active = a.list.filter((x) => ACTIVE_STATUSES.has(x.status)).length;
   const pending = awaitingApproval().length;
   return kpi(
     'Active containment',
     String(active),
     [
-      pending ? el('a', { class: 'warn-text', href: '#/mitigations', on: { click: () => (state.mit = { filter: 'awaiting', host: '', incident: null }) } }, `${pending} awaiting approval`) : el('span', null, 'none awaiting approval'),
-      a.denied ? el('span', null, `${a.denied.length} denied by gate`) : null,
+      pending ? el('a', { class: 'warn-text', href: '#/mitigations', on: { click: () => (state.mit = { filter: 'awaiting', host: '', incident: null }) } }, `${pending} awaiting approval`) : el('span', null, 'None awaiting approval'),
+      a.denied ? el('span', null, `${a.denied.length} denied by the gate`) : null,
     ],
   );
 }
 
-function approvalBanner() {
+function approvalNotice() {
   const pending = awaitingApproval();
   if (!pending.length) return null;
-  return el(
-    'div',
-    { class: 'banner warn' },
-    el('div', { class: 'banner-ico' }, icon('key')),
-    el(
-      'div',
-      null,
-      el('div', { class: 'banner-title' }, `${pending.length} mitigation${pending.length === 1 ? '' : 's'} awaiting dual-signed approval`),
-      el(
-        'div',
-        { class: 'banner-meta' },
-        pending.slice(0, 3).map((a) => el('span', null, el('b', null, VERB_LABEL[a.verb.verb] ?? a.verb.verb), ' ', el('span', { class: 'mono' }, verbTarget(a.verb)), ' on ', el('span', { class: 'mono' }, a.host_id))),
-      ),
-    ),
-    el('span', { class: 'spacer' }),
+  return notice(
+    'warn',
+    'key',
+    [
+      el('strong', null, `${pending.length} mitigation${pending.length === 1 ? '' : 's'} awaiting dual-signed approval`),
+      pending.slice(0, 2).map((a) => el('span', null, `${VERB_LABEL[a.verb.verb] ?? a.verb.verb} `, el('span', { class: 'mono' }, verbTarget(a.verb)), ` on ${a.host_id}`)),
+    ],
     el('a', { class: 'btn btn-sm', href: '#/mitigations', on: { click: () => (state.mit = { filter: 'awaiting', host: '', incident: null }) } }, 'Review'),
   );
 }
 
+function mitigationGuide() {
+  const open = state.incidents.filter((i) => i.status === 'open');
+  const step = (n, title, text, foot) => el('div', { class: 'guide-step' }, el('h3', null, el('span', { class: 'n' }, String(n)), title), text, foot);
+  return card(
+    'How mitigations arrive',
+    'Nothing has been proposed in this scope yet. Every proposal, whoever makes it, passes the same deterministic action gate before anything is signed.',
+    el(
+      'div',
+      { class: 'guide' },
+      step(
+        1,
+        'Automatically, from reasoner-d',
+        el('p', null, 'When reasoner-d investigates an incident with action proposals enabled (', el('code', null, 'enable_action_proposals'), ' in its run budgets, off by default), it may propose one typed containment step per run: block an IP, stop a unit or isolate a host.'),
+        el('div', { class: 'row' }, el('a', { class: 'text-link', href: '#/fleet' }, 'Check automation status on Fleet')),
+      ),
+      step(
+        2,
+        'Manually, from an investigation',
+        el('p', null, 'Open an incident, start an investigation run, then use the ', el('b', null, 'Propose mitigation'), ' tab. Cite the observed facts that justify it; the gate answers at once with its rule and verdict.'),
+        el(
+          'div',
+          { class: 'row' },
+          open.length
+            ? el('a', { class: 'btn btn-sm', href: `#/investigations/${encodeURIComponent(sortIncidents(open)[0].incident_id)}` }, `Open incidents (${open.length})`, icon('arrow'))
+            : el('span', { class: 'muted small' }, 'No open incidents right now.'),
+        ),
+      ),
+    ),
+  );
+}
+
 async function renderMitigations(_arg, stale) {
-  if (!state.actions.loaded) await loadActions();
+  if (!state.actions.loaded || state.openIntent) await loadActions();
   if (stale()) return null;
   const A = state.actions;
   const m = state.mit;
   if (A.error) {
     const scopeHint =
       A.error.code === 'forbidden'
-        ? "control-d lists actions on the investigation socket only for an incident-scoped capability token. Start the console with --enable-admin --admin-sock for the fleet-wide view."
+        ? 'control-d lists actions on the investigation socket only for an incident-scoped capability token. Start the console with --enable-admin --admin-sock for the fleet-wide view.'
         : null;
-    return el('div', { class: 'stack' }, errorBox(A.error), scopeHint ? el('p', { class: 'muted' }, scopeHint) : null);
+    return el('div', { class: 'stack' }, errorBox(A.error), scopeHint ? el('p', { class: 'muted' }, scopeHint) : null, mitigationGuide());
+  }
+  if (state.openIntent) {
+    const want = state.openIntent;
+    state.openIntent = null;
+    const target = A.list.find((x) => x.intent_id === want);
+    if (target) setTimeout(() => openActionDrawer(target), 0);
   }
 
   const inScope = (x) => (!m.host || x.host_id === m.host) && (!m.incident || x.incident_id === m.incident);
@@ -2138,17 +2840,17 @@ async function renderMitigations(_arg, stale) {
     el(
       'button',
       { class: ['mit-tile', cls], type: 'button', attrs: { 'aria-pressed': String(m.filter === id) }, on: { click: () => { m.filter = m.filter === id ? 'all' : id; render(); } } },
-      el('span', { class: 'label' }, el('span', { class: ['dot', cls] }), label),
+      el('span', { class: 'label' }, el('span', { class: ['dot', Number(n) > 0 ? cls : ''] }), label),
       el('span', { class: 'value' }, n),
       el('span', { class: 'note' }, note),
     );
   const stats = el(
     'div',
     { class: 'mit-tiles' },
-    tile('awaiting', 'Awaiting approval', String(buckets.awaiting.length), 'warn', 'operator co-signature needed'),
-    tile('active', 'Active containment', String(buckets.active.length), 'ok', 'authorized or applied, TTL running'),
-    tile('closed', 'Closed', String(buckets.closed.length), '', 'rolled back, expired or failed'),
-    tile('denied', 'Denied by gate', A.denied ? String(buckets.denied.length) : '—', 'bad', A.denied ? 'never became an intent' : 'needs the admin interface'),
+    tile('awaiting', 'Awaiting approval', String(buckets.awaiting.length), 'warn', 'Operator co-signature needed'),
+    tile('active', 'Active containment', String(buckets.active.length), 'ok', 'Authorized or applied, TTL running'),
+    tile('closed', 'Closed', String(buckets.closed.length), '', 'Rolled back, expired or failed'),
+    tile('denied', 'Denied by the gate', A.denied ? String(buckets.denied.length) : '—', 'bad', A.denied ? 'Never became an intent' : 'Needs the admin interface'),
   );
 
   const hosts = [...new Set([...A.list, ...(A.denied ?? [])].map((x) => x.host_id))].sort();
@@ -2160,7 +2862,7 @@ async function renderMitigations(_arg, stale) {
   const toolbar = el(
     'div',
     { class: 'mit-toolbar' },
-    el('div', { class: 'row' }, m.filter !== 'all' ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, on: { click: () => { m.filter = 'all'; render(); } } }, `${m.filter} ×`) : null, m.incident ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, title: 'Clear incident filter', on: { click: () => { m.incident = null; render(); } } }, el('span', { class: 'mono' }, m.incident), ' ×') : null),
+    el('div', { class: 'row' }, m.filter !== 'all' ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, on: { click: () => { m.filter = 'all'; render(); } } }, `${cap(m.filter)} ×`) : null, m.incident ? el('button', { class: 'chip', type: 'button', attrs: { 'aria-pressed': 'true' }, title: `Clear incident filter (${m.incident})`, on: { click: () => { m.incident = null; render(); } } }, 'Incident ', el('span', { class: 'mono' }, shortId(m.incident)), ' ×') : null),
     el('span', { class: 'spacer' }),
     el('span', { class: 'muted src' }, A.source === 'admin' ? 'control-d admin · ListActions' : A.source === 'investigate' ? 'investigation socket · scoped ListActions' : 'demo fixtures'),
     hostSel,
@@ -2192,6 +2894,7 @@ async function renderMitigations(_arg, stale) {
         )
       : null;
 
+  if (!A.list.length && !(A.denied ?? []).length) return el('div', { class: 'mit' }, stats, mitigationGuide());
   return el('div', { class: 'mit' }, stats, toolbar, intentsCard, deniedCard);
 }
 
@@ -2285,7 +2988,7 @@ function openDeniedDrawer(d) {
     `${VERB_LABEL[d.verb?.verb] ?? 'Action'} · ${verbTarget(d.verb)}`,
     'Denied by the deterministic action gate. No intent was signed, nothing reached the host.',
     [
-      el('div', { class: 'row' }, actionStatusBadge('rejected'), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(d.host_id)}` }, d.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(d.incident_id)}` }, d.incident_id)),
+      el('div', { class: 'row' }, actionStatusBadge('rejected'), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(d.host_id)}` }, d.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(d.incident_id)}`, title: d.incident_id }, shortId(d.incident_id))),
       el('div', { class: 'decision bad' }, el('span', { class: 'verdict' }, 'Denied'), el('span', { class: 'rule' }, d.decision.rule_id), el('span', { class: 'reason' }, d.decision.reason), el('span', { class: 'muted' }, `policy v${d.decision.policy_version} · proposed by `, el('span', { class: 'mono' }, d.actor), ' · ', fmtTime(d.created_at))),
       section('Proposed verb', verbParams(d.verb)),
       justification(d),
@@ -2311,6 +3014,7 @@ function approveCommand(intentId) {
 
 function approvalPanel(a, detail) {
   const f = state.approval;
+  if (!f.approver) f.approver = operatorName();
   const cmd = el('code', null, approveCommand(a.intent_id));
   const refreshCmd = () => (cmd.textContent = approveCommand(a.intent_id));
   const keyFile = field('Operator key file', textInput(f, 'keyFile', { mono: true, onInput: refreshCmd }));
@@ -2484,7 +3188,7 @@ function openActionDrawer(a) {
     `${VERB_LABEL[a.verb?.verb] ?? 'Action'} · ${verbTarget(a.verb)}`,
     a.auth_mode === 'dual_signed_operator' ? 'Dual-signed intent: control-d plus an independent operator key' : 'Bounded autonomous intent pre-authorised by human-owned policy',
     [
-      el('div', { class: 'row' }, statusSlot, authModeBadge(a.auth_mode), a.approver ? el('span', { class: 'muted small' }, 'approved by ', el('span', { class: 'mono' }, a.approver)) : null, el('span', { class: 'spacer' }), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(a.host_id)}`, on: { click: () => drawer().close() } }, a.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}`, on: { click: () => drawer().close() } }, a.incident_id)),
+      el('div', { class: 'row' }, statusSlot, authModeBadge(a.auth_mode), a.approver ? el('span', { class: 'muted small' }, 'approved by ', el('span', { class: 'mono' }, a.approver)) : null, el('span', { class: 'spacer' }), el('a', { class: 'mono', href: `#/baselines/${encodeURIComponent(a.host_id)}`, on: { click: () => drawer().close() } }, a.host_id), el('a', { class: 'mono dim', href: `#/investigations/${encodeURIComponent(a.incident_id)}`, title: a.incident_id, on: { click: () => drawer().close() } }, shortId(a.incident_id))),
       approveSlot,
       section('Typed parameters', verbParams(a.verb)),
       justification(a),
@@ -2551,12 +3255,38 @@ function startDashboard() {
   setInterval(poll, 15_000);
 }
 
+function setNavOpen(open) {
+  const shell = document.getElementById('shell');
+  shell.classList.toggle('nav-open', open);
+  document.getElementById('nav-open').setAttribute('aria-expanded', String(open));
+  if (open) document.querySelector('#nav a[aria-current="page"], #nav a')?.focus();
+}
+
 async function boot() {
   hydrateIcons();
+  applyTheme(document.documentElement.dataset.theme);
   document.getElementById('refresh-btn').addEventListener('click', () => refreshAll().then(() => toast('Refreshed')));
+  for (const b of document.querySelectorAll('[data-theme-choice]')) {
+    b.addEventListener('click', () => {
+      applyTheme(b.dataset.themeChoice);
+      store('defsec.theme', b.dataset.themeChoice);
+    });
+  }
+  document.getElementById('nav-open').addEventListener('click', () => setNavOpen(true));
+  document.getElementById('nav-close').addEventListener('click', () => setNavOpen(false));
+  document.getElementById('shell').addEventListener('click', (e) => {
+    // The scrim is the shell's ::after; a click on the shell itself closes the sheet.
+    if (e.target.id === 'shell') setNavOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.getElementById('shell').classList.contains('nav-open')) setNavOpen(false);
+  });
   window.addEventListener('hashchange', () => {
+    setNavOpen(false);
     render();
-    document.getElementById('main').focus({ preventScroll: true });
+    const main = document.getElementById('main');
+    main.focus({ preventScroll: true });
+    main.scrollTop = 0;
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'r' && dashboardStarted && !document.getElementById('shell').hidden && !e.metaKey && !e.ctrlKey && !e.altKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? '') && !drawer().open) {
