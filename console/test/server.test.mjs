@@ -825,6 +825,58 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
     }
   });
 
+  test('Phase 9 reasoner activity endpoints read the real control-d runs, events and trigger queue', async () => {
+    const admin = new AdminClient({ socketPath: adminSock });
+    const observer = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-observer', role: 'observer', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 300 });
+    assert.equal(observer.admin_result, 'token_minted', JSON.stringify(observer));
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: true });
+    const readOnly = createLiveBackend({ investigateSock: invSock, token: observer.token, adminSock, enableAdmin: false });
+    const a = await startConsole(backend);
+    const o = await startConsole(readOnly);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    try {
+      const open = track(await get(a.port, '/api/incidents')).json.incidents.find((i) => i.status === 'open' && i.host_id === HOST);
+      assert.ok(open, 'an open incident exists');
+      const session = track(await post(a.port, `/api/incidents/${open.incident_id}/runs`, {}));
+      assert.equal(session.status, 200, session.text);
+
+      for (const port of [a.port, o.port]) {
+        const runs = track(await get(port, `/api/runs?incident_id=${open.incident_id}`));
+        assert.equal(runs.status, 200, runs.text);
+        assert.equal(runs.json.available, true, `control-d Phase 9 runs must be readable: ${runs.text}`);
+        const mine = runs.json.runs.find((r) => r.run_id === session.json.run_id);
+        assert.ok(mine, runs.text);
+        assert.equal(mine.host_id, HOST);
+        assert.equal(mine.status, 'active');
+        assert.equal(mine.origin, 'operator');
+        assert.ok(Number.isFinite(Date.parse(mine.started_at)));
+        assert.equal(typeof mine.event_count, 'number');
+
+        const events = track(await get(port, `/api/runs/${session.json.run_id}/events`));
+        assert.equal(events.status, 200, events.text);
+        assert.equal(events.json.available, true);
+        assert.ok(Array.isArray(events.json.events));
+
+        const queue = track(await get(port, '/api/triggers'));
+        assert.equal(queue.status, 200, queue.text);
+        assert.equal(queue.json.available, true, queue.text);
+        assert.ok(queue.json.triggers.length >= 2, 'both incidents queued a trigger');
+        assert.ok(queue.json.triggers.every((t) => t.host_id === HOST && typeof t.retry_count === 'number'));
+        const pending = track(await get(port, '/api/triggers?status=pending'));
+        assert.ok(pending.json.triggers.every((t) => t.status === 'pending'));
+      }
+      assert.equal((await get(a.port, '/api/runs?incident_id=bad%20id')).status, 400);
+      for (const text of bodies) {
+        assert.ok(!text.includes(browseToken) && !text.includes(observer.token), 'token leaked');
+        assert.ok(!/lease_token|capability_token/.test(text), 'lease or capability token field leaked');
+      }
+    } finally {
+      await a.app.close();
+      await o.app.close();
+    }
+  });
+
   test('without --enable-admin, runs are refused instead of narrowing the shared token', async () => {
     const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: false });
     const { app, port } = await startConsole(backend);
