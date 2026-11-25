@@ -1035,6 +1035,47 @@ async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
         )
         .await;
     assert_eq!(allowed["decision"]["allowed"], true);
+    let mut watch = sockets_baseline();
+    watch["id"] = json!("operator-watch");
+    watch["class"] = json!("ephemeral");
+    watch["collector"]["parameters"]["include_udp"] = json!(true);
+    watch["incident_id"] = json!(incident_id);
+    watch["lifecycle"]["expires_at"] = json!(Utc::now() + chrono::Duration::minutes(15));
+    watch["lifecycle"]["max_runs"] = json!(20);
+    for (key, spec, expected) in [
+        ("valid-watch", watch, true),
+        ("baseline-watch", sockets_baseline(), false),
+    ] {
+        let proposal = client
+            .tool(
+                "propose_ephemeral_watch",
+                json!({
+                    "run_id":first_run, "idempotency_key":key,
+                    "spec":spec, "rationale":"Confirm socket state"
+                }),
+                false,
+            )
+            .await;
+        assert_eq!(proposal["result"], "proposal_evaluated");
+        assert_eq!(proposal["decision"]["allowed"], expected, "{proposal}");
+        if !expected {
+            assert_eq!(proposal["decision"]["rule_id"], "baseline.protected");
+        }
+    }
+    let denied = client
+        .tool(
+            "propose_expectation_rule",
+            json!({"run_id":first_run,"idempotency_key":"no-expiry","rule":expectation_rule(None)}),
+            false,
+        )
+        .await;
+    assert_eq!(denied["result"], "rule_proposal_evaluated");
+    assert_eq!(denied["decision"]["allowed"], false);
+    assert_eq!(
+        denied["decision"]["rule_id"],
+        "rule-gate/investigator-expiry"
+    );
+
     let action = client.tool("propose_action", json!({
         "run_id":first_run, "incident_id":incident_id, "idempotency_key":"action",
         "verb":{"verb":"nft_block_ip","ip":"203.0.113.99","ttl_seconds":60,"direction":"both"},
@@ -1066,6 +1107,8 @@ async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
         )
         .await;
     assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["proposals"], 5);
+    assert_eq!(finished["proposals_accepted"], 3);
     let cancelled = client
         .tool(
             "cancel_investigation",
@@ -1088,7 +1131,7 @@ async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
         let (offset, pairs) = if run == first_run {
             assert_eq!(events[0]["kind"], "note");
             assert_eq!(events[0]["detail"]["note"], "Inspect socket drift");
-            (1, 4)
+            (1, 7)
         } else {
             (0, 1)
         };
@@ -1112,11 +1155,251 @@ async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
         .iter()
         .find(|run| run["run_id"] == first_run)
         .unwrap()["outcome"];
-    assert_eq!(outcome["tool_calls"], 4);
+    assert_eq!(outcome["tool_calls"], 7);
     assert_eq!(outcome["findings"], 1);
-    assert_eq!(outcome["proposals"], 2);
-    assert_eq!(outcome["proposals_accepted"], 2);
+    assert_eq!(outcome["proposals"], finished["proposals"]);
+    assert_eq!(
+        outcome["proposals_accepted"],
+        finished["proposals_accepted"]
+    );
     server_task.abort();
+}
+
+// Serve real control responses for each RPC except the injected connection cuts.
+fn instrumented_socket(
+    socket: &std::path::Path,
+    service: ControlService,
+    mut drop_response: impl FnMut(&Request) -> bool + Send + 'static,
+) -> (
+    JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use defsec_protocol::wire::{read_frame, write_frame};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::UnixListener;
+
+    let listener = UnixListener::bind(socket).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let call: InvestigationCall = read_frame(&mut stream).await.unwrap().unwrap();
+            counter.fetch_add(1, Ordering::Relaxed);
+            if !drop_response(&call.request) {
+                let response = service.handle_investigation_call(call);
+                write_frame(&mut stream, &response).await.unwrap();
+            }
+        }
+    });
+    (task, calls)
+}
+
+fn denied_rule(run_id: &Value) -> Value {
+    json!({"run_id":run_id,"idempotency_key":"no-expiry","rule":expectation_rule(None)})
+}
+
+#[tokio::test]
+async fn operator_keeps_failed_start_reachable_for_terminal_cleanup() {
+    use defsec_protocol::rpc::RunEventKind;
+
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    seed_sockets_incident(&service);
+    let incident = fixture_incident(&service);
+    let token = mint_operator_fixture(&service, true, &[HOST]);
+    let socket = dir.0.join("investigate.sock");
+    let mut cut_cancel = true;
+    let (server, _) = instrumented_socket(&socket, service, move |request| match request {
+        Request::ReportRunProgress {
+            kind: RunEventKind::Note,
+            ..
+        } => true,
+        Request::CancelInvestigationRun { .. } => std::mem::take(&mut cut_cancel),
+        _ => false,
+    });
+    let mut client = Client::new(Mode::Operator, socket, token);
+    let start = client
+        .tool(
+            "start_investigation",
+            json!({"incident_id":incident,"note":"starting"}),
+            true,
+        )
+        .await;
+    assert_eq!(start["code"], "run_progress_failed");
+    let run = &start["run_id"];
+    assert!(run.is_string());
+    assert_eq!(
+        client
+            .tool("propose_expectation_rule", denied_rule(run), true)
+            .await["code"],
+        "run_cancel_pending"
+    );
+    assert_eq!(
+        client
+            .tool(
+                "cancel_investigation",
+                json!({"run_id":run,"reason":"cleanup"}),
+                false
+            )
+            .await["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        client
+            .tool(
+                "finish_investigation",
+                json!({"run_id":run,"summary":"late"}),
+                true
+            )
+            .await["code"],
+        "run_inactive"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn operator_reserves_event_slots_for_finish_and_rejects_unknown_finish_locally() {
+    use std::sync::atomic::Ordering;
+
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    seed_sockets_incident(&service);
+    let incident = fixture_incident(&service);
+    let token = mint_operator_fixture(&service, true, &[HOST]);
+    let socket = dir.0.join("investigate.sock");
+    let (server, calls) = instrumented_socket(&socket, service, |_| false);
+    let mut client = Client::new(Mode::Operator, socket, token);
+    let start = client
+        .tool(
+            "start_investigation",
+            json!({"incident_id":incident}),
+            false,
+        )
+        .await;
+    let run = &start["run_id"];
+    for _ in 0..127 {
+        let reply = client
+            .tool("propose_expectation_rule", denied_rule(run), false)
+            .await;
+        assert_eq!(reply["decision"]["allowed"], false, "{reply}");
+    }
+    let before = calls.load(Ordering::Relaxed);
+    assert_eq!(
+        client
+            .tool("propose_expectation_rule", denied_rule(run), true)
+            .await["code"],
+        "run_event_quota"
+    );
+    assert_eq!(
+        client
+            .tool(
+                "finish_investigation",
+                json!({"run_id":"foreign","summary":"unknown"}),
+                true
+            )
+            .await["code"],
+        "run_inactive"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), before);
+    let finished = client
+        .tool(
+            "finish_investigation",
+            json!({"run_id":run,"summary":"at quota"}),
+            false,
+        )
+        .await;
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["proposals"], 127);
+    let runs = client
+        .tool("list_investigation_runs", json!({}), false)
+        .await;
+    assert_eq!(runs["runs"][0]["event_count"], 256);
+    server.abort();
+}
+
+#[tokio::test]
+async fn operator_pins_event_budget_when_transport_cuts_the_operation_or_result_event() {
+    use defsec_protocol::rpc::RunEventKind;
+    use std::sync::atomic::Ordering;
+
+    for cut_operation in [true, false] {
+        let dir = TestDir::new();
+        let service = ControlService::open(&dir.0, "key", 1).unwrap();
+        seed_sockets_incident(&service);
+        let incident = fixture_incident(&service);
+        let token = mint_operator_fixture(&service, true, &[HOST]);
+        let socket = dir.0.join("investigate.sock");
+        let (server, calls) = instrumented_socket(&socket, service, move |request| {
+            if cut_operation {
+                matches!(request, Request::ProposeExpectationRule { .. })
+            } else {
+                matches!(
+                    request,
+                    Request::ReportRunProgress {
+                        kind: RunEventKind::ToolResult,
+                        ..
+                    }
+                )
+            }
+        });
+        let mut client = Client::new(Mode::Operator, socket, token);
+        let start = client
+            .tool(
+                "start_investigation",
+                json!({"incident_id":incident}),
+                false,
+            )
+            .await;
+        let run = &start["run_id"];
+        if cut_operation {
+            let failed = client
+                .request(
+                    "tools/call",
+                    json!({"name":"propose_expectation_rule","arguments":denied_rule(run)}),
+                )
+                .await;
+            assert_eq!(failed["error"]["code"], -32000);
+        } else {
+            let reply = client
+                .tool("propose_expectation_rule", denied_rule(run), false)
+                .await;
+            assert_eq!(reply["decision"]["allowed"], false);
+        }
+        let before = calls.load(Ordering::Relaxed);
+        assert_eq!(
+            client
+                .tool("propose_expectation_rule", denied_rule(run), true)
+                .await["code"],
+            "run_event_quota"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), before);
+        let finished = client
+            .tool(
+                "finish_investigation",
+                json!({"run_id":run,"summary":"transport cut"}),
+                false,
+            )
+            .await;
+        assert_eq!(finished["status"], "completed");
+        let timeline = client
+            .tool("get_run_events", json!({"run_id":run}), false)
+            .await;
+        let events = timeline["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["kind"], "tool_call");
+        assert_eq!(events[0]["detail"]["tool"], "propose_expectation_rule");
+        assert_eq!(events[1]["detail"]["tool"], "finish_investigation");
+        assert_eq!(events[2]["kind"], "tool_result");
+        assert_eq!(
+            events[2]["detail"]["request_id"],
+            events[1]["detail"]["request_id"]
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]
