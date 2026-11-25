@@ -336,7 +336,11 @@ impl ControlService {
             }
             Err(error) => {
                 let (code, message) = error.response_parts();
-                AdminResponse::Error { code, message }
+                AdminResponse::Error {
+                    code,
+                    message,
+                    decision: None,
+                }
             }
         }
     }
@@ -473,6 +477,7 @@ impl ControlService {
                     return Ok(AdminResponse::Error {
                         code: decision.rule_id,
                         message: decision.reason,
+                        decision: None,
                     });
                 }
                 insert_watch(db, &spec, &actor, now)?;

@@ -170,12 +170,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       .sort((a, b) => (b.proposal_id ?? 0) - (a.proposal_id ?? 0));
   }
 
-  /**
-   * Admin rule ops whose denial is a gate verdict, not a failure: control-d
-   * answers `Error { code: "rule-gate/<id>", message: <reason> }` (and, for
-   * create/decide, records a PolicyDecision row). Surface it as the decision.
-   */
-  async function ruleGateCall(request, expected, actor = null) {
+  async function ruleGateCall(request, expected) {
     if (!admin) throw new ApiError(403, 'admin_disabled', 'admin interface is disabled (start the console with --enable-admin --admin-sock)');
     let resp;
     try {
@@ -184,21 +179,10 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       throw transportError(err);
     }
     if (resp?.admin_result === 'error' && isRuleGateCode(resp.code)) {
-      return { denied: { allowed: false, rule_id: resp.code, reason: resp.message ?? '', policy_version: await recordedPolicyVersion(resp.code, actor) } };
+      // Older control-d versions still provide the code and reason.
+      return { denied: resp.decision ?? { allowed: false, rule_id: resp.code, reason: resp.message ?? '', policy_version: null } };
     }
     return { value: unwrap(resp, 'admin_result', expected) };
-  }
-
-  /** The error frame carries no policy_version; read it back from the row control-d just recorded. */
-  async function recordedPolicyVersion(ruleId, actor) {
-    if (!actor) return null;
-    try {
-      const r = await adminCall({ admin_op: 'list_policy_decisions', limit: 20 }, 'policy_decisions');
-      const hit = r.decisions.filter((d) => d.decision?.rule_id === ruleId && d.actor === actor).sort((a, b) => b.decision_id - a.decision_id)[0];
-      return hit?.decision?.policy_version ?? null;
-    } catch {
-      return null;
-    }
   }
 
   return {
@@ -517,7 +501,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
 
     async createRule(body = {}) {
       const { rule, actor } = parseRuleBody(body, { actor: true });
-      const r = await ruleGateCall({ admin_op: 'create_expectation_rule', rule, actor }, 'rule_decided', actor);
+      const r = await ruleGateCall({ admin_op: 'create_expectation_rule', rule, actor }, 'rule_decided');
       if (r.denied) return { allowed: false, decision: r.denied, rule_id: null, status: null, rule };
       return { allowed: true, decision: null, rule_id: r.value.rule_id, status: r.value.status, rule };
     },
@@ -527,7 +511,7 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       const d = parseRuleDecision(body);
       const request = { admin_op: 'decide_expectation_rule', rule_id, approve: d.approve, actor: d.actor };
       if (d.note !== null) request.note = d.note;
-      const r = await ruleGateCall(request, 'rule_decided', d.actor);
+      const r = await ruleGateCall(request, 'rule_decided');
       if (r.denied) return { allowed: false, decision: r.denied, rule_id, status: 'proposed' };
       return { allowed: true, decision: null, rule_id: r.value.rule_id, status: r.value.status };
     },

@@ -178,6 +178,8 @@ Admin interface:
 * `BacktestExpectationRule { rule }`. Response: `RuleBacktestResult { backtest: RuleBacktest }`.
 * `ListExpectationRules { host_id, statuses, limit }`. Response: `ExpectationRules { .. }`.
 
+Create, approval and backtest gate denials return `Error { code, message, decision: PolicyDecision }`. The decision contains the policy version used for that request. Other admin failures omit `decision`.
+
 Shared types:
 
 ```rust

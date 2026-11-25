@@ -976,3 +976,41 @@ fn investigator_backtest_scope_includes_own_incident_and_baseline() {
     // baseline watch + own ephemeral = 2 (base empty? Actually baseline watch obs seq1 empty + seq2 nx; plus own ephemeral obs = 3?) 
     assert_eq!(bt.observations_scanned, 3);
 }
+
+#[test]
+fn admin_rule_gate_denials_return_the_decision_for_each_operation() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let mut invalid = allow("expected.service");
+    invalid.matches.clear();
+    let create = f.admin(AdminRequest::CreateExpectationRule {
+        rule: invalid.clone(),
+        actor: "operator".into(),
+    });
+    let backtest = f.admin(AdminRequest::BacktestExpectationRule { rule: invalid });
+
+    f.put(1, vec![]);
+    f.put(2, vec![socket("unexpected.service", 22)]);
+    let (token, run) = f.run(&f.incident());
+    let mut rule = allow("expected.service");
+    rule.expires_at = Some(Utc::now() + Duration::days(1));
+    let (id, _) = proposal_result(f.propose(&token, &run, "approval", rule.clone()));
+    rule.expires_at = Some(Utc::now() - Duration::days(1));
+    f.db()
+        .execute(
+            "UPDATE expectation_rules SET spec_json=?2 WHERE rule_id=?1",
+            params![id, serde_json::to_string(&rule).unwrap()],
+        )
+        .unwrap();
+    let approve = f.decide(&id, true);
+
+    for response in [create, backtest, approve] {
+        let AdminResponse::Error { code, message, decision: Some(decision) } = response else {
+            panic!("{response:?}")
+        };
+        assert!(!decision.allowed);
+        assert_eq!(decision.policy_version, 3);
+        assert_eq!(decision.rule_id, code);
+        assert_eq!(decision.reason, message);
+    }
+    assert!(matches!(f.decide("rule-missing", true), AdminResponse::Error { decision: None, .. }));
+}

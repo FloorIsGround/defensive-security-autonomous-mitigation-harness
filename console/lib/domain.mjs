@@ -764,5 +764,5 @@ export function publicRuleRecord(r) {
   };
 }
 
-/** control-d answers a denied admin rule op with `Error { code: "rule-gate/…", message: reason }`. */
+/** Identify legacy and current admin rule gate errors. */
 export const isRuleGateCode = (code) => typeof code === 'string' && code.startsWith('rule-gate/');

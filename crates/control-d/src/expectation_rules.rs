@@ -532,8 +532,9 @@ fn canonical_spec(rule: &ExpectationRuleSpec) -> Result<String> {
 
 fn decision_error(decision: PolicyDecision) -> AdminResponse {
     AdminResponse::Error {
-        code: decision.rule_id,
-        message: decision.reason,
+        code: decision.rule_id.clone(),
+        message: decision.reason.clone(),
+        decision: Some(decision),
     }
 }
 

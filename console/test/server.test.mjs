@@ -925,7 +925,7 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
       assert.equal(wildcard.status, 200, wildcard.text);
       assert.equal(wildcard.json.allowed, false);
       assert.equal(wildcard.json.decision.rule_id, 'rule-gate/wildcard-bind');
-      assert.equal(typeof wildcard.json.decision.policy_version, 'number', 'policy_version is read back from the recorded decision');
+      assert.equal(typeof wildcard.json.decision.policy_version, 'number', 'policy_version comes from the gate response');
       const unknownHost = track(await post(a.port, '/api/admin/rules/backtest', { rule: rule({ scope: { host_id: 'edge-nope', collector: 'sockets.listening', watch_id: null } }) }));
       assert.equal(unknownHost.status, 404, unknownHost.text);
       assert.equal(track(await post(a.port, '/api/admin/rules', { rule: { ...rule(), extra: 1 }, actor: 'it-operator' })).status, 400);
@@ -2565,6 +2565,7 @@ describe('expectation rules over a mock control-d', () => {
       backtest: { observations_scanned: 3, triggered_before: 2, triggered_after: 0, items_matched: 1, sample_keys: ['tcp:0.0.0.0:4444:uid=0'], currently_matching: 1 },
       created_at: now, decided_by: null, decided_at: null, decision_note: null, hit_count: 0, last_matched_at: null,
     };
+    const denial = (code, message, policy_version) => ({ admin_result: 'error', code, message, decision: { allowed: false, rule_id: code, reason: message, policy_version } });
     const invSeen = [];
     const admSeen = [];
     const invSrv = await mockUdsServer(inv, (frame) => {
@@ -2578,16 +2579,14 @@ describe('expectation rules over a mock control-d', () => {
           return { admin_result: 'expectation_rules', rules: [record] };
         case 'backtest_expectation_rule':
           return frame.rule.matches.length === 1
-            ? { admin_result: 'error', code: 'rule-gate/identity-anchor', message: 'rule must constrain systemd_unit, comm, or uid with eq or in' }
+            ? denial('rule-gate/identity-anchor', 'rule must constrain systemd_unit, comm, or uid with eq or in', 6)
             : { admin_result: 'rule_backtest_result', backtest: record.backtest };
         case 'create_expectation_rule':
           return frame.rule.matches.length === 1
-            ? { admin_result: 'error', code: 'rule-gate/port-bounds', message: 'socket rule must constrain local_port within the allowed bounds' }
+            ? denial('rule-gate/port-bounds', 'socket rule must constrain local_port within the allowed bounds', 7)
             : { admin_result: 'rule_decided', rule_id: 'rule-new', status: 'active' };
-        case 'list_policy_decisions':
-          return { admin_result: 'policy_decisions', decisions: [{ decision_id: 9, proposal_id: null, actor: 'op', request_id: 'r', decision: { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'x', policy_version: 7 }, created_at: now }] };
         case 'decide_expectation_rule':
-          return { admin_result: 'rule_decided', rule_id: frame.rule_id, status: frame.approve ? 'active' : 'rejected' };
+          return frame.approve ? denial('rule-gate/expired', 'rule has expired', 8) : { admin_result: 'rule_decided', rule_id: frame.rule_id, status: 'rejected' };
         case 'revoke_expectation_rule':
           return frame.rule_id === 'rule-gone' ? { admin_result: 'error', code: 'not_found', message: 'expectation rule does not exist' } : { admin_result: 'rule_decided', rule_id: frame.rule_id, status: 'revoked' };
         default:
@@ -2621,16 +2620,19 @@ describe('expectation rules over a mock control-d', () => {
       assert.deepEqual(bt.json.backtest, record.backtest);
       const btDenied = track(await post(rw.port, '/api/admin/rules/backtest', { rule: { ...rule, matches: [{ op: 'eq', field: 'local_port', value: 4444 }] } }));
       assert.equal(btDenied.status, 200);
-      assert.deepEqual(btDenied.json.decision, { allowed: false, rule_id: 'rule-gate/identity-anchor', reason: 'rule must constrain systemd_unit, comm, or uid with eq or in', policy_version: null });
+      assert.deepEqual(btDenied.json.decision, { allowed: false, rule_id: 'rule-gate/identity-anchor', reason: 'rule must constrain systemd_unit, comm, or uid with eq or in', policy_version: 6 });
 
       const created = track(await post(rw.port, '/api/admin/rules', { rule, actor: 'op' }));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'create_expectation_rule', rule, actor: 'op' });
       assert.deepEqual([created.json.allowed, created.json.rule_id, created.json.status], [true, 'rule-new', 'active']);
       const cDenied = track(await post(rw.port, '/api/admin/rules', { rule: { ...rule, matches: [{ op: 'eq', field: 'comm', value: 'x' }] }, actor: 'op' }));
       assert.equal(cDenied.status, 200);
-      assert.deepEqual(cDenied.json.decision, { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'socket rule must constrain local_port within the allowed bounds', policy_version: 7 }, 'policy_version read back from the recorded decision');
+      assert.deepEqual(cDenied.json.decision, { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'socket rule must constrain local_port within the allowed bounds', policy_version: 7 });
 
-      track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: true, actor: 'op' }));
+      const approval = track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: true, actor: 'op' }));
+      assert.deepEqual(approval.json.decision, { allowed: false, rule_id: 'rule-gate/expired', reason: 'rule has expired', policy_version: 8 });
+      assert.equal(approval.json.status, 'proposed');
+      assert.ok(!admSeen.some((f) => f.admin_op === 'list_policy_decisions'));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'decide_expectation_rule', rule_id: 'rule-abc', approve: true, actor: 'op' }, 'a null note is omitted');
       track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: false, note: 'noisy', actor: 'op' }));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'decide_expectation_rule', rule_id: 'rule-abc', approve: false, actor: 'op', note: 'noisy' });
