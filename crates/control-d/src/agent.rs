@@ -632,6 +632,21 @@ fn trigger(
     } else {
         let incident = if let Some(incident) = &spec.incident_id {
             incident.clone()
+        } else if let Some(existing) = db
+            .query_row(
+                "SELECT i.incident_id FROM trigger_events t JOIN incidents i USING (incident_id)
+                WHERE t.host_id=?1 AND t.watch_id=?2 AND i.status='open' AND i.is_liveness=0
+                ORDER BY i.updated_at DESC LIMIT 1",
+                params![spec.host_id, spec.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            db.execute(
+                "UPDATE incidents SET summary=?2, updated_at=?3 WHERE incident_id=?1",
+                params![existing, reason, stamp(now)],
+            )?;
+            existing
         } else {
             let incident = uuid();
             let severity = if health {
