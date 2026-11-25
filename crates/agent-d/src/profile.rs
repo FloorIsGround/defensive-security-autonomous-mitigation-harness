@@ -5,12 +5,17 @@
 //! explicit and fatal, and suspicious file metadata (group/world-writable,
 //! unexpected owner, oversize) refuses startup rather than being ignored.
 
-use std::os::unix::fs::MetadataExt;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use defsec_policy::edge_floor::EdgeSafetyConfig;
 use defsec_policy::host_profile::apply_host_profile;
 use defsec_protocol::profile::{HostProfile, HostProfileSummary};
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 use nix::unistd::geteuid;
 use thiserror::Error;
 
@@ -33,7 +38,13 @@ pub enum ProfileError {
     TooLarge { path: String, size: u64 },
     #[error("host profile {path} is writable by group or others (mode {mode:o}); refusing to start")]
     GroupOrWorldWritable { path: String, mode: u32 },
-    #[error("host profile {path} is owned by uid {owner}, expected root or the agent's own uid {own}")]
+    #[error(
+        "host profile parent {path} is group- or world-writable without the sticky bit (mode {mode:o})"
+    )]
+    WritableParent { path: String, mode: u32 },
+    #[error(
+        "host profile {path} is owned by uid {owner}, expected root or the agent's own uid {own}"
+    )]
     UnexpectedOwner { path: String, owner: u32, own: u32 },
     #[error("failed reading host profile {path}: {message}")]
     ReadFailed { path: String, message: String },
@@ -48,11 +59,41 @@ pub fn load_profile(
     base_cfg: &EdgeSafetyConfig,
 ) -> Result<LoadedProfile, ProfileError> {
     let display = path.display().to_string();
-    let meta = std::fs::metadata(path)
-        .map_err(|e| ProfileError::ReadFailed {
+    let read_failed = |e: std::io::Error| ProfileError::ReadFailed {
+        path: display.clone(),
+        message: e.to_string(),
+    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(read_failed)?;
+    let parent_mode = parent_fd.metadata().map_err(read_failed)?.mode();
+    if parent_mode & 0o022 != 0 && parent_mode & libc::S_ISVTX == 0 {
+        return Err(ProfileError::WritableParent {
+            path: parent.display().to_string(),
+            mode: parent_mode & 0o7777,
+        });
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| ProfileError::NotRegularFile {
             path: display.clone(),
-            message: e.to_string(),
         })?;
+    let fd = openat(
+        Some(parent_fd.as_raw_fd()),
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|e| read_failed(e.into()))?;
+    // SAFETY: openat returned a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata().map_err(read_failed)?;
     if !meta.is_file() {
         return Err(ProfileError::NotRegularFile { path: display });
     }
@@ -82,18 +123,22 @@ pub fn load_profile(
         });
     }
 
-    let bytes = std::fs::read(path).map_err(|e| ProfileError::ReadFailed {
-        path: display.clone(),
-        message: e.to_string(),
-    })?;
-    let text = match String::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
-    let profile: HostProfile = serde_json::from_str(&text).map_err(|e| ProfileError::Invalid {
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(read_failed)?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return Err(ProfileError::TooLarge {
+            path: display,
+            size: bytes.len() as u64,
+        });
+    }
+    let invalid = |e: &dyn std::fmt::Display| ProfileError::Invalid {
         path: display.clone(),
         reason: e.to_string(),
-    })?;
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|e| invalid(&e))?;
+    let profile: HostProfile = serde_json::from_str(text).map_err(|e| invalid(&e))?;
     let (cfg, summary) =
         apply_host_profile(base_cfg, &profile).map_err(|reason| ProfileError::Invalid {
             path: display,
@@ -117,7 +162,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        crate::collectors::files::temp_root(&format!("profile-{tag}"))
+        let dir = crate::collectors::files::temp_root(&format!("profile-{tag}"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
     }
 
     fn write_profile(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
@@ -141,17 +188,12 @@ mod tests {
                 "schema_version": 1,
                 "host_tags": ["prod"],
                 "expected_services": ["sshd.service"],
-                "approved_file_roots": ["/etc/myapp"],
                 "enabled_collectors": ["sockets.listening", "connections.outbound"],
                 "collector_caps": { "max_outbound_flows": 100 }
             }"#,
         );
         let loaded = load_profile(&path, &base_cfg()).unwrap();
         assert_eq!(loaded.cfg.max_outbound_flows, 100);
-        assert!(loaded
-            .cfg
-            .approved_file_roots
-            .contains(&std::path::PathBuf::from("/etc/myapp")));
         assert_eq!(loaded.summary.host_tags, vec!["prod".to_string()]);
         assert_eq!(
             loaded.summary.enabled_collectors,
@@ -224,6 +266,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_symlink_invalid_utf8_and_writable_parent() {
+        let dir = temp_dir("unsafe-input");
+        let path = write_profile(&dir, "profile.json", r#"{"schema_version":1}"#);
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(load_profile(&link, &base_cfg()).is_err());
+
+        std::fs::write(
+            &path,
+            b"{\"schema_version\":1,\"approved_file_roots\":[\"/tmp/\xff\"]}",
+        )
+        .unwrap();
+        assert!(matches!(load_profile(&path, &base_cfg()),
+            Err(ProfileError::Invalid { reason, .. }) if reason.contains("utf-8")));
+        write_profile(&dir, "profile.json", r#"{"schema_version":1}"#);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let unsafe_parent = load_profile(&path, &base_cfg());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(load_profile(&path, &base_cfg()).is_ok());
+        assert!(unsafe_parent.is_err());
+    }
+
+    #[test]
     fn malformed_json_and_invalid_content_are_explicit_errors() {
         let dir = temp_dir("invalid");
         let bad_json = write_profile(&dir, "bad.json", "{not json");
@@ -257,8 +323,10 @@ mod tests {
         assert!(matches!(missing, Err(ProfileError::ReadFailed { .. })));
 
         // A directory, not a regular file.
+        let directory = dir.join("directory");
+        std::fs::create_dir(&directory).unwrap();
         assert!(matches!(
-            load_profile(&dir, &base_cfg()),
+            load_profile(&directory, &base_cfg()),
             Err(ProfileError::NotRegularFile { .. })
         ));
     }

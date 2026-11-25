@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use defsec_policy::edge_floor::{
-    validate_bundle, BundleHighWaterMark, BundleValidationOutcome, EdgeSafetyConfig,
+    BundleHighWaterMark, BundleValidationOutcome, EdgeSafetyConfig, validate_bundle,
+    validate_cached_bundle,
 };
 use defsec_policy::predicate::SustainedCounterState;
 use defsec_protocol::observation::{ObservationPayload, ObservationRecord, ObservationStatus};
@@ -185,6 +186,7 @@ pub struct AgentEngine<C: CollectorBackend> {
     previous_session_id: Option<String>,
     next_seq_no: u64,
     active_bundle: Option<ActiveBundle>,
+    cached_bundle_rejection: Option<AgentToControl>,
     hwm: Option<BundleHighWaterMark>,
     stale_desired_state: bool,
     boot_id: String,
@@ -225,6 +227,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
         // Cached verified bundle (verified BEFORE trusting it).
         let mut active_bundle: Option<ActiveBundle> = None;
         let mut hwm: Option<BundleHighWaterMark> = None;
+        let mut cached_bundle_rejection = None;
         if let Some(envelope) = load_json::<SignedEnvelope>(&state_dir.join(BUNDLE_FILE))
             && let Ok((payload, digest)) = self_verify(&store, &envelope)
         {
@@ -239,10 +242,26 @@ impl<C: CollectorBackend> AgentEngine<C> {
                         payload_digest: digest.clone(),
                     })
                 });
-            active_bundle = Some(ActiveBundle {
-                payload,
-                payload_digest: digest,
-            });
+            match validate_cached_bundle(&payload, &host_id, &cfg, now) {
+                Ok(()) => {
+                    active_bundle = Some(ActiveBundle {
+                        payload,
+                        payload_digest: digest,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, bundle_version = payload.bundle_version, "cached bundle rejected");
+                    cached_bundle_rejection = Some(AgentToControl::BundleAck {
+                        host_id: host_id.clone(),
+                        bundle_id: payload.bundle_id,
+                        bundle_version: payload.bundle_version,
+                        payload_digest: digest,
+                        status: BundleAckStatus::Rejected,
+                        reason: Some(format!("cached bundle rejected: {error}")),
+                        acked_at: now,
+                    });
+                }
+            }
         }
 
         // Journal cursors: durable profile only — cursors are checkpointed
@@ -279,7 +298,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
 
         // Preserve baseline monitoring while disconnected, but retire
         // ephemeral watches conservatively once the bundle itself expired.
-        let mut stale_desired_state = false;
+        let mut stale_desired_state = cached_bundle_rejection.is_some();
         if let Some(bundle) = &active_bundle {
             let skew = cfg.max_clock_skew_seconds;
             if bundle.payload.expires_at + Duration::seconds(skew) < now {
@@ -304,6 +323,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
             previous_session_id,
             next_seq_no: 1,
             active_bundle,
+            cached_bundle_rejection,
             hwm,
             stale_desired_state,
             boot_id,
@@ -441,15 +461,20 @@ impl<C: CollectorBackend> AgentEngine<C> {
     ) -> Vec<AgentToControl> {
         match msg {
             ControlToAgent::RegisterAck {
-                last_acked_seq_no, ..
+                accepted: true,
+                last_acked_seq_no,
+                ..
             } => {
                 // The control plane durably committed up to this sequence
                 // number of the PREVIOUS session; prune its spooled records.
                 if let Some(prev) = self.previous_session_id.clone() {
                     let _ = self.spool.prune_acked(&prev, last_acked_seq_no);
                 }
-                Vec::new()
+                self.cached_bundle_rejection.iter().cloned().collect()
             }
+            ControlToAgent::RegisterAck {
+                accepted: false, ..
+            } => Vec::new(),
             ControlToAgent::ObservationAck {
                 session_id,
                 acked_seq_no,
@@ -506,7 +531,9 @@ impl<C: CollectorBackend> AgentEngine<C> {
             &self.cfg,
             now,
         ) {
-            Ok(BundleValidationOutcome::IdenticalRetransmission) => {
+            Ok(BundleValidationOutcome::IdenticalRetransmission)
+                if self.active_bundle_digest() == Some(digest.as_str()) =>
+            {
                 AgentToControl::BundleAck {
                     host_id: self.host_id.clone(),
                     bundle_id: payload.bundle_id.clone(),
@@ -517,7 +544,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     acked_at: now,
                 }
             }
-            Ok(BundleValidationOutcome::AcceptNew) => {
+            Ok(_) => {
                 let bundle_id = payload.bundle_id.clone();
                 let bundle_version = payload.bundle_version;
 
@@ -577,6 +604,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     payload_digest: digest.clone(),
                 });
                 self.stale_desired_state = false;
+                self.cached_bundle_rejection = None;
                 self.reconcile_requested.clear();
                 let _ = self.persist_agent_state();
                 let _ = self.persist_cursors();

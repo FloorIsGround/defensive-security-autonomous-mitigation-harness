@@ -173,7 +173,7 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
     // Open the approved root as a directory fd.
     let root_fd = match open(
         root,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
     .map_err(std::io::Error::from)
@@ -198,6 +198,25 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
             return entry;
         }
     };
+
+    let check_opened_path = || {
+        let real = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map_err(|e| format!("resolving opened file failed: {e}"))?;
+        let actual = real.to_str().ok_or("opened file path is not UTF-8")?;
+        validate_file_path(actual, cfg)?;
+        if real != path {
+            return Err(format!(
+                "opened file resolved to a different path: {real:?}"
+            ));
+        }
+        Ok(())
+    };
+    if let Err(reason) = check_opened_path() {
+        let _ = close(fd);
+        entry.status = ObservationStatus::Error;
+        entry.detail = Some(reason);
+        return entry;
+    }
 
     let stat: FileStat = match fstat(fd) {
         Ok(s) => s,
@@ -431,6 +450,24 @@ mod tests {
         let outside_entry = snap.files.iter().find(|f| f.path == "/etc/passwd").unwrap();
         assert_eq!(outside_entry.status, ObservationStatus::Error);
         assert!(outside_entry.detail.as_deref().unwrap().contains("approved file roots"));
+    }
+
+    #[tokio::test]
+    async fn rejects_opened_path_when_approved_root_ancestor_is_replaced() {
+        let parent = temp_root("files-root-swap");
+        let root = parent.join("public/config");
+        let denied = parent.join("private");
+        write_file(&root.join("app.conf"), b"safe");
+        write_file(&denied.join("config/app.conf"), b"secret");
+        let mut cfg = test_cfg(&root);
+        cfg.denied_path_prefixes.push(denied.clone());
+
+        std::fs::rename(parent.join("public"), parent.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&denied, parent.join("public")).unwrap();
+        let entry = file_entry(root.join("app.conf").to_str().unwrap(), &cfg, true, 1024);
+        assert_eq!(entry.status, ObservationStatus::Error);
+        assert!(entry.detail.unwrap().contains("denylist"));
+        assert!(entry.sha256.is_none());
     }
 
     #[tokio::test]

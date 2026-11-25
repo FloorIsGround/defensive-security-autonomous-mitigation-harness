@@ -1046,6 +1046,7 @@ async fn truncated_outbound_snapshot_reports_partial_with_explicit_reason() {
 }
 
 fn write_profile_file(dir: &Path, contents: &str) -> PathBuf {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.join("profile.json");
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(contents.as_bytes()).unwrap();
@@ -1163,5 +1164,57 @@ async fn register_reports_host_profile_summary_when_present() {
                 .contains(&defsec_protocol::watch::CollectorType::ConnectionsOutbound));
         }
         other => panic!("expected register, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tighter_profile_rejects_cached_bundle_and_identical_retransmission() {
+    let kp = key_pair();
+    let dir = state_dir("profile-cache-reject");
+    let now = Utc::now();
+    let msg = sync_bundle_msg(&kp, HOST, 2, vec![outbound_watch("w-out")]);
+    let mut original = engine_with(&kp, &dir, fake_sockets_host(0), false);
+    assert!(matches!(
+        original.handle_control(msg.clone(), now).await.as_slice(),
+        [AgentToControl::BundleAck {
+            status: BundleAckStatus::Accepted,
+            ..
+        }]
+    ));
+    drop(original);
+
+    let profile_path = write_profile_file(
+        &dir,
+        r#"{"schema_version":1,"enabled_collectors":["sockets.listening"]}"#,
+    );
+    let loaded = load_profile(&profile_path, &EdgeSafetyConfig::default()).unwrap();
+    let mut restarted = engine_with_cfg(&kp, &dir, fake_sockets_host(0), false, loaded.cfg);
+    assert_eq!(restarted.active_bundle_version(), 0);
+    assert!(restarted.watch_ids().is_empty());
+    assert!(restarted.stale_desired_state());
+    assert!(
+        restarted
+            .run_due_watches(now + Duration::seconds(90))
+            .await
+            .is_empty()
+    );
+
+    let registration = ControlToAgent::RegisterAck {
+        protocol_version: defsec_protocol::wire::WIRE_PROTOCOL_VERSION,
+        accepted: true,
+        reason: None,
+        server_time: now,
+        last_acked_seq_no: 0,
+    };
+    for incoming in [registration, msg] {
+        let reply = restarted.handle_control(incoming, now).await;
+        assert!(
+            matches!(
+                reply.as_slice(),
+                [AgentToControl::BundleAck { status: BundleAckStatus::Rejected, reason: Some(reason), .. }]
+                    if reason.contains("w-out") && reason.contains("connections.outbound")
+            ),
+            "{reply:?}"
+        );
     }
 }
