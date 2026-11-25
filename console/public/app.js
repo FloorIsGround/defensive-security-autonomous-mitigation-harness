@@ -69,7 +69,7 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = t;
   for (const b of document.querySelectorAll('[data-theme-choice]')) b.setAttribute('aria-pressed', String(b.dataset.themeChoice === t));
 }
-applyTheme(stored('defsec.theme', 'light'));
+applyTheme(stored('defsec.theme', 'dark'));
 class HttpError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -1022,14 +1022,36 @@ function socketsTable(d, prevSockets, filterKey = null, incidentId = null) {
   const added = d.sockets.filter(isAdded).sort(byPort);
   const removed = (prevSockets ? prevSockets.filter((s) => !curKeys.has(s.socket_key)) : markers?.removed ?? []).sort(byPort);
   const rest = d.sockets.filter((s) => !isAdded(s)).sort(byPort);
-  const rows = [...added.map((s) => [s, 'new']), ...removed.map((s) => [s, 'gone']), ...rest.map((s) => [s, null])];
+  const diffRows = [...added.map((s) => [s, 'new']), ...removed.map((s) => [s, 'gone'])];
+  const rows = [...diffRows, ...rest.map((s) => [s, null])];
+  const hasDiff = diffRows.length > 0 && rest.length > 0;
+  let showAll = !hasDiff;
+  let currentQuery = filterKey ? state.tableFilters.get(filterKey) ?? '' : '';
 
   const tbody = el('tbody');
   const countNode = el('span', { class: 'count' });
+  const toggleBtn = hasDiff
+    ? el(
+        'button',
+        {
+          class: 'btn btn-sm',
+          type: 'button',
+          on: {
+            click: () => {
+              showAll = !showAll;
+              draw(currentQuery);
+            },
+          },
+        },
+        `Show all ${d.sockets.length} (${rest.length} unchanged)`,
+      )
+    : null;
   const text = (s) => [s.protocol, sockAddr(s), s.pid, s.comm, s.systemd_unit, s.uid].filter((v) => v != null).join(' ').toLowerCase();
   const draw = (q = '') => {
+    currentQuery = q;
     const needle = q.trim().toLowerCase();
-    const shown = needle ? rows.filter(([s]) => text(s).includes(needle)) : rows;
+    const base = needle || showAll ? rows : diffRows;
+    const shown = needle ? base.filter(([s]) => text(s).includes(needle)) : base;
     replace(
       tbody,
       shown.map(([s, mark]) =>
@@ -1047,19 +1069,26 @@ function socketsTable(d, prevSockets, filterKey = null, incidentId = null) {
       ),
       shown.length ? null : el('tr', null, el('td', { attrs: { colspan: '7' }, class: 'muted' }, 'No sockets match this filter.')),
     );
+    if (toggleBtn) {
+      toggleBtn.textContent = showAll ? `Changes only (${diffRows.length})` : `Show all ${d.sockets.length} (${rest.length} unchanged)`;
+    }
     const delta = prevKeys || markers ? ` · ${added.length} added · ${removed.length} removed${markers ? ' vs reference' : ''}` : '';
-    countNode.textContent = needle ? `${shown.length} of ${d.sockets.length} sockets${delta}` : `${d.sockets.length} sockets${delta}`;
+    countNode.textContent = needle
+      ? `${shown.length} of ${d.sockets.length} sockets${delta}`
+      : showAll
+        ? `${d.sockets.length} sockets${delta}`
+        : `${diffRows.length} changed of ${d.sockets.length} sockets`;
   };
 
-  let tools = el('div', { class: 'ptools' }, countNode);
+  let tools = el('div', { class: 'ptools' }, countNode, toggleBtn);
   if (rows.length > 12) {
-    const input = el('input', { type: 'search', placeholder: 'Filter port, process, unit…', value: filterKey ? state.tableFilters.get(filterKey) ?? '' : '', attrs: { 'aria-label': 'Filter sockets' } });
+    const input = el('input', { type: 'search', placeholder: 'Filter port, process, unit…', value: currentQuery, attrs: { 'aria-label': 'Filter sockets' } });
     input.addEventListener('input', () => {
       if (filterKey) state.tableFilters.set(filterKey, input.value);
       draw(input.value);
     });
-    tools = el('div', { class: 'ptools' }, el('label', { class: 'search' }, icon('search'), input), countNode);
-    draw(input.value);
+    tools = el('div', { class: 'ptools' }, el('label', { class: 'search' }, icon('search'), input), countNode, toggleBtn);
+    draw(currentQuery);
   } else {
     draw();
   }
@@ -1814,6 +1843,9 @@ function actionComposer(inc, run, ev) {
 
   function draw() {
     syncDefaults();
+    if (!ev.selected.size && ev.obs.length) {
+      evidenceToggle(ev.obs[0].observation_id, true, ev);
+    }
     const seg = el(
       'div',
       { class: 'seg', attrs: { role: 'group', 'aria-label': 'Mitigation verb' } },
@@ -1830,6 +1862,18 @@ function actionComposer(inc, run, ev) {
       },
       'Cite latest',
     );
+    const justification = el(
+      'details',
+      { class: 'more' },
+      el('summary', null, 'Review audit justification (auto-filled)'),
+      el(
+        'div',
+        { class: 'stack' },
+        textField('expected_effect', 'Expected effect', 2),
+        textField('blast_radius', 'Blast radius', 2),
+        textField('rollback_plan', 'Rollback plan', 2),
+      ),
+    );
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to action gate');
     const form = el(
       'form',
@@ -1837,9 +1881,7 @@ function actionComposer(inc, run, ev) {
       field('Action', seg),
       verbFields(),
       el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence', citeLatest), evNode, evHint),
-      textField('expected_effect', 'Expected effect'),
-      textField('blast_radius', 'Blast radius'),
-      textField('rollback_plan', 'Rollback plan'),
+      justification,
       el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
     );
     form.addEventListener('submit', async (e) => {
