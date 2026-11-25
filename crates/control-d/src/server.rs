@@ -162,7 +162,15 @@ impl UnixServer {
             let service = service.clone();
             async move {
                 while let Some(call) =
-                    timeout(IO_TIMEOUT, read_frame::<_, InvestigationCall>(&mut stream)).await??
+                    timeout(IO_TIMEOUT, read_frame::<_, InvestigationCall>(&mut stream))
+                        .await?
+                        // Decoder errors can include excerpts from the incoming frame.
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid investigation frame",
+                            )
+                        })?
                 {
                     let response = spawn_blocking({
                         let service = service.clone();

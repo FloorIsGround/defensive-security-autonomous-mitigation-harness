@@ -39,6 +39,8 @@ pub struct ScopedCapability {
     pub run_id: Option<String>,
     #[serde(default)]
     pub incident_id: Option<String>,
+    #[serde(default)]
+    pub may_spawn_runs: bool,
     pub allowed_hosts: Vec<String>,
     pub allowed_collectors: Vec<CollectorType>,
     pub expires_at: DateTime<Utc>,
@@ -83,6 +85,7 @@ pub struct InvestigationCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationRequest {
+    GetCapability {},
     ListHosts {
         #[serde(default)]
         limit: Option<u32>,
@@ -121,6 +124,18 @@ pub enum InvestigationRequest {
         backend_id: String,
         model_id: String,
         prompt_schema_version: String,
+    },
+    StartDelegatedRun {
+        incident_id: String,
+        backend_id: String,
+        model_id: String,
+        prompt_schema_version: String,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+    },
+    CancelInvestigationRun {
+        run_id: String,
+        reason: String,
     },
     ReportRunProgress {
         run_id: String,
@@ -388,6 +403,10 @@ pub struct BaselineSummaryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationResponse {
+    Capability {
+        capability: ScopedCapability,
+        delegated: bool,
+    },
     Hosts {
         hosts: Vec<HostSummary>,
     },
@@ -417,6 +436,12 @@ pub enum InvestigationResponse {
         run_id: String,
         incident_id: String,
         expires_at: DateTime<Utc>,
+    },
+    DelegatedRunStarted {
+        run_id: String,
+        incident_id: String,
+        expires_at: DateTime<Utc>,
+        run_token: String,
     },
     RunProgressRecorded {
         run_id: String,
@@ -544,6 +569,8 @@ pub enum AdminRequest {
         #[serde(default)]
         incident_id: Option<String>,
         ttl_seconds: u64,
+        #[serde(default)]
+        may_spawn_runs: bool,
     },
     CloseIncident {
         incident_id: String,

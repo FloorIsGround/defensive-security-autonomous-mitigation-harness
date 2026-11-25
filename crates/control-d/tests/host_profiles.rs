@@ -110,7 +110,7 @@ fn migration_from_v5_preserves_rows_and_adds_nullable_profile_columns() {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let host: (String, Option<String>, Option<String>) = db
             .query_row(
                 "SELECT agent_version, profile_json, profile_reported_at FROM hosts WHERE host_id='legacy'",
@@ -287,6 +287,7 @@ fn tag_filter_is_exact_and_preserves_investigation_host_scope() {
 
     let AdminResponse::TokenMinted { token, .. } =
         service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "reader".into(),
             role: PrincipalRole::Observer,
             allowed_hosts: vec!["edge".into(), "untagged".into()],

@@ -111,6 +111,7 @@ mod tests {
         let now = Utc::now();
         let policy = ControlPolicyConfig::default();
         let capability = ScopedCapability {
+            may_spawn_runs: false,
             principal_id: "operator".into(),
             role: PrincipalRole::Admin,
             run_id: None,

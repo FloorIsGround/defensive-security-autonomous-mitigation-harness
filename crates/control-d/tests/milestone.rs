@@ -123,6 +123,7 @@ impl Fixture {
         let response = self
             .service
             .handle_admin_request(AdminRequest::MintCapabilityToken {
+                may_spawn_runs: false,
                 principal_id: "test-user".into(),
                 role,
                 allowed_hosts: vec!["edge".into(), "foreign".into()],
@@ -725,6 +726,7 @@ async fn unix_roundtrip_with_live_bundle_and_durable_ack() {
     write_frame(
         &mut operator,
         &AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "observer".into(),
             role: PrincipalRole::Observer,
             allowed_hosts: vec!["edge".into()],

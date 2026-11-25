@@ -90,6 +90,8 @@ enum Command {
         incident_id: Option<String>,
         #[arg(long, default_value_t = 3600)]
         ttl_seconds: u64,
+        #[arg(long)]
+        allow_run_spawn: bool,
     },
     CloseIncident {
         incident_id: String,
@@ -216,7 +218,9 @@ impl Command {
                 allowed_collectors,
                 incident_id,
                 ttl_seconds,
+                allow_run_spawn,
             } => AdminRequest::MintCapabilityToken {
+                may_spawn_runs: allow_run_spawn,
                 principal_id,
                 role: match role {
                     Role::Observer => PrincipalRole::Observer,
@@ -756,6 +760,7 @@ mod tests {
             "user",
             "--role",
             "investigator",
+            "--allow-run-spawn",
             "--host",
             "edge",
             "--host",
@@ -774,6 +779,7 @@ mod tests {
         assert_eq!(
             args.command.into_request().unwrap(),
             AdminRequest::MintCapabilityToken {
+                may_spawn_runs: true,
                 principal_id: "user".into(),
                 role: PrincipalRole::Investigator,
                 allowed_hosts: vec!["edge".into(), "edge2".into()],

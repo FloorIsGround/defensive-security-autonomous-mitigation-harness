@@ -393,6 +393,7 @@ async fn investigator_flow_preserves_controller_decisions() {
     let incident_id = &incidents[0].incident_id;
     let AdminResponse::TokenMinted { token, .. } =
         service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "operator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
@@ -410,6 +411,7 @@ async fn investigator_flow_preserves_controller_decisions() {
         token: observer_token,
         ..
     } = service.handle_admin_request(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
@@ -624,6 +626,7 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
     let incident_id = incidents[0].incident_id.clone();
     let AdminResponse::TokenMinted { token, .. } = service.handle_admin_request(
         AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "investigator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
@@ -639,6 +642,7 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
         token: observer_token,
         ..
     } = service.handle_admin_request(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
