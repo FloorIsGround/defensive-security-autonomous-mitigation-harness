@@ -36,6 +36,8 @@ pub struct EdgeSafetyConfig {
     pub max_clock_skew_seconds: i64,
     pub allowed_collectors: BTreeSet<CollectorType>,
     pub approved_file_roots: Vec<PathBuf>,
+    /// Approved roots introduced by a host profile, subject to stricter collection checks.
+    pub profile_file_roots: Vec<PathBuf>,
     pub denied_path_prefixes: Vec<PathBuf>,
     pub denied_filename_suffixes: Vec<String>,
     pub denied_exact_filenames: Vec<String>,
@@ -75,6 +77,7 @@ impl Default for EdgeSafetyConfig {
                 PathBuf::from("/etc/cron.d"),
                 PathBuf::from("/usr/lib/systemd/system"),
             ],
+            profile_file_roots: Vec::new(),
             denied_path_prefixes: vec![
                 PathBuf::from("/etc/shadow"),
                 PathBuf::from("/etc/gshadow"),

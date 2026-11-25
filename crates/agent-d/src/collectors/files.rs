@@ -8,7 +8,9 @@
 //! races. The hash is computed strictly from the already-open fd (never
 //! re-opened).
 
-use std::os::unix::io::RawFd;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use defsec_policy::edge_floor::{validate_file_path, EdgeSafetyConfig};
@@ -18,7 +20,6 @@ use defsec_protocol::observation::{
 };
 use defsec_protocol::watch::FilesMetadataParams;
 use nix::fcntl::{open, OFlag};
-use nix::sys::stat::{fstat, FileStat};
 use nix::unistd::close;
 use sha2::{Digest, Sha256};
 
@@ -148,6 +149,7 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
         mode_octal: None,
         uid: None,
         gid: None,
+        nlink: None,
         size_bytes: None,
         sha256: None,
         mtime_unix: None,
@@ -189,8 +191,9 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
 
     let opened = openat2_beneath(root_fd, rel);
     let _ = close(root_fd);
-    let fd = match opened {
-        Ok(fd) => fd,
+    let file = match opened {
+        // SAFETY: openat2 returned a newly owned descriptor.
+        Ok(fd) => unsafe { File::from_raw_fd(fd) },
         Err(e) => {
             let (status, detail) = errno_status_and_detail(&e);
             entry.status = status;
@@ -199,6 +202,18 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
         }
     };
 
+    let fd = file.as_raw_fd();
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            entry.status = ObservationStatus::Error;
+            entry.detail = Some(format!("fstat failed: {e}"));
+            return entry;
+        }
+    };
+
+    // Check after fstat so an alias unlinked before the link-count check is
+    // still detected by the changed path of the open descriptor.
     let check_opened_path = || {
         let real = std::fs::read_link(format!("/proc/self/fd/{fd}"))
             .map_err(|e| format!("resolving opened file failed: {e}"))?;
@@ -212,49 +227,43 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
         Ok(())
     };
     if let Err(reason) = check_opened_path() {
-        let _ = close(fd);
         entry.status = ObservationStatus::Error;
         entry.detail = Some(reason);
         return entry;
     }
 
-    let stat: FileStat = match fstat(fd) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = close(fd);
-            entry.status = ObservationStatus::Error;
-            entry.detail = Some(format!("fstat failed: {e}"));
-            return entry;
-        }
-    };
-
-    if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
-        let _ = close(fd);
+    if !meta.is_file() {
         entry.status = ObservationStatus::Error;
         entry.detail =
             Some("not a regular file (directory/FIFO/device/socket rejected)".to_string());
         return entry;
     }
 
-    entry.mode_octal = Some(format!("{:04o}", stat.st_mode & 0o7777));
-    entry.uid = Some(stat.st_uid);
-    entry.gid = Some(stat.st_gid);
-    entry.mtime_unix = Some(stat.st_mtime);
+    entry.mode_octal = Some(format!("{:04o}", meta.mode() & 0o7777));
+    entry.uid = Some(meta.uid());
+    entry.gid = Some(meta.gid());
+    entry.nlink = Some(meta.nlink());
+    entry.mtime_unix = Some(meta.mtime());
 
-    if (stat.st_size as u64) > cap {
-        let _ = close(fd);
+    if meta.nlink() > 1 && cfg.profile_file_roots.iter().any(|added| added == root) {
+        entry.status = ObservationStatus::Error;
+        entry.size_bytes = Some(meta.len());
+        entry.detail = Some("hardlinked file under profile root refused".into());
+        return entry;
+    }
+
+    if meta.len() > cap {
         entry.status = ObservationStatus::TruncatedRejected;
-        entry.size_bytes = Some(stat.st_size as u64);
+        entry.size_bytes = Some(meta.len());
         entry.detail = Some(format!(
             "file size {} exceeds hash byte cap {cap}; refusing to hash",
-            stat.st_size
+            meta.len()
         ));
         return entry;
     }
 
     match hash_fd(fd, cap, compute_hash) {
         Ok((digest, read_total, overgrew)) => {
-            let _ = close(fd);
             entry.size_bytes = Some(read_total);
             if overgrew {
                 entry.status = ObservationStatus::TruncatedRejected;
@@ -267,7 +276,6 @@ fn file_entry(path_str: &str, cfg: &EdgeSafetyConfig, compute_hash: bool, cap: u
             }
         }
         Err(e) => {
-            let _ = close(fd);
             entry.status = ObservationStatus::Error;
             entry.detail = Some(format!("read failed: {e}"));
         }
@@ -404,12 +412,52 @@ mod tests {
         let entry = &snap.files[0];
         assert_eq!(entry.status, ObservationStatus::Ok);
         assert_eq!(entry.size_bytes, Some(11));
+        assert_eq!(entry.nlink, Some(1));
         assert!(entry.mode_octal.is_some());
         assert!(entry.mtime_unix.is_some());
         assert_eq!(
             entry.sha256.as_deref(),
             Some(hex::encode(Sha256::digest(b"hello world")).as_str())
         );
+    }
+
+    #[test]
+    fn hardlinks_are_reported_and_refused_under_profile_added_roots() {
+        use defsec_policy::host_profile::apply_host_profile;
+        use defsec_protocol::profile::HostProfile;
+
+        let dir = temp_root("files-hardlinks");
+        let root = dir.join("profile-root");
+        std::fs::create_dir(&root).unwrap();
+        let original = dir.join("original.conf");
+        write_file(&original, b"fixture");
+        let link = root.join("alias.conf");
+        std::fs::hard_link(&original, &link).unwrap();
+        let path = link.to_str().unwrap();
+        let profile: HostProfile = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "approved_file_roots": [root],
+        }))
+        .unwrap();
+        let mut base = test_cfg(&root);
+        let (cfg, _) = apply_host_profile(&base, &profile).unwrap();
+        let entry = file_entry(path, &cfg, true, 1024);
+        assert_eq!(entry.status, ObservationStatus::Ok);
+        assert_eq!(entry.nlink, Some(2));
+        assert!(entry.sha256.is_some());
+
+        base.approved_file_roots.clear();
+        let (cfg, _) = apply_host_profile(&base, &profile).unwrap();
+        for compute_hash in [false, true] {
+            let entry = file_entry(path, &cfg, compute_hash, 1024);
+            assert_eq!(entry.status, ObservationStatus::Error);
+            assert_eq!(entry.nlink, Some(2));
+            assert_eq!(
+                entry.detail.as_deref(),
+                Some("hardlinked file under profile root refused")
+            );
+            assert_eq!(entry.sha256, None);
+        }
     }
 
     #[tokio::test]

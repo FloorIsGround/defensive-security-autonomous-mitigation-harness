@@ -296,12 +296,12 @@ impl RuleStore<'_> {
         let samples = rows(
             self.db,
             "SELECT w.spec_json, o.status_json, o.sample_json,
-                    CASE WHEN json_extract(w.spec_json,'$.trigger.compare_against')='last_observed'
-                         THEN (SELECT p.sample_json FROM observations p
-                               WHERE p.host_id=o.host_id AND p.watch_id=o.watch_id
-                                 AND p.spec_version=o.spec_version AND p.observation_id<o.observation_id
-                                 AND p.sample_json IS NOT NULL ORDER BY p.observation_id DESC LIMIT 1)
-                         ELSE (SELECT b.sample_json FROM baseline_revisions b
+                    (SELECT p.sample_json FROM observations p
+                     WHERE p.host_id=o.host_id AND p.watch_id=o.watch_id
+                       AND p.spec_version=o.spec_version AND p.observation_id<o.observation_id
+                       AND p.sample_json IS NOT NULL ORDER BY p.observation_id DESC LIMIT 1),
+                    CASE WHEN json_extract(w.spec_json,'$.trigger.compare_against')='accepted_baseline'
+                         THEN (SELECT b.sample_json FROM baseline_revisions b
                                WHERE b.host_id=o.host_id AND b.watch_id=o.watch_id
                                  AND b.spec_version=o.spec_version AND b.approved_at<o.received_at
                                ORDER BY b.revision_id DESC LIMIT 1) END
@@ -324,7 +324,7 @@ impl RuleStore<'_> {
             ],
             |r| Ok((json_column::<WatchSpec>(r, 0)?, json_column::<ObservationStatus>(r, 1)?,
                 json_column::<Value>(r, 2)?,
-                optional_json::<Value>(r, 3)?)),
+                optional_json::<Value>(r, 3)?, optional_json::<Value>(r, 4)?)),
         )?;
         let mut backtest = RuleBacktest {
             observations_scanned: samples.len() as u32,
@@ -340,7 +340,7 @@ impl RuleStore<'_> {
             spec: rule.clone(),
         };
         let mut rules_by_watch = BTreeMap::new();
-        for (index, (spec, status, sample, reference)) in samples.into_iter().enumerate() {
+        for (index, (spec, status, sample, last, baseline)) in samples.into_iter().enumerate() {
             let TriggerPredicate::SetDiff {
                 compare_against, ..
             } = spec.trigger
@@ -353,16 +353,16 @@ impl RuleStore<'_> {
             }
             items.extend(keys);
 
-            let (last, baseline) = match compare_against {
-                CompareTarget::LastObserved => (reference.as_ref(), None),
-                CompareTarget::AcceptedBaseline => (None, reference.as_ref()),
+            let reference = match compare_against {
+                CompareTarget::LastObserved => last.as_ref(),
+                CompareTarget::AcceptedBaseline => baseline.as_ref(),
             };
             let raw = evaluate_predicate(
                 &spec.trigger,
                 status,
                 Some(&sample),
-                last,
-                baseline,
+                last.as_ref(),
+                baseline.as_ref(),
                 None,
                 0,
                 0,
@@ -385,7 +385,7 @@ impl RuleStore<'_> {
                         raw.clone(),
                         status,
                         Some(&sample),
-                        reference.as_ref(),
+                        reference,
                         rules
                     )
                     .outcome,

@@ -4,8 +4,7 @@
 //! in-process against `FakeHostCollectors`.
 
 use std::collections::VecDeque;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,7 +30,7 @@ use uuid::Uuid;
 
 use agent_d::collectors::{FakeHostCollectors, FakeHostState};
 use agent_d::engine::AgentEngine;
-use agent_d::profile::load_profile;
+use agent_d::profile::{LoadedProfile, load_profile};
 use agent_d::spool::DurabilityProfile;
 
 const HOST: &str = "edge-01";
@@ -1046,23 +1045,22 @@ async fn truncated_outbound_snapshot_reports_partial_with_explicit_reason() {
     assert_eq!(hb[0].success_runs, 1);
 }
 
-fn write_profile_file(dir: &Path, contents: &str) -> PathBuf {
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+fn load_profile_fixture(contents: &str) -> LoadedProfile {
+    let dir = std::env::temp_dir().join(format!("agent-d-profile-{}", Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("profile.json");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(contents.as_bytes()).unwrap();
-    drop(file);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    path
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let result = load_profile(&path, &EdgeSafetyConfig::default());
+    std::fs::remove_dir_all(&dir).unwrap();
+    result.expect("valid profile file loads")
 }
 
 #[tokio::test]
 async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
     let kp = key_pair();
     let dir = state_dir("profile-reject");
-    let profile_dir = state_dir("profile-reject-file");
-    let profile_path = write_profile_file(
-        &profile_dir,
+    let loaded = load_profile_fixture(
         r#"{
             "schema_version": 1,
             "host_tags": ["prod"],
@@ -1070,8 +1068,6 @@ async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
             "collector_caps": { "max_outbound_flows": 32 }
         }"#,
     );
-    let loaded = load_profile(&profile_path, &EdgeSafetyConfig::default())
-        .expect("valid profile file loads");
     assert!(!loaded
         .cfg
         .allowed_collectors
@@ -1184,11 +1180,9 @@ async fn tighter_profile_rejects_cached_bundle_and_identical_retransmission() {
     ));
     drop(original);
 
-    let profile_path = write_profile_file(
-        &dir,
+    let loaded = load_profile_fixture(
         r#"{"schema_version":1,"enabled_collectors":["sockets.listening"]}"#,
     );
-    let loaded = load_profile(&profile_path, &EdgeSafetyConfig::default()).unwrap();
     let mut restarted = engine_with_cfg(&kp, &dir, fake_sockets_host(0), false, loaded.cfg);
     assert_eq!(restarted.active_bundle_version(), 0);
     assert!(restarted.watch_ids().is_empty());

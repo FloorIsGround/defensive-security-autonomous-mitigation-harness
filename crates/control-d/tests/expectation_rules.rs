@@ -697,6 +697,56 @@ fn incomplete_snapshots_preserve_additions_without_removals_or_missing_rules() {
 }
 
 #[test]
+fn truncation_opens_incident_despite_allow_rule_and_replays_consistently() {
+    for compare_against in [CompareTarget::LastObserved, CompareTarget::AcceptedBaseline] {
+        let f = Fixture::new(compare_against);
+        let baseline = f.put(1, vec![]);
+        if compare_against == CompareTarget::AcceptedBaseline {
+            f.promote(baseline);
+        }
+        let allow_rule = allow("expected.service");
+        let rule_id = f.create(allow_rule.clone());
+        let retained = socket("expected.service", 4002);
+        let truncated = json!({"truncated": true, "sockets": [retained.clone()]});
+        let first = f.put_snapshot_with_status(2, truncated.clone(), ObservationStatus::Partial);
+        assert!(f.saw_trigger(first));
+
+        let outcome = f.outcome();
+        assert_eq!(outcome["details"]["added"], json!([]));
+        assert_eq!(outcome["details"]["truncation_began"], json!({}));
+        assert_eq!(
+            outcome["details"]["suppressed_by_rules"][rule_id],
+            json!(["tcp:127.0.0.5:4002"])
+        );
+        let (summary, trigger_reason): (String, String) = f.db().query_row(
+            "SELECT i.summary, json_extract(t.outcome_json,'$.reason')
+             FROM incidents i JOIN trigger_events t USING (incident_id)
+             JOIN trigger_evidence e USING (event_id) WHERE e.observation_id=?1 AND i.status='open'",
+            [first],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(summary.contains("truncation_began"));
+        assert_eq!(trigger_reason, summary);
+        assert_eq!(outcome["reason"], summary);
+
+        let mut continued = truncated.clone();
+        continued["count"] = json!(1);
+        let second = f.put_snapshot_with_status(3, continued, ObservationStatus::Partial);
+        assert!(!f.saw_trigger(second));
+        assert_eq!(f.outcome(), json!({"outcome":"not_triggered"}));
+        let recovery = f.put(4, vec![retained]);
+        assert!(!f.saw_trigger(recovery));
+        let renewed = f.put_snapshot_with_status(5, truncated, ObservationStatus::Partial);
+        assert!(f.saw_trigger(renewed));
+        let backtest = f.backtest(allow_rule);
+        assert_eq!(
+            (backtest.observations_scanned, backtest.triggered_before, backtest.triggered_after),
+            (5, 2, 2)
+        );
+    }
+}
+
+#[test]
 fn backtest_uses_then_accepted_baseline_and_bounds_the_observation_window() {
     let f = Fixture::new(CompareTarget::AcceptedBaseline);
     let empty = f.put(1, vec![]);

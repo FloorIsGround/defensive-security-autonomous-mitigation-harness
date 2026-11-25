@@ -91,6 +91,7 @@ pub fn apply_host_profile(
     // checks above; the hard denylist still applies at collection time.
     for root in extra_roots {
         if !effective.approved_file_roots.contains(&root) {
+            effective.profile_file_roots.push(root.clone());
             effective.approved_file_roots.push(root);
         }
     }
