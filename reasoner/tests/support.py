@@ -58,6 +58,7 @@ class FakeControlServer:
         expire_leases: bool = False,
         complete_error: dict[str, str] | None = None,
         proposal_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
+        rule_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
         action_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
         action_auth_modes: dict[str, str] | None = None,
         triggers: list[dict[str, Any]] | None = None,
@@ -67,6 +68,11 @@ class FakeControlServer:
         self.expire_leases = expire_leases
         self.complete_error = complete_error
         self.proposal_policy = proposal_policy or (lambda spec: (True, "policy.accepted", "ok"))
+        #: Deterministic rule-gate stand-in for expectation-rule proposals.
+        self.rule_policy = rule_policy or (lambda rule: (True, "policy.accepted", "ok"))
+        #: Optional hard error for propose_expectation_rule (mirrors control-d
+        #: refusing the call itself, e.g. a run-scope violation).
+        self.rule_error: dict[str, str] | None = None
         self.action_policy = action_policy or (lambda verb: (True, "policy.action_ok", "ok"))
         #: Per-verb authorization tier, mirroring Phase 8's policy engine.
         self.action_auth_modes = dict(
@@ -104,6 +110,7 @@ class FakeControlServer:
         ]
         self.findings: list[dict[str, Any]] = []
         self.proposals: list[dict[str, Any]] = []
+        self.rule_proposals: list[dict[str, Any]] = []
         self.action_proposals: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.progress_error: str | None = None
@@ -274,6 +281,45 @@ class FakeControlServer:
             "decision": {"allowed": True, "rule_id": rule_id, "reason": "ok", "policy_version": 1},
             "watch_id": spec.get("id"),
             "bundle_version": 2,
+        }
+
+    def _op_propose_expectation_rule(self, req: dict[str, Any]) -> dict[str, Any]:
+        if self.rule_error is not None:
+            return self._error(self.rule_error["code"], self.rule_error["message"])
+        rule = req["rule"]
+        allowed, gate_rule_id, reason = self.rule_policy(rule)
+        self.rule_proposals.append(
+            {"rule": rule, "allowed": allowed, "rule_id": gate_rule_id, "key": req["idempotency_key"]}
+        )
+        if not allowed:
+            return {
+                "result": "rule_proposal_evaluated",
+                "decision": {
+                    "allowed": False,
+                    "rule_id": gate_rule_id,
+                    "reason": reason,
+                    "policy_version": 1,
+                },
+                "rule_id": None,
+                "backtest": None,
+            }
+        return {
+            "result": "rule_proposal_evaluated",
+            "decision": {
+                "allowed": True,
+                "rule_id": gate_rule_id,
+                "reason": "expectation rule satisfies policy",
+                "policy_version": 1,
+            },
+            "rule_id": f"rule-{len(self.rule_proposals)}",
+            "backtest": {
+                "observations_scanned": 2,
+                "triggered_before": 1,
+                "triggered_after": 0,
+                "items_matched": 1,
+                "sample_keys": ["tcp:127.0.0.5:4002"],
+                "currently_matching": 1,
+            },
         }
 
     def _op_record_hypothesis_or_finding(self, req: dict[str, Any]) -> dict[str, Any]:

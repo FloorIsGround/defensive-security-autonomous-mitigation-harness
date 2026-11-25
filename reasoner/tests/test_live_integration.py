@@ -93,6 +93,22 @@ class LiveIntegrationTests(unittest.TestCase):
             interval_seconds=30, expires_at=expires, max_runs=120,
         )
 
+    def _rule_spec(self) -> dict:
+        """A benign expectation rule: sshd.service may re-listen on port 22."""
+        expires = (
+            datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=3)
+        ).isoformat().replace("+00:00", "Z")
+        return {
+            "scope": {"host_id": HOST, "collector": "sockets.listening", "watch_id": "w-sockets"},
+            "matches": [
+                {"op": "eq", "field": "systemd_unit", "value": "sshd.service"},
+                {"op": "eq", "field": "local_port", "value": 22},
+            ],
+            "effect": "allow_optional",
+            "rationale": "sshd.service legitimately re-listens on its pinned port after restarts",
+            "expires_at": expires,
+        }
+
     def test_lease_run_propose_finding_complete_and_audit_chain(self) -> None:
         self._fire_sockets_trigger()
 
@@ -172,11 +188,21 @@ class LiveIntegrationTests(unittest.TestCase):
                 "host_id": HOST, "watch_id": "w-sockets", "limit": 50,
             }}]}
 
+        def propose_rule(messages: list[dict], _tools: list) -> dict:
+            return {"tool_calls": [{
+                "name": "propose_expectation_rule",
+                "arguments": {
+                    "idempotency_key": "sshd-22",
+                    "rule": self._rule_spec(),
+                },
+            }]}
+
         script = [
             inspect_initial_context,
             propose_followup,
             collect_followup,
             record_finding,
+            propose_rule,
             {"final_text": "investigation complete"},
         ]
 
@@ -186,14 +212,19 @@ class LiveIntegrationTests(unittest.TestCase):
             )["token"]
             return ControlRpcClient(self.daemon.investigate_sock, fresh)
 
-        worker = ReasonerWorker(factory, ScriptedMockAdapter(script), backend_id="live-test")
+        worker = ReasonerWorker(
+            factory, ScriptedMockAdapter(script), backend_id="live-test",
+            budgets=RunBudgets(max_turns=8),
+        )
         outcome = worker.run_once()
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, "completed", f"worker outcome: {outcome}")
         self.assertEqual(outcome.proposals, 1)
         self.assertEqual(outcome.proposals_accepted, 1)
+        self.assertEqual(outcome.rule_proposals_submitted, 1)
+        self.assertEqual(outcome.rule_proposals_accepted, 1)
         self.assertEqual(outcome.findings, 1)
-        self.assertGreaterEqual(outcome.tool_calls, 4)
+        self.assertGreaterEqual(outcome.tool_calls, 5)
 
         # The trigger is done and cannot be double-processed.
         client = self._client(self.admin.mint_capability_token(
@@ -216,6 +247,29 @@ class LiveIntegrationTests(unittest.TestCase):
         self.assertEqual(queue[0]["event_id"], outcome.event_id)
         self.assertNotIn("lease_token", queue[0])
         self.assertIn("diff", queue[0]["reason"])
+
+        # The rule proposal was recorded as run progress and stays inert (proposed).
+        rule_results = [
+            event for event in events
+            if event["kind"] == "tool_result"
+            and (event.get("detail") or {}).get("tool") == "propose_expectation_rule"
+        ]
+        self.assertEqual(len(rule_results), 1)
+        self.assertTrue(rule_results[0]["detail"]["accepted"])
+        rules = self.admin.call({
+            "admin_op": "list_expectation_rules",
+            "host_id": HOST,
+            "statuses": ["proposed"],
+            "limit": 10,
+        })["rules"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["status"], "proposed")
+        self.assertEqual(rules[0]["origin"], "investigator")
+        self.assertEqual(rules[0]["run_id"], outcome.run_id)
+        self.assertEqual(rules[0]["spec"]["scope"]["watch_id"], "w-sockets")
+        self.assertEqual(rules[0]["spec"]["matches"][0]["value"], "sshd.service")
+        self.assertGreater(rules[0]["backtest"]["observations_scanned"], 0)
+        self.assertEqual(rules[0]["hit_count"], 0)
 
         # Findings are durable and evidence-bound in the incident context.
         incidents = [i for i in self.admin.list_incidents() if i["status"] == "open"]
@@ -300,6 +354,9 @@ class LiveIntegrationTests(unittest.TestCase):
         with self.assertRaises(RpcError) as ctx:
             observer.propose_ephemeral_watch("run-x", "key", self._ephemeral_spec("inc"), "nope")
         self.assertEqual(ctx.exception.code, "forbidden")
+        with self.assertRaises(RpcError) as rule_ctx:
+            observer.propose_expectation_rule("run-x", "key", self._rule_spec())
+        self.assertEqual(rule_ctx.exception.code, "forbidden")
 
 
 if __name__ == "__main__":
