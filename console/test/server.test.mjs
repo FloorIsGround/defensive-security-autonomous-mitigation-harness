@@ -662,6 +662,7 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
     assert.equal((await admin.call({ admin_op: 'enroll_host', host_id: HOST, agent_public_key_hex: null })).admin_result, 'host_enrolled');
     for (const spec of [
       baselineSpec('base-sockets', { type: 'sockets.listening', parameters: { include_tcp: true, include_udp: true, include_ipv6: true, resolve_process: true } }, { type: 'set_diff', compare_against: 'last_observed', set_field: 'sockets', identity_key: 'socket_key' }),
+      baselineSpec('base-ssh-unit', { type: 'systemd.unit_state', parameters: { unit: 'sshd.service', hash_unit_files: false } }, { type: 'field_changed', compare_against: 'last_observed', fields: ['active_state'] }),
       baselineSpec('base-sshd-journal', { type: 'journal.unit_events', parameters: { unit: 'sshd.service' } }, { type: 'collector_stale_or_error', max_stale_seconds: 600, consecutive_errors: 3 }),
     ]) {
       const r = await admin.call({ admin_op: 'apply_baseline_watch', spec, actor: 'it-operator', rationale: 'integration fixture' });
@@ -673,11 +674,11 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
     await agent.register();
     const ssh = liveSocket(22, 'sshd', 'ssh.service', 101);
     const rogue = liveSocket(4444, 'helperd', 'custom-helper.service', 202);
-    const second = liveSocket(5555, 'beacond', 'beacon.service', 303);
+    const unitSnap = (active) => ({ kind: 'snapshot', data: { unit: 'sshd.service', load_state: 'loaded', active_state: active, sub_state: active === 'active' ? 'running' : 'dead', unit_file_state: 'enabled', main_pid: active === 'active' ? 101 : null, main_pid_start_time_ticks: null, exec_start_hash: null, unit_files: [] } });
     await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh]), { observedAt: new Date(Date.now() - 60_000) });
     await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh, rogue])); // incident A
-    await new Promise((r) => setTimeout(r, 2_300));
-    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh, rogue, second])); // incident B
+    await agent.push('base-ssh-unit', 'systemd.unit_state', unitSnap('active'), { observedAt: new Date(Date.now() - 60_000) });
+    await agent.push('base-ssh-unit', 'systemd.unit_state', unitSnap('inactive')); // incident B
     const event = (i, msg) => ({
       cursor: `s=fake;i=${i}`, timestamp_us: Date.now() * 1000, unit: 'sshd.service', priority: 6, pid: 811, uid: 0,
       message_redacted: msg, truncated: false, redaction_applied: false, classification: 'bounded_redacted_text',
@@ -722,7 +723,7 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
 
       const hosts = track(await get(port, '/api/hosts'));
       assert.equal(hosts.status, 200, hosts.text);
-      assert.equal(hosts.json.hosts[0].watch_count, 2, 'host card shows the real active watch count');
+      assert.equal(hosts.json.hosts[0].watch_count, 3, 'host card shows the real active watch count');
       assert.equal(hosts.json.hosts[0].stream_watch_count, 1);
 
       const run = track(await post(port, `/api/incidents/${A.incident_id}/runs`, {}));
@@ -779,11 +780,11 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
       // What changed + stream derivation + automation status.
       const changes = track(await get(port, `/api/incidents/${B.incident_id}/changes`));
       assert.equal(changes.status, 200, changes.text);
-      const sockChange = changes.json.changes.find((c) => c.watch_id === 'base-sockets');
-      assert.equal(sockChange.basis, 'before_incident');
-      assert.deepEqual(sockChange.diff.added.map((s) => s.local_port), [5555]);
+      const unitChange = changes.json.changes.find((c) => c.watch_id === 'base-ssh-unit');
+      assert.equal(unitChange.basis, 'before_incident');
+      assert.ok(unitChange.diff.fields.some((f) => f.field === 'active_state' && f.before === 'active' && f.after === 'inactive'));
       const changesA = track(await get(port, `/api/incidents/${A.incident_id}/changes`));
-      assert.deepEqual(changesA.json.changes.find((c) => c.watch_id === 'base-sockets').diff.added.map((s) => s.local_port).sort(), [4444, 5555]);
+      assert.deepEqual(changesA.json.changes.find((c) => c.watch_id === 'base-sockets').diff.added.map((s) => s.local_port), [4444]);
       const tri = track(await get(port, `/api/hosts/${HOST}/baselines`)).json.three_state;
       const journal = tri.find((r) => r.watch_id === 'base-sshd-journal');
       assert.equal(journal.state, 'stream');
