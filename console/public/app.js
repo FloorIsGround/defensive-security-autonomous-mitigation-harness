@@ -1362,6 +1362,30 @@ function field(label, control, hint = null) {
   return el('div', { class: 'field' }, el('label', null, label), control, hint);
 }
 
+/**
+ * Keep a submit button disabled, with the reason beside it, until the form has
+ * the input the backend genuinely requires. Server-side validation still runs.
+ */
+function guardSubmit(form, btn, note, missing, idle = 'control-d decides') {
+  const check = () => {
+    const m = missing();
+    btn.disabled = Boolean(m);
+    note.textContent = m ?? idle;
+    note.classList.toggle('warn-text', Boolean(m));
+  };
+  form.addEventListener('input', check);
+  form.addEventListener('change', check);
+  check();
+  return check;
+}
+
+const watchTargetText = (d) => {
+  const p = d.parameters;
+  if (d.collector_type === 'files.metadata') return String(p.paths ?? '').split(/[\n,]/).map((x) => x.trim()).filter(Boolean).join(', ');
+  if (d.collector_type === 'sockets.listening') return 'listening sockets';
+  return String(p.unit ?? '').trim();
+};
+
 function proposalComposer(inc, run, caps) {
   const d = draftsFor(inc.incident_id).proposal;
   if (!d.trigger) d.trigger = triggerDefaults(d.collector_type);
@@ -1545,6 +1569,12 @@ function proposalComposer(inc, run, caps) {
     const ttl = numInput(d, 'ttl_minutes', { min: 1, onInput: updateHints });
     const mr = numInput(d, 'max_runs', { min: 1, onInput: updateHints });
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to policy gate');
+    const note = el('span', { class: 'form-note' });
+    // A sensible rationale is generated from the target until the operator edits it.
+    const autoRationale = () => `Temporary ${d.collector_type} watch on ${watchTargetText(d) || 'the target'} while ${shortId(inc.incident_id)} is investigated.`;
+    if (!d.rationaleEdited) d.rationale = autoRationale();
+    const rationale = textArea(d, 'rationale', { placeholder: 'Why this temporary watch is needed for the investigation…', rows: 2 });
+    rationale.addEventListener('input', () => (d.rationaleEdited = Boolean(rationale.value.trim())));
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1554,13 +1584,23 @@ function proposalComposer(inc, run, caps) {
       triggerFields(),
       el('div', { class: 'grid-2' }, field('Interval (s)', iv), field('Timeout (s)', to), field('TTL (min)', ttl), field('Max runs', mr)),
       hintNode,
-      field('Rationale', textArea(d, 'rationale', { placeholder: 'Why this temporary watch is needed for the investigation…', rows: 2 })),
+      field('Rationale', rationale, el('span', { class: 'hint' }, 'Pre-filled from the target; edit it if there is more to say.')),
       el('details', { class: 'preview' }, el('summary', null, 'Request preview'), jsonBlock({ ...requestBody(), run_id: run?.run_id ? `${run.run_id.slice(0, 8)}…` : null })),
-      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
+      el('div', { class: 'form-actions' }, note, submitBtn),
     );
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('input', (e) => {
+      if (e.target !== rationale && !d.rationaleEdited) rationale.value = d.rationale = autoRationale();
+    });
+    const recheck = guardSubmit(form, submitBtn, note, () => {
+      if ((d.collector_type === 'systemd.unit_state' || d.collector_type === 'journal.unit_events') && !String(d.parameters.unit ?? '').trim()) return 'Enter the unit to watch.';
+      if (d.collector_type === 'files.metadata' && !watchTargetText(d)) return 'Enter at least one path.';
+      if (!String(d.rationale ?? '').trim()) return 'Add a rationale.';
+      return null;
+    });
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      submit(submitBtn);
+      await submit(submitBtn);
+      recheck();
     });
     replace(body, form, result);
     updateHints();
@@ -1624,6 +1664,7 @@ function findingComposerView(inc, run, obsMap, ev) {
       el('button', { type: 'button', attrs: { 'aria-pressed': String(d.kind === 'verified_finding') }, on: { click: () => { d.kind = 'verified_finding'; draw(); } } }, 'Verified finding'),
     );
     const btn = el('button', { class: 'btn btn-primary', type: 'submit' }, d.kind === 'verified_finding' ? 'Record verified finding' : 'Record hypothesis');
+    const note = el('span', { class: 'form-note' });
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1632,8 +1673,10 @@ function findingComposerView(inc, run, obsMap, ev) {
       field('Uncertainty', textArea(d, 'uncertainty', { placeholder: 'What is not yet established, alternative explanations…', rows: 2 })),
       el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence observations'), evNode, evHint),
       el('div', { class: 'checks' }, check(d, 'escalation_requested', 'Request escalation to operator')),
-      el('div', { class: 'form-actions' }, btn),
+      el('div', { class: 'form-actions' }, note, btn),
     );
+    const recheck = guardSubmit(form, btn, note, () => (!d.summary.trim() ? 'Write a summary.' : d.kind === 'verified_finding' && !selected.size ? 'Cite at least one observation.' : null), 'Bound to the cited evidence');
+    ev.listeners.add(recheck);
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       btn.disabled = true;
@@ -1650,7 +1693,7 @@ function findingComposerView(inc, run, obsMap, ev) {
         reloadWorkspace(inc.incident_id);
       } catch (err) {
         toast(`${err.code}: ${err.message}`, 'bad');
-        btn.disabled = false;
+        recheck();
       }
     });
     replace(body, form);
@@ -1906,6 +1949,7 @@ function actionComposer(inc, run, ev) {
       ),
     );
     const submitBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Submit to action gate');
+    const note = el('span', { class: 'form-note' });
     const form = el(
       'form',
       { class: 'form', attrs: { novalidate: true } },
@@ -1913,7 +1957,10 @@ function actionComposer(inc, run, ev) {
       verbFields(),
       el('div', { class: 'field' }, el('span', { class: 'lbl' }, 'Evidence', citeLatest), evNode, evHint),
       justification,
-      el('div', { class: 'form-actions' }, el('span', { class: 'form-note' }, 'control-d decides'), submitBtn),
+      el('div', { class: 'form-actions' }, note, submitBtn),
+    );
+    const recheck = guardSubmit(form, submitBtn, note, () =>
+      d.verb === 'nft_block_ip' && !d.ip.trim() ? 'Enter the IP address to block.' : d.verb === 'systemd_stop_unit' && !d.unit.trim() ? 'Enter the unit to stop.' : null,
     );
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1930,7 +1977,7 @@ function actionComposer(inc, run, ev) {
       } catch (err) {
         toast(`${err.code}: ${err.message}`, 'bad');
       } finally {
-        submitBtn.disabled = false;
+        recheck();
       }
     });
     replace(body, form, result);
