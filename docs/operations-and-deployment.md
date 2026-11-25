@@ -109,7 +109,7 @@ To revoke a compromised host certificate immediately for new connections:
 admin-cli pki revoke <SERIAL_HEX> --revoked-file ./pki/revoked_serials.json --reason "host decommissioned"
 ```
 
-A baseline watch file has this shape. Collector parameters are a closed schema; replace the `collector` object with one of the four examples below and use a unique `id` per watch. Check local policy floors and choose paths and units appropriate to the host.
+A baseline watch file has this shape. Collector parameters are a closed schema; replace the `collector` object with one of the examples below and use a unique `id` per watch. Check local policy floors and choose paths and units appropriate to the host.
 
 ```json
 {
@@ -136,6 +136,14 @@ Other collector objects:
 {"type":"journal.unit_events","parameters":{"unit":"sshd.service","min_priority":6,"max_events_per_batch":100,"max_message_bytes":512}}
 ```
 
+```json
+{"type":"connections.outbound","parameters":{"include_tcp":true,"include_udp":true,"include_ipv6":true,"resolve_process":true,"exclude_loopback":true,"max_flows":256}}
+```
+
+```json
+{"type":"packages.inventory","parameters":{"max_packages":4096}}
+```
+
 Apply and manage with the admin socket; use IDs returned by the system:
 
 ```sh
@@ -147,6 +155,32 @@ admin-cli --admin-sock ./run-data/admin.sock close-incident INCIDENT_ID --actor 
 ```
 
 Store tokens securely; token output is sensitive. Scope hosts, collectors and incident as narrowly as needed. Use `list-hosts` and `list-incidents` for discovery. Audit verification checks the stored chain; retain an external checkpoint if you need to detect ledger replacement or truncation.
+
+## Host profiles and additional collectors
+
+Two zero-root snapshot collectors extend the baseline view on Ubuntu/Debian hosts:
+
+- `connections.outbound` groups `/proc/net/{tcp,tcp6,udp,udp6}` rows by remote endpoint (`<proto>:<remote_addr>:<remote_port>:<uid>:<comm or '?'>`). Listening sockets, TCP `TIME_WAIT`/`CLOSE`, unconnected (zero-address) remotes and — by default — loopback remotes are excluded as noise. More flow groups than the cap (default 256, hard max 1024, local ceiling 512) produce an explicit `partial` observation carrying `truncated: true` and the omitted count. Unprivileged agents report process attribution explicitly as `partial`/`none`, exactly like `sockets.listening`.
+- `packages.inventory` parses `/var/lib/dpkg/status` (32 MiB hard read cap; over-cap files are explicit errors, never partial parses) and reports installed packages as `<name>:<arch>` entries with the file's SHA-256. Malformed stanzas are skipped and counted. More packages than the cap (default 4096, hard max 16384, local ceiling 16384) produce an explicit `partial` observation with the omitted count.
+
+Both collectors are part of the default allowlist and honor the same interval, timeout and ephemeral bounds as the original four.
+
+`agent-d --profile <PATH>` optionally applies an admin-owned host profile at startup. The profile is local configuration, never part of a signed bundle, and can only tighten the built-in edge safety floor: collector caps take `min(builtin, profile)`, and `enabled_collectors` intersects the built-in allowlist. `approved_file_roots` is the one additive field — profile roots beneath a denied prefix (for example `/etc/shadow`, `/root`, `/home/x`) or the filesystem root itself are rejected at load. Bundles containing a watch whose collector the profile disabled are rejected with an explicit reason through the normal bundle acknowledgment path.
+
+Example profile:
+
+```json
+{
+  "schema_version": 1,
+  "host_tags": ["prod", "dc:eu-west-1"],
+  "expected_services": ["sshd.service", "nginx.service"],
+  "approved_file_roots": ["/etc/myapp"],
+  "enabled_collectors": ["sockets.listening", "connections.outbound", "packages.inventory"],
+  "collector_caps": { "max_outbound_flows": 128, "max_packages": 2048, "max_file_hash_bytes": 1048576 }
+}
+```
+
+`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16); `expected_services` are validated systemd unit names (at most 64); `approved_file_roots` holds at most 32 normalized absolute paths. Load-time safety follows sshd's `StrictModes`: the agent refuses to start when the profile file is group- or world-writable, owned by anyone other than root or the agent's own user, larger than 64 KiB, or fails validation. The applied summary (tags, expected services, effective collectors) is reported to the control plane on registration; the control plane treats it as informational.
 
 ## Interactive clients and reasoner
 
