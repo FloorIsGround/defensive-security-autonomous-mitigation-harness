@@ -19,6 +19,7 @@ if str(TESTS_ROOT) not in sys.path:
 import unittest  # noqa: E402
 
 from defsec_reasoner.models import ProviderError, ScriptedMockAdapter  # noqa: E402
+from defsec_reasoner.canonical import canonical_json, sha256_hex  # noqa: E402
 from defsec_reasoner.provenance import envelope_contents
 from defsec_reasoner.rpc_client import ControlRpcClient, RpcTransportError  # noqa: E402
 from defsec_reasoner.worker import ReasonerWorker, RunBudgets  # noqa: E402
@@ -108,6 +109,36 @@ class TestWorkerHappyPath(WorkerTestBase):
         results = [r["detail"] for r in progress if r["kind"] == "tool_result"]
         self.assertIn({"tool": "propose_ephemeral_watch", "ok": True, "accepted": True}, results)
 
+
+    def test_watch_auto_idempotency_key_is_deterministic(self) -> None:
+        spec = _spec()
+        worker = self.make_worker([
+            {"tool_calls": [
+                {"name": "propose_ephemeral_watch",
+                 "arguments": {"spec": spec, "rationale": "follow-up"}},
+                {"name": "propose_ephemeral_watch",
+                 "arguments": {"spec": spec, "rationale": "follow-up"}},
+                {"name": "propose_ephemeral_watch",
+                 "arguments": {"spec": spec, "rationale": "different rationale"}},
+            ]},
+            {"final_text": "done"},
+        ])
+        outcome = worker.run_once()
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.proposals, 3)  # each call charged against the cap
+        requests = [r for r in self.server.requests if r["op"] == "propose_ephemeral_watch"]
+        self.assertEqual(len(requests), 3)
+        # Identical spec+rationale in the same run replay the same key; a
+        # changed rationale is a different proposal and gets a distinct key.
+        self.assertEqual(requests[0]["idempotency_key"], requests[1]["idempotency_key"])
+        self.assertNotEqual(requests[0]["idempotency_key"], requests[2]["idempotency_key"])
+        material = canonical_json(outcome.run_id) + canonical_json(
+            {"spec": spec, "rationale": "follow-up"}
+        )
+        self.assertEqual(
+            requests[0]["idempotency_key"], "auto-" + sha256_hex(material.encode("utf-8"))[:32]
+        )
 
     def test_findings_and_proposals_submit_before_completion(self) -> None:
         # The complete op must be the LAST investigation request issued.
