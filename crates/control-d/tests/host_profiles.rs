@@ -314,7 +314,7 @@ fn tag_filter_is_exact_and_preserves_investigation_host_scope() {
 }
 
 #[test]
-fn admin_watch_admission_uses_the_last_reported_enabled_collectors() {
+fn reported_disabled_collectors_never_veto_admin_watch_admission() {
     let dir = TempDir::new();
     let service = ControlService::open(&dir.0, "test", 1).unwrap();
     enroll(&service, "edge");
@@ -332,17 +332,9 @@ fn admin_watch_admission_uses_the_last_reported_enabled_collectors() {
             rationale: "onboarding".into(),
         })
     };
+    // A compromised agent claiming every collector is disabled must not be able
+    // to block an operator from deploying detection on it.
     register(&service, "edge", Some(profile(vec![])));
-    assert!(matches!(
-        apply(),
-        AdminResponse::Error { code, message }
-            if code == "profile.collector_disabled" && message.contains("packages.inventory")
-    ));
-    register(
-        &service,
-        "edge",
-        Some(profile(vec![CollectorType::PackagesInventory])),
-    );
     assert!(matches!(
         apply(),
         AdminResponse::WatchApplied {
@@ -358,4 +350,54 @@ fn admin_watch_admission_uses_the_last_reported_enabled_collectors() {
             ..
         }
     ));
+}
+
+#[test]
+fn reordered_profiles_and_repeated_rejections_do_not_flood_the_audit_chain() {
+    let dir = TempDir::new();
+    let service = ControlService::open(&dir.0, "test", 1).unwrap();
+    enroll(&service, "edge");
+    let ordered = HostProfileSummary {
+        host_tags: vec!["alpha".into(), "beta".into()],
+        expected_services: vec!["nginx.service".into(), "ssh.service".into()],
+        ..profile(vec![
+            CollectorType::PackagesInventory,
+            CollectorType::SocketsListening,
+        ])
+    };
+    let mut reordered = ordered.clone();
+    reordered.host_tags.reverse();
+    reordered.expected_services.reverse();
+    reordered.enabled_collectors.reverse();
+    let invalid = HostProfileSummary {
+        host_tags: vec!["Bad".into()],
+        ..ordered.clone()
+    };
+    for report in [&ordered, &reordered, &ordered, &invalid, &invalid, &invalid] {
+        register(&service, "edge", Some(report.clone()));
+    }
+    let AdminResponse::AuditEntries { entries } =
+        service.handle_admin_request(AdminRequest::ListAuditEntries { limit: None })
+    else {
+        panic!("audit entries unavailable");
+    };
+    let count = |kind| entries.iter().filter(|e| e.event_type == kind).count();
+    // First report, then the transition to "no valid profile"; reordering is not drift.
+    assert_eq!(count(AuditEventType::HostProfileChanged), 2);
+    assert_eq!(count(AuditEventType::HostProfileRejected), 1);
+    register(&service, "edge", Some(reordered.clone()));
+    register(&service, "edge", Some(invalid));
+    let AdminResponse::AuditEntries { entries } =
+        service.handle_admin_request(AdminRequest::ListAuditEntries { limit: None })
+    else {
+        panic!("audit entries unavailable");
+    };
+    // A rejection after a valid report is new information and is audited again.
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.event_type == AuditEventType::HostProfileRejected)
+            .count(),
+        2
+    );
 }

@@ -252,23 +252,31 @@ fn record_host_profile(
         |r| optional_json(r, 0),
     )?;
     let request = uuid();
-    let after = match reported.and_then(|profile| {
+    let previous_rejection: Option<String> = db.query_row(
+        "SELECT profile_rejection FROM hosts WHERE host_id=?1",
+        [host_id],
+        |r| r.get(0),
+    )?;
+    let (after, rejection) = match reported.and_then(|profile| {
         if let Some(profile) = &profile {
             validate_host_profile_summary(profile)?;
         }
-        Ok(profile)
+        Ok(profile.map(normalize_profile))
     }) {
-        Ok(profile) => profile,
+        Ok(profile) => (profile, None),
         Err(reason) => {
             tracing::warn!(%host_id, ?reason, "invalid host profile summary");
-            audit(
-                db,
-                HostProfileRejected,
-                host_id,
-                &request,
-                json!({"host_id": host_id, "reason": reason}),
-            )?;
-            None
+            // A looping agent resending the same bad profile is audited once.
+            if previous_rejection.as_deref() != Some(reason.as_str()) {
+                audit(
+                    db,
+                    HostProfileRejected,
+                    host_id,
+                    &request,
+                    json!({"host_id": host_id, "reason": reason}),
+                )?;
+            }
+            (None, Some(reason))
         }
     };
     let profile_json = after
@@ -276,8 +284,8 @@ fn record_host_profile(
         .map(|profile| value_to_canonical_json(&json!(profile)))
         .transpose()?;
     db.execute(
-        "UPDATE hosts SET profile_json=?2,profile_reported_at=?3 WHERE host_id=?1",
-        params![host_id, profile_json, stamp(now)],
+        "UPDATE hosts SET profile_json=?2,profile_reported_at=?3,profile_rejection=?4 WHERE host_id=?1",
+        params![host_id, profile_json, stamp(now), rejection],
     )?;
     if before != after {
         audit(
@@ -289,6 +297,17 @@ fn record_host_profile(
         )?;
     }
     Ok(())
+}
+
+/// Order-insensitive form, so reordering a profile is not reported as drift.
+fn normalize_profile(mut profile: HostProfileSummary) -> HostProfileSummary {
+    profile.host_tags.sort();
+    profile.host_tags.dedup();
+    profile.expected_services.sort();
+    profile.expected_services.dedup();
+    profile.enabled_collectors.sort();
+    profile.enabled_collectors.dedup();
+    profile
 }
 
 fn bundle_expiring(db: &Connection, host: &str, desired: u64, now: DateTime<Utc>) -> Result<bool> {

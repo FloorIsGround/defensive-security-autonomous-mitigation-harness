@@ -18,7 +18,6 @@ use defsec_protocol::{
         IncidentOpened, PolicyDecision as PolicyDecisionAudited, RunCompleted,
     },
     canonical::sha256_hex,
-    profile::HostProfileSummary,
     rpc::*,
     signing::{DOMAIN_WATCH_BUNDLE_V1, SignedEnvelope, SigningKeyPair, VerifyingKeyStore},
     watch::*,
@@ -449,34 +448,17 @@ impl ControlService {
                     allowed_collectors: vec![],
                     expires_at: now + Duration::seconds(1),
                 };
-                let profile: Option<HostProfileSummary> = db.query_row(
-                    "SELECT profile_json FROM hosts WHERE host_id=?1",
-                    [&spec.host_id],
-                    |r| optional_json(r, 0),
-                )?;
-                let collector = spec.collector.collector_type();
-                let decision = if profile
-                    .is_some_and(|profile| !profile.enabled_collectors.contains(&collector))
-                {
-                    PolicyDecision {
-                        allowed: false,
-                        rule_id: "profile.collector_disabled".into(),
-                        reason: format!(
-                            "host '{}' reported that its profile disables collector '{}'",
-                            spec.host_id,
-                            collector.as_str()
-                        ),
-                        policy_version: self.policy().policy_version,
-                    }
-                } else {
-                    evaluate_watch_proposal(
-                        &capability,
-                        &spec,
-                        &ProposalContext::default(),
-                        self.policy(),
-                        now,
-                    )
-                };
+                // The reported profile is advisory: a compromised agent must not be
+                // able to veto detection by claiming collectors are disabled. Drift is
+                // audited at registration, and an honest edge rejects disabled
+                // collectors itself with an explicit BundleAck reason.
+                let decision = evaluate_watch_proposal(
+                    &capability,
+                    &spec,
+                    &ProposalContext::default(),
+                    self.policy(),
+                    now,
+                );
                 record_decision(
                     db,
                     None,
