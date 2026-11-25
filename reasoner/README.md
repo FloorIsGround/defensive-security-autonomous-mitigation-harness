@@ -26,7 +26,7 @@ reasoner/
 │   ├── control_harness.py          # real control-d subprocess + synthetic agent-d wire client
 │   ├── benchmark.py                # §9 adaptive-vs-static scenarios, JSON + Markdown reports
 │   └── cli.py / __main__.py        # `worker` and `benchmark` entrypoints
-└── tests/                          # 120 unittest cases incl. LIVE control-d integration + benchmark
+└── tests/                          # 131 unittest cases incl. LIVE control-d integration + benchmark
 ```
 
 ## Safety model (what the worker can never do)
@@ -59,6 +59,25 @@ reasoner/
   in `control-d`: baseline watches are untouchable, sensitive paths
   (`/etc/shadow`, host keys) are denied, sub-floor polling intervals are
   rejected, and every decision is durably audited.
+* Every typed proposal (watch, expectation rule, action) carries an
+  **idempotency key**; control-d stores a receipt per `(run_id,
+  idempotency_key)` so replaying the same key with the same canonical spec
+  returns the original response, while reusing a key with a different spec
+  is a structured `conflict`. When the model omits the key, the worker
+  derives a deterministic default `auto-<sha256[:32]>` from the run ID plus
+  an RFC 8785 canonical serialization of the proposal, so a proposal whose
+  response was lost can be resubmitted verbatim and replays instead of
+  storing a duplicate — identical proposals in one run share a key, distinct
+  proposals get distinct keys, and keys are stable across worker restarts.
+* A transport-level failure during a proposal tool (read timeout, EOF,
+  unreachable socket) is **never** treated as a rejection and never aborts
+  the run: the model receives an explicit
+  `{"error": "outcome_unknown", "detail": …, "retry_hint": "re-submitting
+  the identical rule is safe; it will replay"}` tool result, the attempt is
+  charged against the per-run proposal cap, and the loop continues. Structured
+  RPC errors and gate denials are reported to the model verbatim, and
+  transport failures outside the proposal tools keep the bounded
+  requeue-and-backoff behavior.
 * Runs default to 6 turns, 45 seconds, 48,000 tokens, $0.25, 3 watch proposals,
   3 expectation rule proposals, a 24 KiB initial context, a 32 KiB conversation
   context, and a 120-second lease. Use `--max-turns` and `--max-total-tokens` to
@@ -137,7 +156,11 @@ Markdown summary table and exits non-zero if any assertion fails.
   dual-signed responses, and adversarial invalid-verb/shell-smuggling attempts.
 * `test_expectation_rules.py` — Phase 10 rule-proposal surface: enabled by
   default, client-side hard cap of 3 per run, exact wire shape, system-prompt
-  guidance, and denied-decision / RPC-error / schema-rejection handling.
+  guidance, deterministic auto idempotency keys (lost-response replay,
+  distinct-rule distinct keys, restart stability), `outcome_unknown` handling
+  for transport failures, denied-decision / RPC-error / conflict reporting,
+  and a prompt-injection test proving injected telemetry never yields a
+  proposal.
 * `test_live_integration.py` — **LIVE** against compiled `control-d`:
   lease → run → propose ephemeral watch → evidence-bound finding → propose
   inert expectation rule → complete → audit-chain verification; expired-lease

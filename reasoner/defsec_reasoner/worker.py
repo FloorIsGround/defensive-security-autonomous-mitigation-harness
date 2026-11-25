@@ -21,12 +21,16 @@ import json
 import logging
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from queue import Full, Queue
 from typing import Any, Callable
 
 from defsec_reasoner import PROMPT_SCHEMA_VERSION
+from defsec_reasoner.canonical import (
+    CanonicalizationError,
+    canonical_json,
+    sha256_hex,
+)
 from defsec_reasoner.context import (
     compact_for_prompt,
     has_set_items,
@@ -203,6 +207,9 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
             "rationale: str (<=1024 bytes), "
             "expires_at: '<RFC3339 UTC within 30 days, required>'}. Sockets fields: "
             "protocol, local_addr, local_port, uid, comm, systemd_unit, bind_scope. "
+            "Proposals are idempotent per (run_id, idempotency_key): omit the key "
+            "and an identical resubmission of the same rule replays the stored "
+            "decision instead of proposing twice. "
             "Arguments: rule (object), optional idempotency_key (string)."
         ),
         "parameters": {
@@ -397,6 +404,56 @@ def _redact_credentials(text: str, client: ControlRpcClient, lease_token: str) -
         if credential:
             text = text.replace(credential, "[redacted]")
     return text
+
+
+def _auto_idempotency_key(run_id: str, payload: Any) -> str:
+    """Deterministic default idempotency key for one typed proposal.
+
+    control-d stores a receipt per ``(run_id, idempotency_key)``: replaying
+    the same key with the same canonical spec returns the original response,
+    and reusing it with a different spec is a structured ``conflict``.
+    Deriving the key from the run plus an RFC 8785 canonical serialization
+    of the proposal payload means a proposal whose response was lost can be
+    resubmitted verbatim and replay instead of storing a duplicate: identical
+    proposals in the same run share a key, distinct proposals get distinct
+    keys, and the key is stable across worker restarts because it contains
+    no process-local randomness and no attempt counter.
+
+    A payload outside the canonical JSON subset (e.g. a non-integral float
+    smuggled in by a model) falls back to sorted deterministic JSON: the
+    key stays a pure function of the payload, and control-d's typed boundary
+    still rejects the spec itself.
+    """
+    try:
+        payload_material = canonical_json(payload)
+    except CanonicalizationError:
+        payload_material = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        )
+    material = canonical_json(str(run_id)) + payload_material
+    return "auto-" + sha256_hex(material.encode("utf-8"))[:32]
+
+
+def _outcome_unknown(tool_noun: str, exc: RpcTransportError) -> dict[str, Any]:
+    """A proposal tool result for a transport-level failure (timeout/EOF).
+
+    The call was sent but no structured reply arrived: the proposal may have
+    committed before the connection died, or may never have been parsed.
+    That ambiguity is reported to the model explicitly instead of aborting
+    the run or guessing a schema rejection; the deterministic auto key (or
+    the model's own key) makes an identical resubmission replay the receipt.
+    Callers add their ``_*_attempted`` flag so the attempt is charged
+    against the per-run proposal cap.
+    """
+    return {
+        "error": "outcome_unknown",
+        "detail": clip_utf8(
+            "control-d transport failure while submitting the "
+            f"{tool_noun} (a commit may or may not have landed): {exc}",
+            256,
+        ),
+        "retry_hint": f"re-submitting the identical {tool_noun} is safe; it will replay",
+    }
 
 
 class ReasonerWorker:
@@ -791,7 +848,16 @@ class ReasonerWorker:
                         run_id,
                         incident_id,
                         args.get("idempotency_key")
-                        or f"{run_id}-a{action_proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        or _auto_idempotency_key(
+                            run_id,
+                            {
+                                "verb": verb,
+                                "evidence_observation_ids": sorted({int(i) for i in evidence}),
+                                "expected_effect": expected_effect,
+                                "blast_radius": blast_radius,
+                                "rollback_plan": rollback_plan,
+                            },
+                        ),
                         verb,
                         [int(i) for i in evidence],
                         expected_effect,
@@ -803,6 +869,14 @@ class ReasonerWorker:
                         {
                             "error": exc.code,
                             "detail": exc.message,
+                            "_action_proposal_attempted": True,
+                        },
+                        False,
+                    )
+                except RpcTransportError as exc:
+                    return (
+                        {
+                            **_outcome_unknown("action proposal", exc),
                             "_action_proposal_attempted": True,
                         },
                         False,
@@ -891,7 +965,9 @@ class ReasonerWorker:
                     reply = client.propose_ephemeral_watch(
                         run_id,
                         args.get("idempotency_key")
-                        or f"{run_id}-p{proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        or _auto_idempotency_key(
+                            run_id, {"spec": spec, "rationale": rationale}
+                        ),
                         spec,
                         rationale,
                     )
@@ -903,19 +979,17 @@ class ReasonerWorker:
                         False,
                     )
                 except RpcTransportError as exc:
-                    if "unexpected EOF" in str(exc):
-                        return (
-                            {
-                                "error": "schema_rejected",
-                                "detail": (
-                                    "control-d rejected the WatchSpec JSON schema (deny_unknown_fields or missing required field); "
-                                    "verify exact WatchSpec structure"
-                                ),
-                                "_proposal_attempted": True,
-                            },
-                            False,
-                        )
-                    raise
+                    # The proposal may have committed before the connection died,
+                    # or never have been parsed. Report the ambiguity to the model
+                    # (the deterministic key makes an identical resubmission
+                    # replay), charge the attempt, and keep the run going.
+                    return (
+                        {
+                            **_outcome_unknown("ephemeral watch proposal", exc),
+                            "_proposal_attempted": True,
+                        },
+                        False,
+                    )
                 decision = reply.get("decision") or {}
                 result = {
                     "decision": decision,
@@ -947,7 +1021,7 @@ class ReasonerWorker:
                     reply = client.propose_expectation_rule(
                         run_id,
                         args.get("idempotency_key")
-                        or f"{run_id}-r{rule_proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        or _auto_idempotency_key(run_id, rule),
                         rule,
                     )
                 except RpcError as exc:
@@ -958,20 +1032,20 @@ class ReasonerWorker:
                         False,
                     )
                 except RpcTransportError as exc:
-                    if "unexpected EOF" in str(exc):
-                        return (
-                            {
-                                "error": "schema_rejected",
-                                "detail": (
-                                    "control-d rejected the ExpectationRuleSpec JSON schema "
-                                    "(deny_unknown_fields or missing required field); "
-                                    "verify exact rule structure"
-                                ),
-                                "_rule_proposal_attempted": True,
-                            },
-                            False,
-                        )
-                    raise
+                    # A read timeout or EOF means the outcome is genuinely
+                    # unknown: the rule may have committed before the response
+                    # was lost, or may never have been parsed (control-d closes
+                    # the socket on a schema violation). Report that to the
+                    # model — never abort the run and never guess a rejection —
+                    # and charge the attempt. The deterministic key makes an
+                    # identical resubmission replay the original receipt.
+                    return (
+                        {
+                            **_outcome_unknown("rule", exc),
+                            "_rule_proposal_attempted": True,
+                        },
+                        False,
+                    )
                 decision = reply.get("decision") or {}
                 result = {
                     "decision": decision,
