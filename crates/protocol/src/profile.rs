@@ -79,14 +79,13 @@ pub struct HostProfile {
 }
 
 /// Summary of an applied profile reported to the control plane on Register.
-/// The control plane treats it as informational in this schema version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostProfileSummary {
     pub host_tags: Vec<String>,
     pub expected_services: Vec<String>,
     /// Effective enabled collectors after intersecting with the built-in
-    /// allowlist (sorted; `None` profile means every built-in collector).
+    /// allowlist (sorted).
     pub enabled_collectors: Vec<CollectorType>,
 }
 

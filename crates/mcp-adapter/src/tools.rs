@@ -22,8 +22,16 @@ pub(crate) fn available_tools(mode: Mode) -> impl Iterator<Item = &'static Tool>
 const READ_TOOLS: &[Tool] = &[
     Tool {
         name: "list_hosts",
-        description: "List enrolled hosts in the capability scope.",
-        schema: || object([], [("limit", nullable(unsigned(u32::MAX.into())))]),
+        description: "List enrolled hosts in the capability scope, optionally filtered by host tag.",
+        schema: || {
+            object(
+                [],
+                [
+                    ("limit", nullable(unsigned(u32::MAX.into()))),
+                    ("tag", nullable(string())),
+                ],
+            )
+        },
     },
     Tool {
         name: "list_active_incidents",

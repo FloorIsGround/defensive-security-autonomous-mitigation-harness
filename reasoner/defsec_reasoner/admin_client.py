@@ -133,8 +133,11 @@ class AdminClient:
 
     # ------------------------------------------------------------------- reads
 
-    def list_hosts(self) -> list[dict[str, Any]]:
-        return self.call({"admin_op": "list_hosts"})["hosts"]
+    def list_hosts(self, *, tag: str | None = None) -> list[dict[str, Any]]:
+        request = {"admin_op": "list_hosts"}
+        if tag is not None:
+            request["tag"] = tag
+        return self.call(request)["hosts"]
 
     def list_incidents(self) -> list[dict[str, Any]]:
         return self.call({"admin_op": "list_incidents"})["incidents"]

@@ -69,9 +69,14 @@ pub enum BundleAckStatus {
 }
 
 /// Messages sent from `agent-d` -> `control-d`.
+pub type AgentToControl = AgentToControlMessage<HostProfileSummary>;
+
+/// The inbound envelope can decode a registration profile separately from the
+/// rest of the message so control can audit a malformed report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AgentToControl {
+#[serde(bound(deserialize = "P: Deserialize<'de>"))]
+pub enum AgentToControlMessage<P> {
     Register {
         protocol_version: u32,
         host_id: String,
@@ -83,9 +88,9 @@ pub enum AgentToControl {
         active_bundle_digest: Option<String>,
         sent_at: DateTime<Utc>,
         /// Summary of the admin-owned host profile applied by this agent.
-        /// Optional and informational; older agents omit it.
+        /// Older agents omit it.
         #[serde(default)]
-        host_profile: Option<HostProfileSummary>,
+        host_profile: Option<P>,
     },
     Heartbeat {
         host_id: String,

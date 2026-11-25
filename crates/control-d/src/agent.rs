@@ -4,19 +4,22 @@ use chrono::{DateTime, Duration, Utc};
 use defsec_policy::{
     control_gate::{WakeBudgetConfig, WakeDecision, check_wake_budget},
     edge_floor::{EdgeSafetyConfig, is_valid_identifier},
+    host_profile::validate_host_profile_summary,
     predicate::{PredicateOutcome, evaluate_predicate},
     rules::apply_expectation_rules,
 };
 use defsec_protocol::{
-    audit::AuditEventType::{BundleAcked, IncidentOpened},
-    canonical::canonical_sha256_hex,
+    audit::AuditEventType::{BundleAcked, HostProfileChanged, HostProfileRejected, IncidentOpened},
+    canonical::{canonical_sha256_hex, value_to_canonical_json},
     observation::{ObservationPayload, ObservationRecord, ObservationStatus},
+    profile::HostProfileSummary,
     rpc::{PolicyDecision, Severity},
     watch::{
         CollectorSpec, CompareTarget, DataClassification, TriggerPredicate, WatchClass, WatchSpec,
     },
     wire::{
-        AgentToControl, BundleAckStatus, ControlToAgent, WIRE_PROTOCOL_VERSION, WatchRunSummary,
+        AgentToControl, AgentToControlMessage, BundleAckStatus, ControlToAgent,
+        WIRE_PROTOCOL_VERSION, WatchRunSummary,
     },
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -33,8 +36,16 @@ use crate::{
 
 impl ControlService {
     pub fn handle_agent_message(&self, msg: AgentToControl) -> Vec<ControlToAgent> {
-        let registering = matches!(msg, AgentToControl::Register { .. });
-        match self.transaction(|db| self.agent(db, msg)) {
+        self.handle_agent_message_with_profile(msg, Ok)
+    }
+
+    pub(crate) fn handle_agent_message_with_profile<P>(
+        &self,
+        msg: AgentToControlMessage<P>,
+        decode_profile: impl FnOnce(P) -> std::result::Result<HostProfileSummary, String>,
+    ) -> Vec<ControlToAgent> {
+        let registering = matches!(msg, AgentToControlMessage::Register { .. });
+        match self.transaction(|db| self.agent(db, msg, decode_profile)) {
             Ok(replies) => replies,
             Err(error) => {
                 let (_, message) = error.response_parts();
@@ -48,10 +59,15 @@ impl ControlService {
         }
     }
 
-    fn agent(&self, db: &Connection, msg: AgentToControl) -> Result<Vec<ControlToAgent>> {
+    fn agent<P>(
+        &self,
+        db: &Connection,
+        msg: AgentToControlMessage<P>,
+        decode_profile: impl FnOnce(P) -> std::result::Result<HostProfileSummary, String>,
+    ) -> Result<Vec<ControlToAgent>> {
         let now = Utc::now();
         match msg {
-            AgentToControl::Register {
+            AgentToControlMessage::Register {
                 protocol_version,
                 host_id,
                 agent_version,
@@ -59,6 +75,7 @@ impl ControlService {
                 session_id,
                 active_bundle_version,
                 active_bundle_digest,
+                host_profile,
                 ..
             } => {
                 require_host(db, &host_id)?;
@@ -92,6 +109,7 @@ impl ControlService {
                     "UPDATE hosts SET agent_version=?2,boot_id=?3,session_id=?4,last_heartbeat_at=?5,liveness_status='online',
                      active_bundle_version=CASE WHEN ?6 THEN ?7 WHEN ?8 THEN 0 ELSE active_bundle_version END WHERE host_id=?1",
                     params![host_id,agent_version,boot_id,session_id,stamp(now),active_matches,active_bundle_version,new_session])?;
+                record_host_profile(db, &host_id, host_profile.map(decode_profile).transpose(), now)?;
                 let mut reply = vec![register_ack(now, None, acked)];
                 let renew = bundle_expiring(db, &host_id, desired, now)?;
                 let expected = if renew {
@@ -116,7 +134,7 @@ impl ControlService {
                 }
                 Ok(reply)
             }
-            AgentToControl::Heartbeat {
+            AgentToControlMessage::Heartbeat {
                 host_id,
                 session_id,
                 active_bundle_version,
@@ -182,10 +200,10 @@ impl ControlService {
                 }
                 Ok(replies)
             }
-            AgentToControl::PushObservationDelta { observation } => {
+            AgentToControlMessage::PushObservationDelta { observation } => {
                 ingest(db, observation, &self.policy().edge_floor, now)
             }
-            AgentToControl::BundleAck {
+            AgentToControlMessage::BundleAck {
                 host_id,
                 bundle_id,
                 bundle_version,
@@ -220,6 +238,57 @@ impl ControlService {
             }
         }
     }
+}
+
+fn record_host_profile(
+    db: &Connection,
+    host_id: &str,
+    reported: std::result::Result<Option<HostProfileSummary>, String>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let before: Option<HostProfileSummary> = db.query_row(
+        "SELECT profile_json FROM hosts WHERE host_id=?1",
+        [host_id],
+        |r| optional_json(r, 0),
+    )?;
+    let request = uuid();
+    let after = match reported.and_then(|profile| {
+        if let Some(profile) = &profile {
+            validate_host_profile_summary(profile)?;
+        }
+        Ok(profile)
+    }) {
+        Ok(profile) => profile,
+        Err(reason) => {
+            tracing::warn!(%host_id, ?reason, "invalid host profile summary");
+            audit(
+                db,
+                HostProfileRejected,
+                host_id,
+                &request,
+                json!({"host_id": host_id, "reason": reason}),
+            )?;
+            None
+        }
+    };
+    let profile_json = after
+        .as_ref()
+        .map(|profile| value_to_canonical_json(&json!(profile)))
+        .transpose()?;
+    db.execute(
+        "UPDATE hosts SET profile_json=?2,profile_reported_at=?3 WHERE host_id=?1",
+        params![host_id, profile_json, stamp(now)],
+    )?;
+    if before != after {
+        audit(
+            db,
+            HostProfileChanged,
+            host_id,
+            &request,
+            json!({"host_id": host_id, "before": before, "after": after}),
+        )?;
+    }
+    Ok(())
 }
 
 fn bundle_expiring(db: &Connection, host: &str, desired: u64, now: DateTime<Utc>) -> Result<bool> {

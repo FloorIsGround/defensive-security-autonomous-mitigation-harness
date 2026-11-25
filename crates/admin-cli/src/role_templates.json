@@ -1,0 +1,51 @@
+[
+  {
+    "roles": ["desktop", "server", "bastion"],
+    "collector": { "type": "sockets.listening", "parameters": {} },
+    "interval_seconds": 30,
+    "set_field": "sockets",
+    "identity_key": "socket_key",
+    "ignore_fields": ["inode", "pid", "pid_start_time_ticks"]
+  },
+  {
+    "roles": ["desktop", "server", "bastion"],
+    "collector": { "type": "packages.inventory", "parameters": {} },
+    "interval_seconds": 900,
+    "set_field": "packages",
+    "identity_key": "package_key"
+  },
+  {
+    "roles": ["desktop"],
+    "collector": { "type": "connections.outbound", "parameters": {} },
+    "interval_seconds": 300,
+    "set_field": "flows",
+    "identity_key": "flow_key"
+  },
+  {
+    "roles": ["server", "bastion"],
+    "collector": { "type": "connections.outbound", "parameters": {} },
+    "interval_seconds": 60,
+    "set_field": "flows",
+    "identity_key": "flow_key"
+  },
+  {
+    "roles": ["server", "bastion"],
+    "collector": {
+      "type": "files.metadata",
+      "parameters": { "paths": ["/etc/ssh/sshd_config"], "compute_hash": true }
+    },
+    "interval_seconds": 300,
+    "set_field": "files",
+    "identity_key": "path"
+  },
+  {
+    "roles": ["bastion"],
+    "collector": {
+      "type": "journal.unit_events",
+      "parameters": { "unit": "ssh.service", "min_priority": 6 }
+    },
+    "interval_seconds": 30,
+    "set_field": "events",
+    "identity_key": "cursor"
+  }
+]

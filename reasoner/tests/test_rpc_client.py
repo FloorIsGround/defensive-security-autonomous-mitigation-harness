@@ -50,6 +50,8 @@ class TestControlRpcClient(unittest.TestCase):
         self.assertEqual(envelope["capability_token"], TOKEN)
         self.assertRegex(envelope["request_id"], r"^[0-9a-f]{32}$")
         self.assertEqual(envelope["request"], {"op": "list_hosts", "limit": 5})
+        self.client.list_hosts(tag="region:west")
+        self.assertEqual(self.server.last_envelope["request"], {"op": "list_hosts", "tag": "region:west"})
 
     def test_omitted_optional_fields_are_absent(self) -> None:
         self.client.query_observations("edge-01")

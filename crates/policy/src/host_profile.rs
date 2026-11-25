@@ -33,29 +33,7 @@ pub fn apply_host_profile(
         ));
     }
 
-    if profile.host_tags.len() > MAX_HOST_TAGS {
-        return Err(format!(
-            "host profile declares {} host_tags (max {MAX_HOST_TAGS})",
-            profile.host_tags.len()
-        ));
-    }
-    for tag in &profile.host_tags {
-        if !is_valid_host_tag(tag) {
-            return Err(format!(
-                "host tag '{tag}' must match ^[a-z0-9][a-z0-9:._-]{{0,63}}$"
-            ));
-        }
-    }
-
-    if profile.expected_services.len() > MAX_EXPECTED_SERVICES {
-        return Err(format!(
-            "host profile declares {} expected_services (max {MAX_EXPECTED_SERVICES})",
-            profile.expected_services.len()
-        ));
-    }
-    for unit in &profile.expected_services {
-        validate_systemd_unit_name(unit)?;
-    }
+    validate_profile_metadata(&profile.host_tags, &profile.expected_services)?;
 
     if profile.approved_file_roots.len() > MAX_PROFILE_FILE_ROOTS {
         return Err(format!(
@@ -123,6 +101,45 @@ pub fn apply_host_profile(
         enabled_collectors: effective.allowed_collectors.iter().copied().collect(),
     };
     Ok((effective, summary))
+}
+
+/// Validate the metadata and effective collector set from an agent registration.
+pub fn validate_host_profile_summary(summary: &HostProfileSummary) -> Result<(), String> {
+    validate_profile_metadata(&summary.host_tags, &summary.expected_services)?;
+    let enabled: BTreeSet<_> = summary.enabled_collectors.iter().collect();
+    if enabled.len() != summary.enabled_collectors.len() {
+        return Err("host profile summary contains duplicate enabled_collectors".into());
+    }
+    Ok(())
+}
+
+fn validate_profile_metadata(host_tags: &[String], expected_services: &[String]) -> Result<(), String> {
+    if host_tags.len() > MAX_HOST_TAGS {
+        return Err(format!(
+            "host profile declares {} host_tags (max {MAX_HOST_TAGS})",
+            host_tags.len()
+        ));
+    }
+    for tag in host_tags {
+        if tag.len() > 64 {
+            return Err("host tag must be at most 64 bytes".into());
+        }
+        if !is_valid_host_tag(tag) {
+            return Err(format!(
+                "host tag '{tag}' must match ^[a-z0-9][a-z0-9:._-]{{0,63}}$"
+            ));
+        }
+    }
+    if expected_services.len() > MAX_EXPECTED_SERVICES {
+        return Err(format!(
+            "host profile declares {} expected_services (max {MAX_EXPECTED_SERVICES})",
+            expected_services.len()
+        ));
+    }
+    for unit in expected_services {
+        validate_systemd_unit_name(unit)?;
+    }
+    Ok(())
 }
 
 /// Lexically validate one profile-supplied approved file root: absolute,

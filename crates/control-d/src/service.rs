@@ -18,6 +18,7 @@ use defsec_protocol::{
         IncidentOpened, PolicyDecision as PolicyDecisionAudited, RunCompleted,
     },
     canonical::sha256_hex,
+    profile::HostProfileSummary,
     rpc::*,
     signing::{DOMAIN_WATCH_BUNDLE_V1, SignedEnvelope, SigningKeyPair, VerifyingKeyStore},
     watch::*,
@@ -29,7 +30,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::expectation_rules::RuleStore;
-use crate::ledger::{self, audit, json_column, rows};
+use crate::ledger::{self, audit, json_column, optional_json, rows};
 use crate::server::Registry;
 
 #[path = "actions.rs"]
@@ -448,13 +449,34 @@ impl ControlService {
                     allowed_collectors: vec![],
                     expires_at: now + Duration::seconds(1),
                 };
-                let decision = evaluate_watch_proposal(
-                    &capability,
-                    &spec,
-                    &ProposalContext::default(),
-                    self.policy(),
-                    now,
-                );
+                let profile: Option<HostProfileSummary> = db.query_row(
+                    "SELECT profile_json FROM hosts WHERE host_id=?1",
+                    [&spec.host_id],
+                    |r| optional_json(r, 0),
+                )?;
+                let collector = spec.collector.collector_type();
+                let decision = if profile
+                    .is_some_and(|profile| !profile.enabled_collectors.contains(&collector))
+                {
+                    PolicyDecision {
+                        allowed: false,
+                        rule_id: "profile.collector_disabled".into(),
+                        reason: format!(
+                            "host '{}' reported that its profile disables collector '{}'",
+                            spec.host_id,
+                            collector.as_str()
+                        ),
+                        policy_version: self.policy().policy_version,
+                    }
+                } else {
+                    evaluate_watch_proposal(
+                        &capability,
+                        &spec,
+                        &ProposalContext::default(),
+                        self.policy(),
+                        now,
+                    )
+                };
                 record_decision(
                     db,
                     None,
@@ -616,9 +638,17 @@ impl ControlService {
                     retired_ephemeral_watches: retired,
                 })
             }
-            AdminRequest::ListHosts => Ok(AdminResponse::Hosts {
-                hosts: list_hosts(db)?,
-            }),
+            AdminRequest::ListHosts { tag } => {
+                let response = AdminResponse::Hosts {
+                    hosts: list_hosts(db, tag.as_deref())?,
+                };
+                if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
+                    return Err(ControlError::invalid(
+                        "host list exceeds the frame limit; filter by tag",
+                    ));
+                }
+                Ok(response)
+            }
             AdminRequest::ListIncidents => Ok(AdminResponse::Incidents {
                 incidents: list_incidents(db)?,
             }),
@@ -805,11 +835,16 @@ pub(crate) fn insert_watch(
     Ok(())
 }
 
-pub(crate) fn list_hosts(db: &Connection) -> Result<Vec<HostSummary>> {
+pub(crate) fn list_hosts(db: &Connection, tag: Option<&str>) -> Result<Vec<HostSummary>> {
     rows(
         db,
-        "SELECT host_id,agent_version,liveness_status,active_bundle_version,last_heartbeat_at FROM hosts ORDER BY host_id",
-        [],
+        "SELECT host_id,agent_version,liveness_status,active_bundle_version,last_heartbeat_at,profile_json
+         FROM hosts
+         WHERE ?1 IS NULL OR EXISTS (
+             SELECT 1 FROM json_each(hosts.profile_json, '$.host_tags') WHERE value=?1
+         )
+         ORDER BY host_id",
+        [tag],
         |r| {
             Ok(HostSummary {
                 host_id: r.get(0)?,
@@ -820,6 +855,7 @@ pub(crate) fn list_hosts(db: &Connection) -> Result<Vec<HostSummary>> {
                     .get::<_, Option<String>>(4)?
                     .map(|value| parse_stamp(&value, 4))
                     .transpose()?,
+                host_profile: optional_json(r, 5)?,
             })
         },
     )

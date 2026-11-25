@@ -11,11 +11,13 @@ use std::{
 
 use defsec_mtls::MtlsAcceptor;
 use defsec_protocol::{
+    profile::HostProfileSummary,
     rpc::{AdminRequest, InvestigationCall},
     signing::SignedEnvelope,
     watch::WatchBundlePayload,
-    wire::{AgentToControl, ControlToAgent, read_frame, write_frame},
+    wire::{AgentToControl, AgentToControlMessage, ControlToAgent, read_frame, write_frame},
 };
+use serde::{Deserialize, de::IgnoredAny};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, UnixListener, UnixStream},
@@ -242,6 +244,13 @@ impl Drop for RegisteredAgent {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReportedHostProfile {
+    Summary(HostProfileSummary),
+    Malformed(IgnoredAny),
+}
+
 async fn agent_connection<S>(
     mut stream: S,
     service: ControlService,
@@ -251,11 +260,15 @@ async fn agent_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let register = timeout(IO_TIMEOUT, read_frame::<_, AgentToControl>(&mut stream)).await??;
-    let Some(msg @ AgentToControl::Register { .. }) = register else {
+    let register = timeout(
+        IO_TIMEOUT,
+        read_frame::<_, AgentToControlMessage<ReportedHostProfile>>(&mut stream),
+    )
+    .await??;
+    let Some(msg @ AgentToControlMessage::Register { .. }) = register else {
         return Ok(());
     };
-    let AgentToControl::Register {
+    let AgentToControlMessage::Register {
         host_id,
         session_id,
         active_bundle_version,
@@ -286,7 +299,10 @@ where
             let mut registry = registry
                 .lock()
                 .map_err(|_| io::Error::other("agent registry lock poisoned"))?;
-            let replies = service.handle_agent_message(msg);
+            let replies = service.handle_agent_message_with_profile(msg, |profile| match profile {
+                ReportedHostProfile::Summary(summary) => Ok(summary),
+                ReportedHostProfile::Malformed(_) => Err("malformed host profile summary".into()),
+            });
             if matches!(
                 replies.first(),
                 Some(ControlToAgent::RegisterAck { accepted: true, .. })
