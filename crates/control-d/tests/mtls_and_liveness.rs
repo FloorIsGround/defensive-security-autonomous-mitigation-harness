@@ -226,6 +226,7 @@ async fn fleet_mtls_runs_agent_protocol_end_to_end() {
             compare_against: CompareTarget::AcceptedBaseline,
             set_field: "sockets".into(),
             identity_key: "socket_key".into(),
+            ignore_fields: vec![],
         },
         wake_policy: WakePolicy {
             cooldown_seconds: 60,

@@ -6,6 +6,9 @@ pub mod audit;
 pub mod canonical;
 pub mod observation;
 pub mod rpc;
+pub mod rules;
 pub mod signing;
 pub mod watch;
 pub mod wire;
+
+pub use rules::*;

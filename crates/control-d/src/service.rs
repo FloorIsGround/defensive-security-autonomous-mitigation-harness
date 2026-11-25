@@ -28,6 +28,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::expectation_rules::RuleStore;
 use crate::ledger::{self, audit, json_column, rows};
 use crate::server::Registry;
 
@@ -343,7 +344,41 @@ impl ControlService {
     fn admin(&self, db: &Connection, req: AdminRequest) -> Result<AdminResponse> {
         let now = Utc::now();
         let request = uuid();
+        let rule_store = RuleStore {
+            db,
+            now,
+            request: &request,
+            policy_version: self.policy().policy_version,
+        };
         match req {
+            AdminRequest::CreateExpectationRule { rule, actor } => rule_store.create(&rule, &actor),
+            AdminRequest::DecideExpectationRule {
+                rule_id,
+                approve,
+                actor,
+                note,
+            } => rule_store.decide(rule_id, approve, &actor, note.as_deref()),
+            AdminRequest::RevokeExpectationRule {
+                rule_id,
+                actor,
+                reason,
+            } => rule_store.revoke(rule_id, &actor, &reason),
+            AdminRequest::BacktestExpectationRule { rule } => rule_store.admin_backtest(&rule),
+            AdminRequest::ListExpectationRules {
+                host_id,
+                statuses,
+                limit,
+            } => {
+                let response = AdminResponse::ExpectationRules {
+                    rules: rule_store.list(host_id.as_deref(), None, statuses.as_deref(), limit)?,
+                };
+                if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
+                    return Err(ControlError::invalid(
+                        "rule list exceeds the frame limit; lower the limit or filter by host or status",
+                    ));
+                }
+                Ok(response)
+            }
             AdminRequest::EnrollHost {
                 host_id,
                 agent_public_key_hex,
