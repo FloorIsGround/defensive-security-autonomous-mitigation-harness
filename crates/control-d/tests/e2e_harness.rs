@@ -136,6 +136,7 @@ impl E2eHarness {
         let AdminResponse::TokenMinted { token, .. } =
             self.control
                 .handle_admin_request(AdminRequest::MintCapabilityToken {
+                    may_spawn_runs: false,
                     principal_id: principal.into(),
                     role,
                     allowed_hosts: hosts,

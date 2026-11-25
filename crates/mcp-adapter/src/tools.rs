@@ -1,3 +1,4 @@
+use defsec_protocol::watch::{OUTBOUND_FLOWS_HARD_MAX, PACKAGES_INVENTORY_HARD_MAX};
 use serde_json::{Value, json};
 
 use crate::Mode;
@@ -9,14 +10,44 @@ pub(crate) struct Tool {
 }
 
 impl Tool {
-    pub fn descriptor(&self) -> Value {
-        json!({"name": self.name, "description": self.description, "inputSchema": (self.schema)()})
+    pub fn descriptor(&self, mode: Mode) -> Value {
+        let mut schema = (self.schema)();
+        if mode == Mode::Operator && is_run_tool(self.name) {
+            schema["properties"]["run_id"] = string();
+            schema["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("run_id"));
+        }
+        json!({"name": self.name, "description": self.description, "inputSchema": schema})
     }
 }
 
-pub(crate) fn available_tools(mode: Mode) -> impl Iterator<Item = &'static Tool> {
-    let investigator = (mode == Mode::Investigator).then_some(INVESTIGATOR_TOOLS);
-    READ_TOOLS.iter().chain(investigator.into_iter().flatten())
+pub(crate) fn available_tools(
+    mode: Mode,
+    delegated_investigator: bool,
+) -> impl Iterator<Item = &'static Tool> {
+    let mode_tools = match mode {
+        Mode::ReadOnly => &[],
+        Mode::Investigator => INVESTIGATOR_TOOLS,
+        Mode::Operator => OPERATOR_TOOLS,
+    };
+    let action = (mode == Mode::Operator || (mode == Mode::Investigator && delegated_investigator))
+        .then_some(&ACTION_TOOL);
+    READ_TOOLS.iter().chain(mode_tools).chain(action).chain(
+        (mode != Mode::ReadOnly)
+            .then_some(RUN_TOOLS)
+            .into_iter()
+            .flatten(),
+    )
+}
+
+pub(crate) fn is_run_tool(name: &str) -> bool {
+    RUN_TOOLS.iter().any(|tool| tool.name == name)
+        || matches!(
+            name,
+            "propose_action" | "finish_investigation" | "cancel_investigation"
+        )
 }
 
 const READ_TOOLS: &[Tool] = &[
@@ -117,6 +148,19 @@ const READ_TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "list_actions",
+        description: "List mitigation action intents within the capability scope.",
+        schema: || {
+            object(
+                [],
+                [
+                    ("host_id", nullable(string())),
+                    ("incident_id", nullable(string())),
+                ],
+            )
+        },
+    },
+    Tool {
         name: "list_expectation_rules",
         description: "List expectation rules within scope, optionally filtered by host and status.",
         schema: || {
@@ -127,11 +171,7 @@ const READ_TOOLS: &[Tool] = &[
                     (
                         "statuses",
                         nullable(array(choices(&[
-                            "active",
-                            "proposed",
-                            "rejected",
-                            "revoked",
-                            "expired",
+                            "active", "proposed", "rejected", "revoked", "expired",
                         ]))),
                     ),
                     ("limit", nullable(unsigned(u32::MAX.into()))),
@@ -141,29 +181,74 @@ const READ_TOOLS: &[Tool] = &[
     },
 ];
 
-const INVESTIGATOR_TOOLS: &[Tool] = &[
+const INVESTIGATOR_TOOLS: &[Tool] = &[Tool {
+    name: "start_investigation_run",
+    description: "Start a scoped investigation run for an incident.",
+    schema: || {
+        object(
+            [
+                ("incident_id", string()),
+                ("backend_id", string()),
+                ("model_id", string()),
+                ("prompt_schema_version", string()),
+            ],
+            [],
+        )
+    },
+}];
+
+const OPERATOR_TOOLS: &[Tool] = &[
     Tool {
-        name: "start_investigation_run",
-        description: "Start a scoped investigation run for an incident.",
+        name: "start_investigation",
+        description: "Start a delegated investigation for an open incident.",
+        schema: || object([("incident_id", string())], [("note", nullable(string()))]),
+    },
+    Tool {
+        name: "finish_investigation",
+        description: "Finish a delegated run and record its outcome.",
         schema: || {
             object(
-                [
-                    ("incident_id", string()),
-                    ("backend_id", string()),
-                    ("model_id", string()),
-                    ("prompt_schema_version", string()),
-                ],
-                [],
+                [("summary", string())],
+                [(
+                    "status",
+                    nullable(choices(&["completed", "failed", "budget_exhausted"])),
+                )],
             )
         },
     },
+    Tool {
+        name: "cancel_investigation",
+        description: "Cancel a delegated run and revoke its token.",
+        schema: || object([("reason", string())], []),
+    },
+];
+
+const ACTION_TOOL: Tool = Tool {
+    name: "propose_action",
+    description: "Draft a mitigation for independent operator approval.",
+    schema: || {
+        object(
+            [
+                ("incident_id", string()),
+                ("idempotency_key", string()),
+                ("verb", action_schema()),
+                ("evidence_observation_ids", array(signed())),
+                ("expected_effect", string()),
+                ("blast_radius", string()),
+                ("rollback_plan", string()),
+            ],
+            [],
+        )
+    },
+};
+
+const RUN_TOOLS: &[Tool] = &[
     Tool {
         name: "propose_ephemeral_watch",
         description: "Submit a typed temporary watch for a controller policy decision.",
         schema: || {
             object(
                 [
-                    ("run_id", string()),
                     ("idempotency_key", string()),
                     ("spec", watch_schema()),
                     ("rationale", string()),
@@ -178,7 +263,6 @@ const INVESTIGATOR_TOOLS: &[Tool] = &[
         schema: || {
             object(
                 [
-                    ("run_id", string()),
                     ("incident_id", string()),
                     ("kind", choices(&["hypothesis", "verified_finding"])),
                     (
@@ -196,20 +280,28 @@ const INVESTIGATOR_TOOLS: &[Tool] = &[
     },
     Tool {
         name: "propose_expectation_rule",
-        description: (
-            "Submit a closed-schema expectation rule for the adapter's current \
-             investigation run. A deterministic gate decides; accepted rules are \
-             stored as proposed with a backtest and stay inert until an operator \
-             approves them. The run binding comes from the adapter, not the caller."
-        ),
-        schema: || {
-            object(
-                [("idempotency_key", string()), ("rule", rule_schema())],
-                [],
-            )
-        },
+        description: "Submit a typed expectation rule. Accepted proposals include a backtest and require operator approval.",
+        schema: || object([("idempotency_key", string()), ("rule", rule_schema())], []),
     },
 ];
+
+fn action_schema() -> Value {
+    json!({"oneOf": [
+        object([
+            ("verb", json!({"const": "nft_block_ip"})), ("ip", string()),
+            ("direction", choices(&["inbound", "outbound", "both"])),
+            ("ttl_seconds", unsigned(u64::MAX)),
+        ], []),
+        object(
+            [("verb", json!({"const": "systemd_stop_unit"})), ("unit", string())],
+            [("ttl_seconds", nullable(unsigned(u64::MAX)))],
+        ),
+        object([
+            ("verb", json!({"const": "host_isolate"})), ("preserve_mgmt_cidrs", array(string())),
+            ("ttl_seconds", unsigned(u64::MAX)),
+        ], []),
+    ]})
+}
 
 fn run_filters() -> [(&'static str, Value); 3] {
     [
@@ -280,6 +372,15 @@ fn collector_schema() -> Value {
         collector("files.metadata", object([("paths", array(string()))], [
             ("compute_hash", boolean()), ("max_file_bytes", nullable(unsigned(u64::MAX))),
         ])),
+        collector("connections.outbound", object([], [
+            ("include_tcp", boolean()), ("include_udp", boolean()),
+            ("include_ipv6", boolean()), ("resolve_process", boolean()),
+            ("exclude_loopback", boolean()),
+            ("max_flows", nullable(unsigned(OUTBOUND_FLOWS_HARD_MAX.into()))),
+        ])),
+        collector("packages.inventory", object([], [
+            ("max_packages", nullable(unsigned(PACKAGES_INVENTORY_HARD_MAX.into()))),
+        ])),
         collector("journal.unit_events", object([("unit", string())], [
             ("min_priority", nullable(unsigned(u8::MAX.into()))),
             ("max_events_per_batch", nullable(unsigned(u32::MAX.into()))),
@@ -294,9 +395,10 @@ fn trigger_schema() -> Value {
         tagged("field_changed", [
             ("compare_against", compare()), ("fields", array(string())),
         ]),
-        tagged("set_diff", [
-            ("compare_against", compare()), ("set_field", string()), ("identity_key", string()),
-        ]),
+        object([
+            ("type", json!({"const": "set_diff"})), ("compare_against", compare()),
+            ("set_field", string()), ("identity_key", string()),
+        ], [("ignore_fields", array(string()))]),
         tagged("threshold_sustained", [
             ("field", string()), ("operator", choices(&["gt", "gte", "lt", "lte", "eq", "neq"])),
             ("threshold", signed()), ("consecutive_samples", unsigned(u32::MAX.into())),
@@ -320,9 +422,7 @@ fn tagged(tag: &str, required: impl IntoIterator<Item = (&'static str, Value)>) 
 // `MatchClause` is internally tagged on "op" rather than "type".
 fn op_tagged(tag: &str, required: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     object(
-        [("op", json!({"const": tag}))]
-            .into_iter()
-            .chain(required),
+        [("op", json!({"const": tag}))].into_iter().chain(required),
         [],
     )
 }
@@ -343,6 +443,8 @@ fn rule_schema() -> Value {
                                 "systemd.unit_state",
                                 "files.metadata",
                                 "journal.unit_events",
+                                "connections.outbound",
+                                "packages.inventory",
                             ]),
                         ),
                     ],

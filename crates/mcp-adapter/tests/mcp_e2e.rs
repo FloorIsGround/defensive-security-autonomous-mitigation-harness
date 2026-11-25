@@ -8,7 +8,10 @@ use control_d::{
 use defsec_protocol::{
     canonical::canonical_sha256_hex,
     observation::{ObservationPayload, ObservationRecord, ObservationStatus},
-    rpc::{AdminRequest, AdminResponse, PrincipalRole},
+    rpc::{
+        AdminRequest, AdminResponse, InvestigationCall, InvestigationRequest as Request,
+        InvestigationResponse as Response, PrincipalRole, RunOutcome, RunTerminalStatus,
+    },
     watch::{CollectorType, WatchSpec},
     wire::{AgentToControl, ControlToAgent, WIRE_PROTOCOL_VERSION},
 };
@@ -32,6 +35,7 @@ const READ_TOOLS: &[&str] = &[
     "list_investigation_runs",
     "get_run_events",
     "list_trigger_queue",
+    "list_actions",
     "list_expectation_rules",
 ];
 const WRITE_TOOLS: &[&str] = &[
@@ -393,6 +397,7 @@ async fn investigator_flow_preserves_controller_decisions() {
     let incident_id = &incidents[0].incident_id;
     let AdminResponse::TokenMinted { token, .. } =
         service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "operator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
@@ -410,6 +415,7 @@ async fn investigator_flow_preserves_controller_decisions() {
         token: observer_token,
         ..
     } = service.handle_admin_request(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
@@ -489,7 +495,7 @@ async fn investigator_flow_preserves_controller_decisions() {
     follow_up["lifecycle"]["max_runs"] = json!(20);
     let proposal = |key, spec| {
         json!({
-            "run_id":run_id, "idempotency_key":key, "spec":spec, "rationale":"inspect related state"
+            "idempotency_key":key, "spec":spec, "rationale":"inspect related state"
         })
     };
     let accepted = client
@@ -534,7 +540,7 @@ async fn investigator_flow_preserves_controller_decisions() {
 
     let finding = |evidence: Value| {
         json!({
-            "run_id":run_id, "incident_id":incident_id, "kind":"hypothesis", "severity":"medium",
+            "incident_id":incident_id, "kind":"hypothesis", "severity":"medium",
             "summary":"Service state changed", "uncertainty":"Cause unknown",
             "evidence_observation_ids":[evidence], "escalation_requested":false
         })
@@ -622,16 +628,16 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
     };
     assert_eq!(incidents.len(), 1);
     let incident_id = incidents[0].incident_id.clone();
-    let AdminResponse::TokenMinted { token, .. } = service.handle_admin_request(
-        AdminRequest::MintCapabilityToken {
+    let AdminResponse::TokenMinted { token, .. } =
+        service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "investigator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
             allowed_collectors: vec![CollectorType::SocketsListening],
             incident_id: Some(incident_id.clone()),
             ttl_seconds: 300,
-        },
-    )
+        })
     else {
         panic!("could not mint fixture token")
     };
@@ -639,6 +645,7 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
         token: observer_token,
         ..
     } = service.handle_admin_request(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
@@ -733,7 +740,10 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
         .await;
     assert_eq!(denied["result"], "rule_proposal_evaluated");
     assert_eq!(denied["decision"]["allowed"], false);
-    assert_eq!(denied["decision"]["rule_id"], "rule-gate/investigator-expiry");
+    assert_eq!(
+        denied["decision"]["rule_id"],
+        "rule-gate/investigator-expiry"
+    );
     assert!(denied["rule_id"].is_null());
     assert!(denied["backtest"].is_null());
 
@@ -751,7 +761,11 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
     assert_eq!(reply["error"]["code"], -32602);
 
     let listed = client
-        .tool("list_expectation_rules", json!({"statuses":["proposed"]}), false)
+        .tool(
+            "list_expectation_rules",
+            json!({"statuses":["proposed"]}),
+            false,
+        )
         .await;
     assert_eq!(listed["result"], "expectation_rules");
     let rules = listed["rules"].as_array().unwrap();
@@ -767,7 +781,11 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
 
     // An invalid status filter surfaces as a tool error, not a crash.
     let invalid = client
-        .tool("list_expectation_rules", json!({"statuses":["bogus"]}), true)
+        .tool(
+            "list_expectation_rules",
+            json!({"statuses":["bogus"]}),
+            true,
+        )
         .await;
     assert_eq!(invalid["result"], "error");
     assert_eq!(invalid["code"], "invalid_request");
@@ -781,7 +799,10 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
         .await;
     assert_eq!(observed["rules"][0]["rule_id"], *rule_id);
     let reply = observer
-        .request("tools/call", json!({"name":"propose_expectation_rule","arguments":{}}))
+        .request(
+            "tools/call",
+            json!({"name":"propose_expectation_rule","arguments":{}}),
+        )
         .await;
     assert_eq!(reply["error"]["code"], -32602);
     assert_eq!(
@@ -842,4 +863,406 @@ async fn binary_uses_stdio_and_requires_credentials() {
         frame["result"]["tools"].as_array().unwrap().len(),
         READ_TOOLS.len()
     );
+}
+
+fn mint_operator_fixture(service: &ControlService, spawn: bool, hosts: &[&str]) -> String {
+    let AdminResponse::TokenMinted { token, .. } =
+        service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            principal_id: "operator".into(),
+            role: PrincipalRole::Investigator,
+            allowed_hosts: hosts.iter().map(|host| (*host).into()).collect(),
+            allowed_collectors: vec![CollectorType::SocketsListening],
+            incident_id: None,
+            ttl_seconds: 300,
+            may_spawn_runs: spawn,
+        })
+    else {
+        panic!("could not mint operator fixture")
+    };
+    token
+}
+
+fn fixture_incident(service: &ControlService) -> String {
+    let AdminResponse::Incidents { incidents } =
+        service.handle_admin_request(AdminRequest::ListIncidents)
+    else {
+        panic!("could not list incidents")
+    };
+    incidents[0].incident_id.clone()
+}
+
+fn direct(service: &ControlService, token: &str, request: Request) -> Response {
+    service.handle_investigation_call(InvestigationCall {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        capability_token: token.into(),
+        request,
+    })
+}
+
+#[tokio::test]
+async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
+    let dir = TestDir::new();
+    let service = ControlService::open_with_policies(
+        &dir.0,
+        "key",
+        Default::default(),
+        defsec_policy::action_gate::ActionSafetyConfig::with_bounded_autonomous_containment(),
+    )
+    .unwrap();
+    seed_sockets_incident(&service);
+    let incident_id = fixture_incident(&service);
+    assert!(matches!(
+        service.handle_admin_request(AdminRequest::EnrollHost {
+            host_id: "other-allowed".into(),
+            agent_public_key_hex: None,
+        }),
+        AdminResponse::HostEnrolled { .. }
+    ));
+    assert!(matches!(
+        service.handle_admin_request(AdminRequest::EnrollHost {
+            host_id: "foreign".into(),
+            agent_public_key_hex: None,
+        }),
+        AdminResponse::HostEnrolled { .. }
+    ));
+
+    let parent = mint_operator_fixture(&service, true, &[HOST, "other-allowed"]);
+    let socket = dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let server_task = tokio::spawn(server.serve_investigation(service.clone()));
+    let mut client = Client::new(Mode::Operator, socket, parent.clone());
+    client
+        .handshake(
+            "2025-03-26",
+            &[
+                READ_TOOLS,
+                &[
+                    "start_investigation",
+                    "finish_investigation",
+                    "cancel_investigation",
+                    "propose_action",
+                    "propose_ephemeral_watch",
+                    "record_hypothesis_or_finding",
+                    "propose_expectation_rule",
+                ],
+            ]
+            .concat(),
+        )
+        .await;
+
+    let first = client
+        .tool(
+            "start_investigation",
+            json!({"incident_id":incident_id, "note":"Inspect socket drift"}),
+            false,
+        )
+        .await;
+    let first = first.as_object().unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(first["expires_at"].is_string());
+    let first_run = first["run_id"].as_str().unwrap();
+    let second = client
+        .tool(
+            "start_investigation",
+            json!({"incident_id":incident_id}),
+            false,
+        )
+        .await;
+    let second_run = second["run_id"].as_str().unwrap();
+    assert_ne!(first_run, second_run);
+
+    let hosts = client.tool("list_hosts", json!({}), false).await;
+    assert_eq!(hosts["hosts"].as_array().unwrap().len(), 2);
+    assert!(
+        hosts["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|host| host["host_id"] == "other-allowed")
+    );
+    for tool in [
+        "list_investigation_runs",
+        "list_expectation_rules",
+        "list_actions",
+    ] {
+        assert_eq!(
+            client.tool(tool, json!({"host_id":"foreign"}), true).await["code"],
+            "forbidden"
+        );
+    }
+
+    let context = client
+        .tool(
+            "get_incident_context",
+            json!({"incident_id":incident_id}),
+            false,
+        )
+        .await;
+    let evidence = &context["recent_observations"][0]["observation_id"];
+    let finding = |run: &str| {
+        json!({
+            "run_id":run, "incident_id":incident_id, "kind":"hypothesis", "severity":"low",
+            "summary":"Service state changed", "uncertainty":"Cause unknown",
+            "evidence_observation_ids":[evidence], "escalation_requested":false
+        })
+    };
+    let missing = client
+        .request(
+            "tools/call",
+            json!({"name":"record_hypothesis_or_finding","arguments":{}}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32602);
+    assert_eq!(
+        client
+            .tool("record_hypothesis_or_finding", finding("unknown"), true)
+            .await["code"],
+        "run_inactive"
+    );
+    let found = client
+        .tool("record_hypothesis_or_finding", finding(first_run), false)
+        .await;
+    assert_eq!(found["verified_evidence_count"], 1);
+
+    let allowed = client
+        .tool(
+            "propose_expectation_rule",
+            json!({
+                "run_id":first_run, "idempotency_key":"nx",
+                "rule":expectation_rule(Some(json!(Utc::now() + chrono::Duration::days(3))))
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(allowed["decision"]["allowed"], true);
+    let action = client.tool("propose_action", json!({
+        "run_id":first_run, "incident_id":incident_id, "idempotency_key":"action",
+        "verb":{"verb":"nft_block_ip","ip":"203.0.113.99","ttl_seconds":60,"direction":"both"},
+        "evidence_observation_ids":[evidence], "expected_effect":"Contain traffic",
+        "blast_radius":"One host", "rollback_plan":"Allow expiry"
+    }), false).await;
+    assert_eq!(action["status"], "pending_approval");
+    assert!(action["authorized_intent"].is_null());
+    let actions = client.tool("list_actions", json!({}), false).await;
+    assert_eq!(actions["actions"].as_array().unwrap().len(), 1);
+
+    let runs = client
+        .tool("list_investigation_runs", json!({}), false)
+        .await;
+    let runs = runs["runs"].as_array().unwrap();
+    assert_eq!(
+        runs.iter().find(|run| run["run_id"] == first_run).unwrap()["findings_count"],
+        1
+    );
+    assert_eq!(
+        runs.iter().find(|run| run["run_id"] == second_run).unwrap()["event_count"],
+        0
+    );
+    let finished = client
+        .tool(
+            "finish_investigation",
+            json!({"run_id":first_run,"summary":"Investigated drift"}),
+            false,
+        )
+        .await;
+    assert_eq!(finished["status"], "completed");
+    let cancelled = client
+        .tool(
+            "cancel_investigation",
+            json!({"run_id":second_run,"reason":"Duplicate run"}),
+            false,
+        )
+        .await;
+    assert_eq!(cancelled["status"], "cancelled");
+    for run in [first_run, second_run] {
+        assert_eq!(
+            client
+                .tool("record_hypothesis_or_finding", finding(run), true)
+                .await["code"],
+            "run_inactive"
+        );
+        let events = client
+            .tool("get_run_events", json!({"run_id":run}), false)
+            .await;
+        let events = events["events"].as_array().unwrap();
+        let (offset, pairs) = if run == first_run {
+            assert_eq!(events[0]["kind"], "note");
+            assert_eq!(events[0]["detail"]["note"], "Inspect socket drift");
+            (1, 4)
+        } else {
+            (0, 1)
+        };
+        assert_eq!(events.len(), offset + pairs * 2);
+        for pair in events[offset..].chunks_exact(2) {
+            assert_eq!(pair[0]["kind"], "tool_call");
+            assert_eq!(pair[1]["kind"], "tool_result");
+            assert_eq!(
+                pair[0]["detail"]["request_id"],
+                pair[1]["detail"]["request_id"]
+            );
+        }
+        assert_eq!(events.last().unwrap()["detail"]["result"], "run_finished");
+    }
+    let runs = client
+        .tool("list_investigation_runs", json!({}), false)
+        .await;
+    let outcome = &runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["run_id"] == first_run)
+        .unwrap()["outcome"];
+    assert_eq!(outcome["tool_calls"], 4);
+    assert_eq!(outcome["findings"], 1);
+    assert_eq!(outcome["proposals"], 2);
+    assert_eq!(outcome["proposals_accepted"], 2);
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn investigator_binds_delegated_token_at_startup_and_keeps_binding_after_failed_switch() {
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    seed_sockets_incident(&service);
+    let incident_id = fixture_incident(&service);
+    let parent = mint_operator_fixture(&service, true, &[HOST]);
+    let Response::DelegatedRunStarted {
+        run_id, run_token, ..
+    } = direct(
+        &service,
+        &parent,
+        Request::StartDelegatedRun {
+            incident_id: incident_id.clone(),
+            backend_id: "worker".into(),
+            model_id: "fixture".into(),
+            prompt_schema_version: "1".into(),
+            ttl_seconds: None,
+        },
+    )
+    else {
+        panic!("delegation failed")
+    };
+    let socket = dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let server_task = tokio::spawn(server.serve_investigation(service.clone()));
+
+    let mut client = Client::new(Mode::Investigator, socket, run_token.clone());
+    let tools = client.request("tools/list", json!({})).await;
+    let action = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "propose_action")
+        .unwrap();
+    assert!(action["inputSchema"]["properties"].get("run_id").is_none());
+    let propose = |key| {
+        json!({
+            "idempotency_key":key,
+            "rule":expectation_rule(Some(json!(Utc::now() + chrono::Duration::days(3))))
+        })
+    };
+    let first = client
+        .tool("propose_expectation_rule", propose("first"), false)
+        .await;
+    assert_eq!(first["decision"]["allowed"], true);
+    let failed = client.tool("start_investigation_run", json!({
+        "incident_id":incident_id,"backend_id":"worker","model_id":"different","prompt_schema_version":"1"
+    }), true).await;
+    assert_eq!(failed["code"], "forbidden");
+    let second = client
+        .tool("propose_expectation_rule", propose("second"), false)
+        .await;
+    let rules = client
+        .tool("list_expectation_rules", json!({}), false)
+        .await;
+    for proposal in [first, second] {
+        assert!(
+            rules["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["rule_id"] == proposal["rule_id"] && rule["run_id"] == run_id)
+        );
+    }
+    for tool in [
+        "list_investigation_runs",
+        "list_expectation_rules",
+        "list_actions",
+    ] {
+        assert_eq!(
+            client.tool(tool, json!({"host_id":"foreign"}), true).await["code"],
+            "forbidden"
+        );
+    }
+    assert!(matches!(
+        direct(
+            &service,
+            &run_token,
+            Request::FinishInvestigationRun {
+                run_id,
+                outcome: RunOutcome {
+                    status: RunTerminalStatus::Completed,
+                    summary: "Finished".into(),
+                    budget_stop_reason: None,
+                    turns: 0,
+                    tool_calls: 2,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    findings: 0,
+                    proposals: 2,
+                    proposals_accepted: 2,
+                }
+            }
+        ),
+        Response::RunFinished { .. }
+    ));
+    assert_eq!(
+        client
+            .tool("propose_expectation_rule", propose("late"), true)
+            .await["message"],
+        "investigation run is inactive"
+    );
+    let reply = client
+        .request(
+            "tools/call",
+            json!({"name":"propose_expectation_rule","arguments":propose("later")}),
+        )
+        .await;
+    assert_eq!(
+        reply["error"]["message"],
+        "No investigation run is active; call start_investigation_run first"
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn operator_binary_rejects_token_without_spawn_permission_before_serving_stdio() {
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    seed_sockets_incident(&service);
+    let socket = dir.0.join("investigate.sock");
+    let token = mint_operator_fixture(&service, false, &[HOST]);
+    let token_file = dir.0.join("token");
+    fs::write(&token_file, &token).unwrap();
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let server_task = tokio::spawn(server.serve_investigation(service));
+    let output = timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_mcp-adapter"))
+            .args(["--mode", "operator", "--token-file"])
+            .arg(token_file)
+            .arg("--investigate-sock")
+            .arg(socket)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let log = String::from_utf8(output.stderr).unwrap();
+    assert!(log.contains("with may_spawn_runs"));
+    assert!(!log.contains(&token));
+    server_task.abort();
 }

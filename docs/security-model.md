@@ -10,6 +10,26 @@ Telemetry is untrusted: the reasoner wraps it in `<untrusted_telemetry>` envelop
 
 Containment is disabled by default. Autonomous containment requires opt-in at both control and executor. Dual-signed actions require an independent operator key; protect it separately from the control key. The executor's persistent nonce store supports replay rejection; preserve that state across restarts. Dry-run is the default, and enforcement can disrupt workloads. Validate rollback and recovery in your environment before use.
 
+## Operator MCP and delegated runs
+
+An investigator token needs an explicit run-spawn grant. The control daemon
+scopes each delegated child to one open incident and its host, copies the
+parent's collector scope, caps the lifetime, and enforces four active children
+per parent principal. The child cannot delegate or manage trigger leases.
+Cancellation by the run token or by an in-scope investigator acting as the
+parent principal revokes the run token. The ledger keeps token hashes for
+credential lookup, and the run-start audit records the delegation metadata
+without the child token.
+
+The operator MCP adapter uses its base token for fleet reads and selects each
+child token by explicit run ID for run-scoped tools. The adapter keeps child
+credentials in memory. The control and edge policy gates govern temporary
+watches, expectation rules require operator approval, and actions proposed
+from a delegated run require an independent operator signature. Codex shell
+tools have their own security boundary. Run Codex under a dedicated OS user
+with a read-only sandbox and empty working directory. Keep admin and signing
+access outside that account. See the [operator setup](operator-agent.md).
+
 ## Limitations and verification
 
 File observations report the hard link count. The collector refuses to read regular files with multiple links under roots added by a host profile. Built-in roots rely on administrative control and the host's hard link protections. With `fs.protected_hardlinks=1`, the default on Ubuntu and Debian, an unprivileged user cannot link to a sensitive file owned by someone else when the user lacks read or write access. Linux allows links to otherwise eligible ordinary files the user can both read and write. [Ubuntu file handling](https://documentation.ubuntu.com/security/security-features/process-memory/file-handling/) · [Debian kernel default](https://sources.debian.org/src/linux/7.0.4-1/fs/namei.c) · [Linux hard link rules](https://sources.debian.org/src/manpages/6.9.1-1/man/man5/proc_sys_fs.5)

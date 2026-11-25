@@ -285,6 +285,7 @@ mod tests {
 
     fn make_cap(role: PrincipalRole, now: DateTime<Utc>) -> ScopedCapability {
         ScopedCapability {
+            may_spawn_runs: false,
             principal_id: "reasoner-1".into(),
             role,
             run_id: Some("run-1".into()),

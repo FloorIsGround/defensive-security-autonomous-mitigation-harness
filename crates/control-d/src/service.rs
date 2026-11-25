@@ -440,6 +440,7 @@ impl ControlService {
                     .map_or(Some(1), |spec| spec.version.checked_add(1))
                     .ok_or_else(|| ControlError::invalid("watch versions exhausted"))?;
                 let capability = ScopedCapability {
+                    may_spawn_runs: false,
                     principal_id: actor.clone(),
                     role: PrincipalRole::Admin,
                     run_id: None,
@@ -517,6 +518,7 @@ impl ControlService {
                 })
             }
             AdminRequest::MintCapabilityToken {
+                may_spawn_runs,
                 principal_id,
                 role,
                 allowed_hosts,
@@ -528,6 +530,9 @@ impl ControlService {
                     return Err(ControlError::invalid(
                         "a named observer or investigator is required",
                     ));
+                }
+                if may_spawn_runs && role != PrincipalRole::Investigator {
+                    return Err(ControlError::denied("run spawn requires investigator role"));
                 }
                 let ttl = i64::try_from(ttl_seconds)
                     .ok()
@@ -547,6 +552,7 @@ impl ControlService {
                     }
                 }
                 let capability = ScopedCapability {
+                    may_spawn_runs,
                     principal_id,
                     role,
                     run_id: None,
@@ -555,12 +561,7 @@ impl ControlService {
                     allowed_collectors,
                     expires_at: ttl,
                 };
-                let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-                let hash = sha256_hex(token.as_bytes());
-                db.execute(
-                    "INSERT INTO capability_tokens VALUES (?1,?2)",
-                    params![hash, serde_json::to_string(&capability)?],
-                )?;
+                let (token, hash) = store_capability_token(db, &capability)?;
                 audit(
                     db,
                     CapabilityMinted,
@@ -596,6 +597,12 @@ impl ControlService {
                     "SELECT run_id FROM agent_runs WHERE incident_id=?1 AND status='active'",
                     [&incident_id],
                     |r| r.get::<_, String>(0),
+                )?;
+                db.execute(
+                    "UPDATE capability_tokens SET revoked_at=?2 WHERE token_hash IN (
+                        SELECT token_hash FROM agent_runs WHERE incident_id=?1 AND status='active' AND delegated=1
+                    )",
+                    params![incident_id, stamp(now)],
                 )?;
                 db.execute("UPDATE agent_runs SET status='cancelled',ended_at=?2 WHERE incident_id=?1 AND status='active'", params![incident_id,stamp(now)])?;
                 for run_id in runs {
@@ -639,7 +646,12 @@ impl ControlService {
                 incident_id,
             } => {
                 let response = AdminResponse::Actions {
-                    actions: actions::list_actions(db, host_id.as_deref(), incident_id.as_deref())?,
+                    actions: actions::list_actions(
+                        db,
+                        host_id.as_deref(),
+                        incident_id.as_deref(),
+                        None,
+                    )?,
                 };
                 if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
                     return Err(ControlError::invalid(
@@ -738,6 +750,19 @@ fn load_key(dir: &Path, key_id: String) -> Result<SigningKeyPair> {
     let mut secret = String::new();
     file.take(65).read_to_string(&mut secret)?;
     Ok(SigningKeyPair::from_secret_hex(key_id, &secret)?)
+}
+
+pub(crate) fn store_capability_token(
+    db: &Connection,
+    capability: &ScopedCapability,
+) -> Result<(String, String)> {
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let hash = sha256_hex(token.as_bytes());
+    db.execute(
+        "INSERT INTO capability_tokens (token_hash, capability_json) VALUES (?1,?2)",
+        params![hash, serde_json::to_string(capability)?],
+    )?;
+    Ok((token, hash))
 }
 
 pub(crate) fn uuid() -> String {

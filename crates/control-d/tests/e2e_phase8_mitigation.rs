@@ -209,6 +209,7 @@ async fn setup_triggered_incident(
 
     let AdminResponse::TokenMinted { token: obs_tok, .. } =
         control.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "obs".into(),
             role: PrincipalRole::Observer,
             allowed_hosts: vec![host_id.into()],
@@ -288,6 +289,7 @@ async fn setup_triggered_incident(
 
     let AdminResponse::TokenMinted { token: inv_tok, .. } =
         control.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "reasoner-d".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![host_id.into()],

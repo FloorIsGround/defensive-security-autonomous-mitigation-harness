@@ -195,6 +195,7 @@ impl Fixture {
 
     fn token(&self, role: PrincipalRole, incident_id: Option<String>) -> String {
         let response = self.admin(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "worker".into(),
             role,
             allowed_hosts: vec!["edge".into()],
@@ -810,7 +811,7 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(
             db.query_row("SELECT host_id FROM hosts", [], |r| r.get::<_, String>(0))
