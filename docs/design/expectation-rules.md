@@ -151,7 +151,7 @@ CREATE INDEX expectation_rules_scope ON expectation_rules (host_id, collector_ty
 ```
 
 * Migration v5 also stores proposal receipts keyed by run and idempotency key, so retries return the original policy decision and backtest. Denied submissions get receipts and policy decisions. Only stored proposals consume the per-run quota, and only unexpired pending proposals consume the host quota.
-* An expired rule is never applied. It is reported as `expired` (computed, not stored).
+* An expired rule is never applied. A `proposed` or `active` rule past its expiry is reported as `expired` (computed, not stored). `rejected` and `revoked` rules keep their terminal status.
 * `hit_count` and `last_matched_at` update in the same transaction as the observation that matched.
 * Audit events (new `AuditEventType` variants): `RuleProposed`, `RuleActivated`, `RuleRejected`, `RuleRevoked`. Activation records the approver and the canonical spec hash.
 * Every proposal and decision writes a `policy_decisions` row, like watch proposals.
