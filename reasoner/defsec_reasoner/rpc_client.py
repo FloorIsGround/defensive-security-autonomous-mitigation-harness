@@ -51,6 +51,11 @@ _KNOWN_RESULTS = frozenset(
         "observations",
         "baseline_summary",
         "run_started",
+        "run_progress_recorded",
+        "run_finished",
+        "runs",
+        "run_events",
+        "trigger_queue",
         "proposal_evaluated",
         "finding_recorded",
         "trigger_leased",
@@ -184,9 +189,9 @@ class ControlRpcClient:
             f"token={self._redacted_token()}, timeout={self.request_timeout})"
         )
 
-    def _open_socket(self) -> socket.socket:
+    def _open_socket(self, timeout: float) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.request_timeout)
+        sock.settimeout(timeout)
         try:
             sock.connect(self.socket_path)
         except OSError as exc:
@@ -196,7 +201,7 @@ class ControlRpcClient:
             ) from exc
         return sock
 
-    def call(self, request: dict[str, Any]) -> dict[str, Any]:
+    def call(self, request: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         """Send one ``InvestigationRequest`` and return the response fields.
 
         ``request`` must already contain the ``"op"`` tag. Server errors raise
@@ -209,7 +214,8 @@ class ControlRpcClient:
             "capability_token": self.capability_token,
             "request": request,
         }
-        sock = self._open_socket()
+        timeout = self.request_timeout if timeout is None else timeout
+        sock = self._open_socket(timeout)
         try:
             try:
                 send_frame(sock, envelope, self.max_frame_bytes)
@@ -217,8 +223,10 @@ class ControlRpcClient:
                 raise RpcTransportError(
                     f"outgoing frame exceeds the {self.max_frame_bytes}-byte limit: {exc}"
                 ) from exc
+            except FrameError as exc:
+                raise RpcTransportError(str(exc)) from exc
             try:
-                reply = read_frame(sock, self.max_frame_bytes, timeout=self.request_timeout)
+                reply = read_frame(sock, self.max_frame_bytes, timeout=timeout)
             except FrameTooLargeError as exc:
                 raise RpcTransportError(
                     f"control-d sent an oversized frame: {exc}"
@@ -301,6 +309,39 @@ class ControlRpcClient:
                 "prompt_schema_version": prompt_schema_version,
             }
         )
+
+    def report_run_progress(self, run_id: str, kind: str, detail: Any) -> dict[str, Any]:
+        return self.call(
+            {"op": "report_run_progress", "run_id": run_id, "kind": kind, "detail": detail},
+            timeout=min(self.request_timeout, 0.1),
+        )
+
+    def finish_investigation_run(self, run_id: str, outcome: dict[str, Any]) -> dict[str, Any]:
+        return self.call({"op": "finish_investigation_run", "run_id": run_id, "outcome": outcome})
+
+    def list_investigation_runs(
+        self, incident_id: str | None = None, host_id: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        return self.call({
+            "op": "list_investigation_runs", "incident_id": incident_id,
+            "host_id": host_id, "limit": limit,
+        })["runs"]
+
+    def get_run_events(
+        self, run_id: str, after_seq: int | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        return self.call({
+            "op": "get_run_events", "run_id": run_id, "after_seq": after_seq, "limit": limit,
+        })["events"]
+
+    def list_trigger_queue(
+        self, host_id: str | None = None, incident_id: str | None = None,
+        statuses: list[str] | None = None, limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.call({
+            "op": "list_trigger_queue", "host_id": host_id, "incident_id": incident_id,
+            "statuses": statuses, "limit": limit,
+        })["triggers"]
 
     def propose_ephemeral_watch(
         self, run_id: str, idempotency_key: str, spec: dict[str, Any], rationale: str

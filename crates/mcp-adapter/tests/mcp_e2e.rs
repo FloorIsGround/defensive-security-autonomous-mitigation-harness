@@ -29,6 +29,9 @@ const READ_TOOLS: &[&str] = &[
     "get_incident_context",
     "query_observations",
     "get_host_baseline_summary",
+    "list_investigation_runs",
+    "get_run_events",
+    "list_trigger_queue",
 ];
 const WRITE_TOOLS: &[&str] = &[
     "start_investigation_run",
@@ -174,6 +177,8 @@ async fn read_only_handshake_and_local_rejection() {
         "lease_next_trigger",
         "complete_trigger_lease",
         "fail_trigger_lease",
+        "report_run_progress",
+        "finish_investigation_run",
     ]) {
         let reply = client
             .request("tools/call", json!({"name":name,"arguments":{}}))
@@ -354,6 +359,19 @@ async fn investigator_flow_preserves_controller_decisions() {
         "incident_id":incident_id, "backend_id":"mcp", "model_id":"fixture", "prompt_schema_version":"1"
     }), false).await;
     let run_id = run["run_id"].as_str().unwrap();
+    for name in ["report_run_progress", "finish_investigation_run"] {
+        let reply = client
+            .request("tools/call", json!({"name":name,"arguments":{}}))
+            .await;
+        assert_eq!(
+            reply["error"]["message"],
+            "Tool is unavailable in this mode"
+        );
+    }
+    let runs = client
+        .tool("list_investigation_runs", json!({}), false)
+        .await;
+    assert_eq!(runs["runs"][0]["run_id"], run_id);
 
     let mut follow_up = baseline();
     follow_up["id"] = json!("follow-up");
@@ -456,6 +474,25 @@ async fn investigator_flow_preserves_controller_decisions() {
         .tool("get_host_baseline_summary", json!({"host_id":HOST}), false)
         .await;
     assert_eq!(baseline["host_id"], HOST);
+
+    let runs = observer
+        .tool("list_investigation_runs", json!({"limit":1}), false)
+        .await;
+    assert_eq!(runs["runs"][0]["findings_count"], 1);
+    assert_eq!(runs["runs"][0]["proposals_count"], 3);
+    let events = observer
+        .tool(
+            "get_run_events",
+            json!({"run_id":run_id,"after_seq":0}),
+            false,
+        )
+        .await;
+    assert_eq!(events["events"], json!([]));
+    let queue = observer
+        .tool("list_trigger_queue", json!({"statuses":["pending"]}), false)
+        .await;
+    assert_eq!(queue["triggers"][0]["incident_id"], *incident_id);
+    assert!(queue["triggers"][0].get("lease_token").is_none());
 
     let mut unauthorized = Client::new(Mode::ReadOnly, socket, "invalid-capability-token".into());
     assert_eq!(

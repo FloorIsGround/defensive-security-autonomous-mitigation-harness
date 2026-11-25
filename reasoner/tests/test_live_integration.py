@@ -50,7 +50,7 @@ def _base_sockets() -> list[dict]:
 
 
 def _changed_sockets() -> list[dict]:
-    return _base_sockets() + [
+    return _base_sockets()[:1] + [
         socket_entry("tcp:0.0.0.0:4444:uid=0", port=4444, inode=4404, pid=444, comm="ghost", systemd_unit="ghost.service")
     ]
 
@@ -158,9 +158,22 @@ class LiveIntegrationTests(unittest.TestCase):
                 },
             }]}
 
+        def inspect_initial_context(messages, _tools):
+            from defsec_reasoner.provenance import envelope_contents
+
+            sockets = [
+                item for payload in envelope_contents(messages[1]["content"])
+                if isinstance(payload, dict) and payload.get("kind") == "snapshot"
+                for item in payload["data"]["sockets"]["items"]
+            ]
+            self.assertIn(_base_sockets()[1], sockets)
+            self.assertIn(_changed_sockets()[-1], sockets)
+            return {"tool_calls": [{"name": "query_observations", "arguments": {
+                "host_id": HOST, "watch_id": "w-sockets", "limit": 50,
+            }}]}
+
         script = [
-            {"tool_calls": [{"name": "query_observations",
-                             "arguments": {"host_id": HOST, "watch_id": "w-sockets", "limit": 50}}]},
+            inspect_initial_context,
             propose_followup,
             collect_followup,
             record_finding,
@@ -186,6 +199,23 @@ class LiveIntegrationTests(unittest.TestCase):
         client = self._client(self.admin.mint_capability_token(
             "verify", "investigator", [HOST], COLLECTORS)["token"])
         self.assertIsNone(client.lease_next_trigger("verify-worker", 60))
+
+        runs = client.list_investigation_runs(host_id=HOST, limit=1)
+        self.assertEqual(runs[0]["run_id"], outcome.run_id)
+        self.assertEqual(runs[0]["status"], "completed")
+        self.assertEqual(runs[0]["outcome"]["summary"], "investigation complete")
+        self.assertEqual(runs[0]["findings_count"], 1)
+        self.assertEqual(runs[0]["proposals_count"], 1)
+        events = client.get_run_events(outcome.run_id)
+        self.assertEqual(len(events), runs[0]["event_count"])
+        self.assertEqual(events[0]["kind"], "turn_started")
+        self.assertIn("model_text", {event["kind"] for event in events})
+        self.assertEqual(events[-1], runs[0]["last_event"])
+        self.assertEqual(client.get_run_events(outcome.run_id, after_seq=events[0]["event_seq"]), events[1:])
+        queue = client.list_trigger_queue(statuses=["done"])
+        self.assertEqual(queue[0]["event_id"], outcome.event_id)
+        self.assertNotIn("lease_token", queue[0])
+        self.assertIn("diff", queue[0]["reason"])
 
         # Findings are durable and evidence-bound in the incident context.
         incidents = [i for i in self.admin.list_incidents() if i["status"] == "open"]

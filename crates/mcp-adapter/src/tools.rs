@@ -72,6 +72,42 @@ const READ_TOOLS: &[Tool] = &[
         description: "Get accepted baseline revisions for a host.",
         schema: host_schema,
     },
+    Tool {
+        name: "list_investigation_runs",
+        description: "List recent investigation runs and their progress within scope.",
+        schema: || object([], run_filters()),
+    },
+    Tool {
+        name: "get_run_events",
+        description: "Read an investigation run's events in sequence order.",
+        schema: || {
+            object(
+                [("run_id", string())],
+                [
+                    ("after_seq", nullable(signed())),
+                    ("limit", nullable(unsigned(u32::MAX.into()))),
+                ],
+            )
+        },
+    },
+    Tool {
+        name: "list_trigger_queue",
+        description: "List recent trigger queue entries without lease credentials.",
+        schema: || {
+            object(
+                [],
+                run_filters().into_iter().chain([(
+                    "statuses",
+                    nullable(array(choices(&[
+                        "pending",
+                        "leased",
+                        "done",
+                        "dead_letter",
+                    ]))),
+                )]),
+            )
+        },
+    },
 ];
 
 const INVESTIGATOR_TOOLS: &[Tool] = &[
@@ -128,6 +164,14 @@ const INVESTIGATOR_TOOLS: &[Tool] = &[
         },
     },
 ];
+
+fn run_filters() -> [(&'static str, Value); 3] {
+    [
+        ("incident_id", nullable(string())),
+        ("host_id", nullable(string())),
+        ("limit", nullable(unsigned(u32::MAX.into()))),
+    ]
+}
 
 fn host_schema() -> Value {
     object([("host_id", string())], [])

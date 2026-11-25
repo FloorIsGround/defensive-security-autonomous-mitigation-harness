@@ -289,8 +289,11 @@ class TestActionProposalsEnabled(ActionTestBase):
         self.assertEqual(outcome.action_proposals_accepted, 1)
         self.assertEqual(self.server.completed_events, [1])
 
-        request = self.server.requests[-2]  # propose_action precedes completion
-        self.assertEqual(request["op"], "propose_action")
+        ops = [req["op"] for req in self.server.requests]
+        proposal_idx = ops.index("propose_action")
+        self.assertLess(proposal_idx, ops.index("finish_investigation_run"))
+        self.assertEqual(ops[-1], "complete_trigger_lease")
+        request = self.server.requests[proposal_idx]
         self.assertEqual(
             request["verb"],
             {"verb": "nft_block_ip", "ip": "203.0.113.7", "direction": "inbound", "ttl_seconds": 900},

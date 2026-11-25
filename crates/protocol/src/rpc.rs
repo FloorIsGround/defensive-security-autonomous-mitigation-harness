@@ -118,6 +118,40 @@ pub enum InvestigationRequest {
         model_id: String,
         prompt_schema_version: String,
     },
+    ReportRunProgress {
+        run_id: String,
+        kind: RunEventKind,
+        detail: serde_json::Value,
+    },
+    FinishInvestigationRun {
+        run_id: String,
+        outcome: RunOutcome,
+    },
+    ListInvestigationRuns {
+        #[serde(default)]
+        incident_id: Option<String>,
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    GetRunEvents {
+        run_id: String,
+        #[serde(default)]
+        after_seq: Option<i64>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    ListTriggerQueue {
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        incident_id: Option<String>,
+        #[serde(default)]
+        statuses: Option<Vec<String>>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     ProposeEphemeralWatch {
         run_id: String,
         idempotency_key: String,
@@ -168,6 +202,93 @@ pub enum InvestigationRequest {
         #[serde(default)]
         incident_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEventKind {
+    TurnStarted,
+    ToolCall,
+    ToolResult,
+    ModelText,
+    BudgetWarning,
+    Note,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTerminalStatus {
+    Completed,
+    BudgetExhausted,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutcome {
+    pub status: RunTerminalStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub budget_stop_reason: Option<String>,
+    pub turns: u32,
+    pub tool_calls: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub findings: u32,
+    pub proposals: u32,
+    pub proposals_accepted: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvent {
+    pub event_seq: i64,
+    pub kind: RunEventKind,
+    pub detail: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSummary {
+    pub run_id: String,
+    pub incident_id: String,
+    pub host_id: String,
+    pub principal_id: String,
+    pub backend_id: String,
+    pub model_id: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub outcome: Option<RunOutcome>,
+    #[serde(default)]
+    pub last_event: Option<RunEvent>,
+    pub event_count: u32,
+    pub findings_count: u32,
+    pub proposals_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerSummary {
+    pub event_id: i64,
+    pub incident_id: String,
+    pub host_id: String,
+    pub watch_id: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub retry_count: u32,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +398,24 @@ pub enum InvestigationResponse {
         run_id: String,
         incident_id: String,
         expires_at: DateTime<Utc>,
+    },
+    RunProgressRecorded {
+        run_id: String,
+        event_seq: i64,
+    },
+    RunFinished {
+        run_id: String,
+        status: RunTerminalStatus,
+    },
+    Runs {
+        runs: Vec<RunSummary>,
+    },
+    RunEvents {
+        run_id: String,
+        events: Vec<RunEvent>,
+    },
+    TriggerQueue {
+        triggers: Vec<TriggerSummary>,
     },
     ProposalEvaluated {
         decision: PolicyDecision,

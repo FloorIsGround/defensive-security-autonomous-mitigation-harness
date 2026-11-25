@@ -1,3 +1,5 @@
+mod progress;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
@@ -79,7 +81,16 @@ impl ControlService {
                 .allowed_hosts
                 .retain(|host| host == &incident.host_id);
         }
-        if let Some(run) = &capability.run_id {
+        let requires_active_run = !matches!(
+            call.request,
+            InvestigationRequest::FinishInvestigationRun { .. }
+                | InvestigationRequest::CompleteTriggerLease { .. }
+                | InvestigationRequest::FailTriggerLease { .. }
+                | InvestigationRequest::ListInvestigationRuns { .. }
+                | InvestigationRequest::GetRunEvents { .. }
+                | InvestigationRequest::ListTriggerQueue { .. }
+        );
+        if requires_active_run && let Some(run) = &capability.run_id {
             let valid: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE run_id=?1 AND token_hash=?2 AND expires_at>?3 AND status='active')",
                 params![run,hash,stamp(now)], |r| r.get(0))?;
@@ -264,6 +275,51 @@ impl ControlService {
                     }
                 }
             }
+            InvestigationRequest::ReportRunProgress {
+                run_id,
+                kind,
+                detail,
+            } => progress::report_progress(db, &capability, run_id, kind, detail, now)?,
+            InvestigationRequest::FinishInvestigationRun { run_id, outcome } => {
+                progress::finish_run(db, &capability, &hash, request_id, run_id, outcome, now)?
+            }
+            InvestigationRequest::ListInvestigationRuns {
+                incident_id,
+                host_id,
+                limit,
+            } => InvestigationResponse::Runs {
+                runs: progress::list_runs(
+                    db,
+                    &capability,
+                    host_id.as_deref(),
+                    incident_id.as_deref(),
+                    limit,
+                    now,
+                )?,
+            },
+            InvestigationRequest::GetRunEvents {
+                run_id,
+                after_seq,
+                limit,
+            } => {
+                let events = progress::get_events(db, &capability, &run_id, after_seq, limit)?;
+                InvestigationResponse::RunEvents { run_id, events }
+            }
+            InvestigationRequest::ListTriggerQueue {
+                host_id,
+                incident_id,
+                statuses,
+                limit,
+            } => InvestigationResponse::TriggerQueue {
+                triggers: progress::list_triggers(
+                    db,
+                    &capability,
+                    host_id.as_deref(),
+                    incident_id.as_deref(),
+                    statuses,
+                    limit,
+                )?,
+            },
             InvestigationRequest::ProposeEphemeralWatch {
                 run_id,
                 idempotency_key,
@@ -515,21 +571,23 @@ impl ControlService {
                 authorize_incident(db, &capability, &incident_id)?;
                 db.execute(
                     "UPDATE trigger_events
-                     SET status = 'done', lease_expires_at = NULL, updated_at = ?2
+                     SET status = 'done', lease_token = NULL, lease_expires_at = NULL, updated_at = ?2
                      WHERE event_id = ?1",
                     params![event_id, stamp(now)],
                 )?;
                 if let Some(ref rid) = run_id {
-                    db.execute(
-                        "UPDATE agent_runs SET status = 'completed' WHERE run_id = ?1 AND incident_id = ?2",
-                        params![rid, incident_id],
+                    let changed = db.execute(
+                        "UPDATE agent_runs SET status = 'completed', ended_at = ?3
+                         WHERE run_id = ?1 AND incident_id = ?2 AND status = 'active'",
+                        params![rid, incident_id, stamp(now)],
                     )?;
+                    let outcome = if changed == 0 { "done" } else { "completed" };
                     audit(
                         db,
                         RunCompleted,
                         &capability.principal_id,
                         request_id,
-                        json!({"run_id": rid, "event_id": event_id, "incident_id": incident_id, "outcome": "completed", "summary": summary}),
+                        json!({"run_id": rid, "event_id": event_id, "incident_id": incident_id, "outcome": outcome, "summary": summary}),
                     )?;
                 }
                 InvestigationResponse::LeaseUpdated {

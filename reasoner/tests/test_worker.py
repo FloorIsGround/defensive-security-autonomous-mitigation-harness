@@ -19,7 +19,8 @@ if str(TESTS_ROOT) not in sys.path:
 import unittest  # noqa: E402
 
 from defsec_reasoner.models import ProviderError, ScriptedMockAdapter  # noqa: E402
-from defsec_reasoner.rpc_client import ControlRpcClient  # noqa: E402
+from defsec_reasoner.provenance import envelope_contents
+from defsec_reasoner.rpc_client import ControlRpcClient, RpcTransportError  # noqa: E402
 from defsec_reasoner.worker import ReasonerWorker, RunBudgets  # noqa: E402
 
 from support import FakeControlServer  # noqa: E402
@@ -95,6 +96,18 @@ class TestWorkerHappyPath(WorkerTestBase):
         self.assertEqual(len(self.server.proposals), 1)
         self.assertEqual(len(self.server.findings), 1)
         self.assertGreater(outcome.input_tokens, 0)
+        self.assertEqual(outcome.summary, "done")
+        recorded = self.server.runs[0]["outcome"]
+        self.assertEqual(recorded["summary"], "done")
+        self.assertEqual(recorded["findings"], 1)
+        self.assertEqual(recorded["proposals_accepted"], 1)
+        self.assertEqual(recorded["status"], "completed")
+        progress = [r for r in self.server.requests if r["op"] == "report_run_progress"]
+        self.assertEqual([r["kind"] for r in progress].count("turn_started"), 4)
+        self.assertEqual([r["kind"] for r in progress].count("tool_call"), 4)
+        results = [r["detail"] for r in progress if r["kind"] == "tool_result"]
+        self.assertIn({"tool": "propose_ephemeral_watch", "ok": True, "accepted": True}, results)
+
 
     def test_findings_and_proposals_submit_before_completion(self) -> None:
         # The complete op must be the LAST investigation request issued.
@@ -111,7 +124,100 @@ class TestWorkerHappyPath(WorkerTestBase):
         last_op = self.server.requests[-1]["op"]
         self.assertEqual(last_op, "complete_trigger_lease")
         ops = [r["op"] for r in self.server.requests]
-        self.assertLess(ops.index("record_hypothesis_or_finding"), ops.index("complete_trigger_lease"))
+        self.assertLess(ops.index("record_hypothesis_or_finding"), ops.index("finish_investigation_run"))
+        self.assertLess(ops.index("finish_investigation_run"), ops.index("complete_trigger_lease"))
+
+
+    def test_progress_quota_does_not_interrupt_the_run(self) -> None:
+        self.server.progress_error = "run_event_quota"
+        worker = self.make_worker([
+            {"tool_calls": [{"name": "query_observations", "arguments": {"host_id": "edge-01"}}]},
+            {"final_text": "done"},
+        ])
+        self.assertEqual(worker.run_once().status, "completed")
+        attempts = [req for req in self.server.requests if req["op"] == "report_run_progress"]
+        self.assertEqual([req["kind"] for req in attempts], ["turn_started"])
+
+    def test_stalled_progress_transport_does_not_hold_the_run(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        unwound = threading.Event()
+
+        class StallingClient(ControlRpcClient):
+            def report_run_progress(self, run_id, kind, detail):
+                started.set()
+                try:
+                    release.wait(3)
+                    raise RpcTransportError("simulated socket timeout")
+                finally:
+                    unwound.set()
+
+        def finish(_messages, _tools):
+            self.assertTrue(started.wait(1))
+            return {"final_text": "done"}
+
+        client = StallingClient(self.sock_path, TOKEN)
+        worker = ReasonerWorker(client, ScriptedMockAdapter([finish]))
+        try:
+            start = time.monotonic()
+            self.assertEqual(worker.run_once().status, "completed")
+            self.assertLess(time.monotonic() - start, 2)
+            self.assertFalse(unwound.is_set())
+        finally:
+            release.set()
+        self.assertTrue(unwound.wait(1))
+
+    def test_initial_and_queried_context_keep_focused_sockets(self) -> None:
+        added = {"socket_key": "zz-added", "listen_port": 4444, "command": "added-program"}
+        removed = {"socket_key": "zz-removed", "listen_port": 5555, "command": "removed-program"}
+        background = [
+            {"socket_key": f"socket-{i:03d}", "listen_port": 10000 + i, "command": "background" * 6}
+            for i in range(399)
+        ]
+        sample = self.server.observations[-1]
+        self.server.observations = [
+            {**sample, "observation_id": i, "observed_at": f"2026-11-24T12:{i:02d}:00Z",
+             "payload": {"kind": "snapshot", "data": {"sockets": background + [added if i >= 12 else removed]}}}
+            for i in range(1, 21)
+        ]
+        self.server.triggers[0]["outcome"]["predicate"]["details"] = {
+            "added": ["zz-added"], "removed": ["zz-removed"], "modified": [],
+        }
+
+        def inspect_context(messages, _tools):
+            block = messages[1]["content"]
+            self.assertLessEqual(len(block.encode("utf-8")), 24 * 1024)
+            self.assertNotIn(self.server.triggers[0]["lease_token"], block)
+            header = json.JSONDecoder().raw_decode(block.split("\n", 1)[1])[0]
+            self.assertEqual(header["trigger_diff"], self.server.triggers[0]["outcome"]["predicate"]["details"])
+            items = []
+            for payload in envelope_contents(block):
+                if isinstance(payload, dict) and payload.get("kind") == "snapshot":
+                    items += payload["data"]["sockets"]["items"]
+                    self.assertEqual(payload["data"]["sockets"]["total"], 400)
+            self.assertIn(added, items)
+            self.assertIn(removed, items)
+            self.assertEqual(len(items), 3)  # both cited observations and the newest one
+            self.assertNotIn('observation_id="10"', block)
+            return {"tool_calls": [{"name": "query_observations", "arguments": {
+                "host_id": "edge-01", "limit": 101, "focus_keys": ["zz-removed"],
+                "unrecognized": TOKEN,
+            }}]}
+
+        def inspect_query(messages, _tools):
+            payload = envelope_contents(messages[-1]["content"])[0]
+            sets = [o["payload"]["data"]["sockets"] for o in payload["observations"]]
+            self.assertIn([removed], [subset["items"] for subset in sets])
+            self.assertNotIn([added], [subset["items"] for subset in sets])
+            return {"tool_calls": [{"name": "finish", "arguments": {"summary": "finished"}}]}
+
+        worker = self.make_worker([inspect_context, inspect_query])
+        self.assertEqual(worker.run_once().summary, "finished")
+        queries = [req for req in self.server.requests if req["op"] == "query_observations"]
+        self.assertEqual(queries[0]["limit"], 100)
+        self.assertNotIn("focus_keys", queries[0])
+        events = [req for req in self.server.requests if req["op"] == "report_run_progress"]
+        self.assertNotIn(TOKEN, json.dumps(events))
 
 
 class TestWorkerBudgets(WorkerTestBase):
@@ -151,6 +257,8 @@ class TestWorkerBudgets(WorkerTestBase):
         self.assertEqual(outcome.status, "completed")
         self.assertEqual(outcome.budget_stop_reason, "max_total_tokens")
         self.assertEqual(outcome.turns, 1)
+        self.assertEqual(self.server.runs[0]["outcome"]["status"], "budget_exhausted")
+        self.assertIn("budget_warning", [req.get("kind") for req in self.server.requests])
 
     def test_cost_budget_stops_loop(self) -> None:
         script = [{"tool_calls": [{"name": "query_observations", "arguments": {"host_id": "edge-01"}}]}]
@@ -204,6 +312,10 @@ class TestWorkerFailurePaths(WorkerTestBase):
         self.assertEqual(self.server.triggers[0]["status"], "pending")
         self.assertEqual(self.server.triggers[0]["retry_count"], 1)
         self.assertEqual(self.server.completed_events, [])
+
+        self.assertEqual(self.server.runs[0]["outcome"]["status"], "failed")
+        ops = [req["op"] for req in self.server.requests]
+        self.assertLess(ops.index("finish_investigation_run"), ops.index("fail_trigger_lease"))
 
     def test_nonretryable_provider_failure_dead_letters(self) -> None:
         script = [ProviderError("401 unauthorized", retryable=False)]
