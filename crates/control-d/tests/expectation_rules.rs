@@ -715,7 +715,7 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             db.query_row("SELECT host_id FROM hosts", [], |r| r.get::<_, String>(0))

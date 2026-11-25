@@ -214,7 +214,35 @@ Example profile:
 }
 ```
 
-`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16); `expected_services` are validated systemd unit names (at most 64); `approved_file_roots` holds at most 32 normalized absolute paths. Load-time safety follows sshd's `StrictModes`: the agent refuses to start when the profile file is group- or world-writable, owned by anyone other than root or the agent's own user, larger than 64 KiB, or fails validation. The applied summary (tags, expected services, effective collectors) is reported to the control plane on registration; the control plane treats it as informational.
+`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16). `expected_services` holds up to 64 validated systemd unit names, and `approved_file_roots` holds up to 32 normalized absolute paths. Load-time safety follows sshd's `StrictModes`. The agent refuses to start when the profile file is group- or world-writable, owned by anyone other than root or the agent's own user, larger than 64 KiB, or fails validation.
+
+### Onboard a host with a role template
+
+Generate the profile on the operator side and install the JSON at the agent's `--profile` path. Restart or start the agent so it registers the effective profile. Preview the role watches before applying them to the enrolled host.
+
+```sh
+admin-cli profile-template --role server --tag prod --tag region:west \
+  --expected-service ssh.service > edge-01.profile.json
+admin-cli apply-profile --host edge-01 --role server --dry-run
+admin-cli apply-profile --host edge-01 --role server --actor alice
+admin-cli list-hosts --tag region:west
+```
+
+| Role | Baseline watches |
+| --- | --- |
+| `desktop` | Listening sockets every 30 seconds, package inventory every 15 minutes, and outbound connections every 5 minutes |
+| `server` | Desktop collectors with outbound connections every minute, plus the hash and metadata of `/etc/ssh/sshd_config` every 5 minutes |
+| `bastion` | Server watches plus a redacted `ssh.service` journal batch every 30 seconds |
+
+The generated profile enables the role's listed collectors. Check the host's existing watches when installing a profile because the agent rejects bundles containing a disabled collector. The file collector's sensitive-path denylist includes `/etc/sudoers`. The bastion journal watch targets Debian/Ubuntu's `ssh.service` and requires journal read access. Its set diff compares successive emitted batches by cursor. Expected services appear in the host summary as inventory metadata.
+
+`apply-profile` uses the existing baseline watch and signed bundle path. It uses stable watch IDs per collector and updates their versions on repeat application. Each watch is applied separately. A rejection stops the command, and earlier successful watches stay applied. The command prints the responses it received and exits with a failure code on rejection. Omit `--actor` to record the actor as `operator`.
+
+### Discover tags and review profile drift
+
+The host listing exposes the last valid reported profile. The admin and investigation `list_hosts` operations and the MCP tool accept an exact `tag` filter. Investigation listings continue to respect capability host scope. An agent registers its summary on each connection. A missing summary clears the last report, and a summary that fails profile validation is cleared and logged while registration continues.
+
+The audit chain records `host_profile_changed` with the previous and current summaries, including collector disablement and clearing. It records `host_profile_rejected` with the validation failure. The admin watch gate rejects a collector the host last reported as disabled. When the stored summary is absent, baseline watch admission uses the central policy and the agent enforces its local profile when receiving the signed bundle.
 
 ## Interactive clients and reasoner
 

@@ -132,8 +132,8 @@ impl ControlService {
                     )?,
                 }
             }
-            InvestigationRequest::ListHosts { limit } => InvestigationResponse::Hosts {
-                hosts: list_hosts(db)?
+            InvestigationRequest::ListHosts { limit, tag } => InvestigationResponse::Hosts {
+                hosts: list_hosts(db, tag.as_deref())?
                     .into_iter()
                     .filter(|h| capability.allowed_hosts.contains(&h.host_id))
                     .take(bounded(limit))
