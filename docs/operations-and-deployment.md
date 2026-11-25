@@ -190,6 +190,10 @@ Configure an MCP client to launch `mcp-adapter --investigate-sock ./run-data/inv
 node console/server.mjs --investigate-sock ./run-data/investigate.sock --token-file TOKEN_FILE
 ```
 
+Both MCP modes expose `list_expectation_rules` (filter by `host_id`, `statuses`, `limit`) over the shared investigation RPC. In investigator mode the adapter additionally exposes `propose_expectation_rule` (`idempotency_key` plus a closed-schema `rule` mirroring `ExpectationRuleSpec`); the proposal is submitted for the run this adapter started via `start_investigation_run` — the caller never picks the `run_id` — and control-d's deterministic rule gate returns a policy decision plus a backtest. Accepted proposals are stored as `proposed` and stay inert until an operator decides them with `admin-cli decide-rule`. Decide rules with `admin-cli list-rules`, `create-rule RULE_JSON --actor`, `decide-rule RULE_ID --approve|--reject --actor` and `revoke-rule RULE_ID --actor --reason`; preview impact first with `backtest-rule RULE_JSON`.
+
+The reasoner worker exposes the same proposal as its `propose_expectation_rule` tool, enabled by default because proposals are inert. The worker caps it at 3 calls per run, records each proposal as run progress, and its system prompt restricts use to benign recurring set-diff noise with a clear service anchor (unit/comm/uid plus bounded ports) — never suspicious or unexplained activity. Control-d independently enforces the per-run (3), per-host (20 pending) and expiry (≤ 30 days) quotas for investigator-origin rules.
+
 Add `--enable-admin --admin-sock ./run-data/admin.sock` only for a trusted local operator session. The default listener is loopback. See [console/README.md](../console/README.md) for options and security boundaries.
 
 Set `DEFSEC_CAPABILITY_TOKEN` in the worker's protected environment, then run:
