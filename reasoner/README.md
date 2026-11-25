@@ -18,7 +18,7 @@ reasoner/
 │   ├── __init__.py                 # package + PROMPT_SCHEMA_VERSION
 │   ├── wire.py                     # u32-BE length-prefixed JSON framing (2 MiB cap)
 │   ├── canonical.py                # RFC 8785 canonical JSON + SHA-256 (matches Rust ledger hashes)
-│   ├── rpc_client.py               # ControlRpcClient: 15 typed Investigation ops, token-safe
+│   ├── rpc_client.py               # ControlRpcClient: 21 typed Investigation ops, token-safe
 │   ├── admin_client.py             # operator-side Admin RPC (enroll/baseline/mint/audit-verify)
 │   ├── provenance.py               # §7.5: <untrusted_telemetry> envelopes + system prompt
 │   ├── models.py                   # ModelAdapter ABC + OpenAI / Anthropic / ScriptedMock adapters
@@ -26,7 +26,7 @@ reasoner/
 │   ├── control_harness.py          # real control-d subprocess + synthetic agent-d wire client
 │   ├── benchmark.py                # §9 adaptive-vs-static scenarios, JSON + Markdown reports
 │   └── cli.py / __main__.py        # `worker` and `benchmark` entrypoints
-└── tests/                          # 90 unittest cases incl. LIVE control-d integration + benchmark
+└── tests/                          # 120 unittest cases incl. LIVE control-d integration + benchmark
 ```
 
 ## Safety model (what the worker can never do)
@@ -38,6 +38,16 @@ reasoner/
   disabled by default**; when enabled, the grammar is the closed catalog
   `nft_block_ip` / `systemd_stop_unit` / `host_isolate` only, with per-run caps,
   mandatory verified `observation_id` evidence, and a mandatory rollback plan.
+* Phase 10 expectation-rule proposals (`propose_expectation_rule`) are enabled
+  by default because they are **inert**: a proposal only stores an auditable
+  expectation with a backtest, and nothing is suppressed until an operator
+  approves the rule on the admin interface. The worker hard-caps the tool at
+  3 calls per run client-side (`max_rule_proposals_per_run`), and control-d
+  independently enforces its own per-run and per-host proposal quotas plus the
+  deterministic rule gate (service identity anchor, bounded ports, mandatory
+  expiry within 30 days for investigator rules). The system prompt restricts
+  the tool to benign recurring set-diff noise with a clear service anchor —
+  never suspicious or unexplained activity.
 * Observation payloads, journal lines, baselines, and trigger outcomes are wrapped in explicit
   `<untrusted_telemetry source="…" host_id="…" observation_id="…" state_hash="…">`
   envelopes with strict byte clipping; injected `</untrusted_telemetry>`
@@ -50,11 +60,11 @@ reasoner/
   (`/etc/shadow`, host keys) are denied, sub-floor polling intervals are
   rejected, and every decision is durably audited.
 * Runs default to 6 turns, 45 seconds, 48,000 tokens, $0.25, 3 watch proposals,
-  a 24 KiB initial context, a 32 KiB conversation context, and a 120-second
-  lease. Use `--max-turns` and `--max-total-tokens` to override the turn and
-  token budgets. Pass `--enable-action-proposals` to enable typed mitigation
-  proposals. When enabled, they are separately capped at
-  `max_action_proposals_per_run=1` with local rejection of any excess.
+  3 expectation rule proposals, a 24 KiB initial context, a 32 KiB conversation
+  context, and a 120-second lease. Use `--max-turns` and `--max-total-tokens` to
+  override the turn and token budgets. Pass `--enable-action-proposals` to
+  enable typed mitigation proposals. When enabled, they are separately capped
+  at `max_action_proposals_per_run=1` with local rejection of any excess.
   Retryable provider failures requeue with bounded backoff and dead-letter
   after five attempts. Lease completion checks the fencing token and expiry.
 
@@ -125,9 +135,13 @@ Markdown summary table and exits non-zero if any assertion fails.
 * `test_actions.py` — Phase 8 action contract: exact `ActionVerb` wire shapes,
   disabled-by-default local rejection, per-run action caps, policy-bounded vs.
   dual-signed responses, and adversarial invalid-verb/shell-smuggling attempts.
+* `test_expectation_rules.py` — Phase 10 rule-proposal surface: enabled by
+  default, client-side hard cap of 3 per run, exact wire shape, system-prompt
+  guidance, and denied-decision / RPC-error / schema-rejection handling.
 * `test_live_integration.py` — **LIVE** against compiled `control-d`:
-  lease → run → propose ephemeral watch → evidence-bound finding → complete →
-  audit-chain verification; expired-lease fencing + requeue; observer-role
-  denial. Skipped automatically if no binary is built.
+  lease → run → propose ephemeral watch → evidence-bound finding → propose
+  inert expectation rule → complete → audit-chain verification; expired-lease
+  fencing + requeue; observer-role denial. Skipped automatically if no binary
+  is built.
 * `test_benchmark.py` — runs the full 4-scenario suite end-to-end and asserts
   adaptive coverage > static and 100% adversarial rejection.

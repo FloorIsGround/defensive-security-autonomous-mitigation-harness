@@ -108,6 +108,29 @@ const READ_TOOLS: &[Tool] = &[
             )
         },
     },
+    Tool {
+        name: "list_expectation_rules",
+        description: "List expectation rules within scope, optionally filtered by host and status.",
+        schema: || {
+            object(
+                [],
+                [
+                    ("host_id", nullable(string())),
+                    (
+                        "statuses",
+                        nullable(array(choices(&[
+                            "active",
+                            "proposed",
+                            "rejected",
+                            "revoked",
+                            "expired",
+                        ]))),
+                    ),
+                    ("limit", nullable(unsigned(u32::MAX.into()))),
+                ],
+            )
+        },
+    },
 ];
 
 const INVESTIGATOR_TOOLS: &[Tool] = &[
@@ -159,6 +182,21 @@ const INVESTIGATOR_TOOLS: &[Tool] = &[
                     ("evidence_observation_ids", array(signed())),
                     ("escalation_requested", boolean()),
                 ],
+                [],
+            )
+        },
+    },
+    Tool {
+        name: "propose_expectation_rule",
+        description: (
+            "Submit a closed-schema expectation rule for the adapter's current \
+             investigation run. A deterministic gate decides; accepted rules are \
+             stored as proposed with a backtest and stay inert until an operator \
+             approves them. The run binding comes from the adapter, not the caller."
+        ),
+        schema: || {
+            object(
+                [("idempotency_key", string()), ("rule", rule_schema())],
                 [],
             )
         },
@@ -269,6 +307,72 @@ fn tagged(tag: &str, required: impl IntoIterator<Item = (&'static str, Value)>) 
             .chain(required),
         [],
     )
+}
+
+// `MatchClause` is internally tagged on "op" rather than "type".
+fn op_tagged(tag: &str, required: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    object(
+        [("op", json!({"const": tag}))]
+            .into_iter()
+            .chain(required),
+        [],
+    )
+}
+
+/// Strict mirror of `ExpectationRuleSpec` (`crates/protocol/src/rules.rs`).
+fn rule_schema() -> Value {
+    object(
+        [
+            (
+                "scope",
+                object(
+                    [
+                        ("host_id", string()),
+                        (
+                            "collector",
+                            choices(&[
+                                "sockets.listening",
+                                "systemd.unit_state",
+                                "files.metadata",
+                                "journal.unit_events",
+                            ]),
+                        ),
+                    ],
+                    [("watch_id", nullable(string()))],
+                ),
+            ),
+            (
+                "matches",
+                json!({"type": "array", "minItems": 1, "maxItems": 8, "items": clause_schema()}),
+            ),
+            (
+                "effect",
+                choices(&["allow_optional", "require_present", "ignore_modified"]),
+            ),
+            ("rationale", string()),
+        ],
+        [("expires_at", nullable(timestamp()))],
+    )
+}
+
+fn clause_schema() -> Value {
+    json!({"oneOf": [
+        op_tagged("eq", [("field", string()), ("value", rule_value())]),
+        op_tagged("in", [
+            ("field", string()),
+            (
+                "values",
+                json!({"type": "array", "minItems": 1, "maxItems": 32, "items": rule_value()}),
+            ),
+        ]),
+        op_tagged("range", [("field", string()), ("min", signed()), ("max", signed())]),
+        op_tagged("prefix", [("field", string()), ("value", string())]),
+    ]})
+}
+
+// `RuleValue` is untagged: Int(i64) | Bool(bool) | Text(String).
+fn rule_value() -> Value {
+    json!({"anyOf": [signed(), boolean(), string()]})
 }
 
 fn object(
