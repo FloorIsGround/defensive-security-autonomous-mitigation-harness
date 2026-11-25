@@ -9,17 +9,26 @@ import {
   ApiError,
   COLLECTOR_TYPES,
   REASONER_UNSUPPORTED_MESSAGE,
+  RULES_UNSUPPORTED_MESSAGE,
   automationSummary,
   buildIncidentChanges,
   buildWatchSpec,
   deriveThreeState,
   int,
+  isRuleGateCode,
   isStreamWatch,
   parseActionBody,
   parseEventsQuery,
   parseFindingBody,
+  parseRuleBody,
+  parseRuleDecision,
+  parseRuleId,
+  parseRuleRevoke,
+  parseRulesQuery,
   parseRunsQuery,
   parseTriggersQuery,
+  publicBacktest,
+  publicRuleRecord,
   publicRunEvent,
   publicRunSummary,
   publicTrigger,
@@ -27,7 +36,7 @@ import {
   requireText,
 } from './domain.mjs';
 
-const CODE_STATUS = { forbidden: 403, invalid_request: 400, not_found: 404 };
+const CODE_STATUS = { forbidden: 403, invalid_request: 400, not_found: 404, conflict: 409 };
 
 function transportError(err) {
   if (err instanceof ApiError) return err;
@@ -63,8 +72,8 @@ function unsupportedOp(err) {
   return /unknown (variant|op)|unsupported (op|request)/i.test(err.message ?? '');
 }
 
-function unavailable(err) {
-  if (unsupportedOp(err)) return { available: false, reason: 'unsupported', message: REASONER_UNSUPPORTED_MESSAGE };
+function unavailable(err, message = REASONER_UNSUPPORTED_MESSAGE) {
+  if (unsupportedOp(err)) return { available: false, reason: 'unsupported', message };
   if (err instanceof ApiError && err.status === 403) return { available: false, reason: 'forbidden', message: err.message };
   return null;
 }
@@ -159,6 +168,37 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       }))
       .filter(match)
       .sort((a, b) => (b.proposal_id ?? 0) - (a.proposal_id ?? 0));
+  }
+
+  /**
+   * Admin rule ops whose denial is a gate verdict, not a failure: control-d
+   * answers `Error { code: "rule-gate/<id>", message: <reason> }` (and, for
+   * create/decide, records a PolicyDecision row). Surface it as the decision.
+   */
+  async function ruleGateCall(request, expected, actor = null) {
+    if (!admin) throw new ApiError(403, 'admin_disabled', 'admin interface is disabled (start the console with --enable-admin --admin-sock)');
+    let resp;
+    try {
+      resp = await admin.call(request);
+    } catch (err) {
+      throw transportError(err);
+    }
+    if (resp?.admin_result === 'error' && isRuleGateCode(resp.code)) {
+      return { denied: { allowed: false, rule_id: resp.code, reason: resp.message ?? '', policy_version: await recordedPolicyVersion(resp.code, actor) } };
+    }
+    return { value: unwrap(resp, 'admin_result', expected) };
+  }
+
+  /** The error frame carries no policy_version; read it back from the row control-d just recorded. */
+  async function recordedPolicyVersion(ruleId, actor) {
+    if (!actor) return null;
+    try {
+      const r = await adminCall({ admin_op: 'list_policy_decisions', limit: 20 }, 'policy_decisions');
+      const hit = r.decisions.filter((d) => d.decision?.rule_id === ruleId && d.actor === actor).sort((a, b) => b.decision_id - a.decision_id)[0];
+      return hit?.decision?.policy_version ?? null;
+    } catch {
+      return null;
+    }
   }
 
   return {
@@ -431,6 +471,72 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
         if (u) return { ...u, triggers: [], server_time: new Date().toISOString() };
         throw err;
       }
+    },
+
+    // ---- Phase 10 expectation rules --------------------------------------------
+    // Reads use the admin interface when it is on (every host), otherwise the
+    // browse token's investigation scope. Mutations are admin-only; the actor
+    // is bound to the signed-in account by server.mjs before it gets here.
+
+    async rules(query = {}) {
+      const q = parseRulesQuery(query);
+      const filter = { limit: q.limit };
+      if (q.host_id) filter.host_id = q.host_id;
+      if (q.statuses) filter.statuses = q.statuses;
+      const server_time = new Date().toISOString();
+      let source = admin ? 'admin' : 'investigate';
+      let r;
+      try {
+        r = admin ? await adminCall({ admin_op: 'list_expectation_rules', ...filter }, 'expectation_rules') : await invCall({ op: 'list_expectation_rules', ...filter }, 'expectation_rules');
+      } catch (err) {
+        if (admin && err instanceof ApiError && err.status !== 503 && !unsupportedOp(err)) {
+          // The admin socket refused (e.g. frame limit); the scoped list still works.
+          source = 'investigate';
+          try {
+            r = await invCall({ op: 'list_expectation_rules', ...filter }, 'expectation_rules');
+          } catch (inner) {
+            const u = unavailable(inner, RULES_UNSUPPORTED_MESSAGE);
+            if (u) return { ...u, source, rules: [], server_time };
+            throw inner;
+          }
+        } else {
+          const u = unavailable(err, RULES_UNSUPPORTED_MESSAGE);
+          if (u) return { ...u, source, rules: [], server_time };
+          throw err;
+        }
+      }
+      return { available: true, source, rules: (r.rules ?? []).map(publicRuleRecord), server_time };
+    },
+
+    async backtestRule(body = {}) {
+      const { rule } = parseRuleBody(body);
+      const r = await ruleGateCall({ admin_op: 'backtest_expectation_rule', rule }, 'rule_backtest_result');
+      if (r.denied) return { allowed: false, decision: r.denied, backtest: null, rule };
+      return { allowed: true, decision: null, backtest: publicBacktest(r.value.backtest), rule };
+    },
+
+    async createRule(body = {}) {
+      const { rule, actor } = parseRuleBody(body, { actor: true });
+      const r = await ruleGateCall({ admin_op: 'create_expectation_rule', rule, actor }, 'rule_decided', actor);
+      if (r.denied) return { allowed: false, decision: r.denied, rule_id: null, status: null, rule };
+      return { allowed: true, decision: null, rule_id: r.value.rule_id, status: r.value.status, rule };
+    },
+
+    async decideRule(ruleId, body = {}) {
+      const rule_id = parseRuleId(ruleId);
+      const d = parseRuleDecision(body);
+      const request = { admin_op: 'decide_expectation_rule', rule_id, approve: d.approve, actor: d.actor };
+      if (d.note !== null) request.note = d.note;
+      const r = await ruleGateCall(request, 'rule_decided', d.actor);
+      if (r.denied) return { allowed: false, decision: r.denied, rule_id, status: 'proposed' };
+      return { allowed: true, decision: null, rule_id: r.value.rule_id, status: r.value.status };
+    },
+
+    async revokeRule(ruleId, body = {}) {
+      const rule_id = parseRuleId(ruleId);
+      const v = parseRuleRevoke(body);
+      const r = await adminCall({ admin_op: 'revoke_expectation_rule', rule_id, actor: v.actor, reason: v.reason }, 'rule_decided');
+      return { rule_id: r.rule_id, status: r.status };
     },
 
     async automation() {
