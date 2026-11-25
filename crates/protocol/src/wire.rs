@@ -84,7 +84,7 @@ pub enum AgentToControl {
         sent_at: DateTime<Utc>,
         /// Summary of the admin-owned host profile applied by this agent.
         /// Optional and informational; older agents omit it.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         host_profile: Option<HostProfileSummary>,
     },
     Heartbeat {
@@ -222,6 +222,25 @@ pub fn in_memory_link_pair(capacity: usize) -> (InMemoryAgentLink, InMemoryContr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_without_profile_preserves_legacy_json() {
+        let legacy = serde_json::json!({
+            "msg": "register", "protocol_version": WIRE_PROTOCOL_VERSION,
+            "host_id": "edge-01", "agent_version": "0.1.0", "boot_id": "boot-1",
+            "session_id": "sess-1", "active_bundle_version": 0,
+            "active_bundle_digest": null, "sent_at": "2026-01-01T00:00:00Z"
+        });
+        let register: AgentToControl = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            register,
+            AgentToControl::Register {
+                host_profile: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(register).unwrap(), legacy);
+    }
 
     #[tokio::test]
     async fn framed_roundtrip_over_duplex() {
