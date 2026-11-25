@@ -825,6 +825,58 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
     }
   });
 
+  test('Phase 9 reasoner activity endpoints read the real control-d runs, events and trigger queue', async () => {
+    const admin = new AdminClient({ socketPath: adminSock });
+    const observer = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-observer', role: 'observer', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 300 });
+    assert.equal(observer.admin_result, 'token_minted', JSON.stringify(observer));
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: true });
+    const readOnly = createLiveBackend({ investigateSock: invSock, token: observer.token, adminSock, enableAdmin: false });
+    const a = await startConsole(backend);
+    const o = await startConsole(readOnly);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    try {
+      const open = track(await get(a.port, '/api/incidents')).json.incidents.find((i) => i.status === 'open' && i.host_id === HOST);
+      assert.ok(open, 'an open incident exists');
+      const session = track(await post(a.port, `/api/incidents/${open.incident_id}/runs`, {}));
+      assert.equal(session.status, 200, session.text);
+
+      for (const port of [a.port, o.port]) {
+        const runs = track(await get(port, `/api/runs?incident_id=${open.incident_id}`));
+        assert.equal(runs.status, 200, runs.text);
+        assert.equal(runs.json.available, true, `control-d Phase 9 runs must be readable: ${runs.text}`);
+        const mine = runs.json.runs.find((r) => r.run_id === session.json.run_id);
+        assert.ok(mine, runs.text);
+        assert.equal(mine.host_id, HOST);
+        assert.equal(mine.status, 'active');
+        assert.equal(mine.origin, 'operator');
+        assert.ok(Number.isFinite(Date.parse(mine.started_at)));
+        assert.equal(typeof mine.event_count, 'number');
+
+        const events = track(await get(port, `/api/runs/${session.json.run_id}/events`));
+        assert.equal(events.status, 200, events.text);
+        assert.equal(events.json.available, true);
+        assert.ok(Array.isArray(events.json.events));
+
+        const queue = track(await get(port, '/api/triggers'));
+        assert.equal(queue.status, 200, queue.text);
+        assert.equal(queue.json.available, true, queue.text);
+        assert.ok(queue.json.triggers.length >= 2, 'both incidents queued a trigger');
+        assert.ok(queue.json.triggers.every((t) => t.host_id === HOST && typeof t.retry_count === 'number'));
+        const pending = track(await get(port, '/api/triggers?status=pending'));
+        assert.ok(pending.json.triggers.every((t) => t.status === 'pending'));
+      }
+      assert.equal((await get(a.port, '/api/runs?incident_id=bad%20id')).status, 400);
+      for (const text of bodies) {
+        assert.ok(!text.includes(browseToken) && !text.includes(observer.token), 'token leaked');
+        assert.ok(!/lease_token|capability_token/.test(text), 'lease or capability token field leaked');
+      }
+    } finally {
+      await a.app.close();
+      await o.app.close();
+    }
+  });
+
   test('without --enable-admin, runs are refused instead of narrowing the shared token', async () => {
     const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: false });
     const { app, port } = await startConsole(backend);
@@ -1782,7 +1834,7 @@ describe('POST /api/incidents/:id/actions (demo)', () => {
     assert.ok(!changes.some((c) => c.collector_type === 'journal.unit_events'), 'streams are not diffed');
     const auto = (await get(port, '/api/automation')).json;
     assert.equal(auto.available, true);
-    assert.equal(auto.reasoner_runs, 2);
+    assert.equal(auto.reasoner_runs, 3);
     assert.equal(auto.last_run.model_id, 'claude-sonnet-5-5');
   });
 });
@@ -1848,6 +1900,280 @@ describe('ProposeAction frames over a mock control-d', () => {
       invSrv.close();
       admSrv.close();
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Phase 9 reasoner activity: runs, run events, trigger queue
+// ---------------------------------------------------------------------------
+
+const RUN_KEYS = ['backend_id', 'ended_at', 'event_count', 'expires_at', 'findings_count', 'host_id', 'incident_id', 'last_event', 'model_id', 'origin', 'outcome', 'principal_id', 'proposals_count', 'run_id', 'started_at', 'status'];
+const TRIGGER_KEYS = ['created_at', 'event_id', 'host_id', 'incident_id', 'lease_expires_at', 'lease_owner', 'reason', 'retry_count', 'status', 'updated_at', 'watch_id'];
+
+describe('reasoner activity (demo)', () => {
+  let app;
+  let port;
+  let clock;
+  before(async () => {
+    clock = Date.now();
+    ({ app, port } = await startConsole(createDemoBackend({ now: () => clock })));
+  });
+  after(() => app.close());
+
+  test('runs list automated runs with the RunSummary schema and an origin', async () => {
+    const r = await get(port, '/api/runs');
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.available, true);
+    assert.ok(r.json.runs.length >= 3);
+    for (const run of r.json.runs) assert.deepEqual(Object.keys(run).sort(), RUN_KEYS);
+    const active = r.json.runs.find((x) => x.status === 'active');
+    assert.equal(active.run_id, 'run-a41c07d9');
+    assert.equal(active.origin, 'automated');
+    assert.equal(active.outcome, null);
+    assert.equal(active.last_event.kind, 'tool_result');
+    const budget = r.json.runs.find((x) => x.run_id === 'run-7f3a91c2');
+    assert.equal(budget.status, 'budget_exhausted');
+    assert.equal(budget.outcome.status, 'budget_exhausted');
+    assert.match(budget.outcome.budget_stop_reason, /tool_calls/);
+    assert.deepEqual(
+      Object.keys(budget.outcome).sort(),
+      ['budget_stop_reason', 'findings', 'input_tokens', 'output_tokens', 'proposals', 'proposals_accepted', 'status', 'summary', 'tool_calls', 'turns'],
+    );
+    assert.equal(budget.findings_count, 3);
+    const scoped = await get(port, '/api/runs?incident_id=inc-2026-0039');
+    assert.deepEqual(scoped.json.runs.map((x) => x.run_id), ['run-19bd04e7']);
+    assert.equal((await get(port, '/api/runs?host_id=edge-vm-07&limit=1')).json.runs.length, 1);
+    assert.equal((await get(port, '/api/runs?incident_id=bad%20id')).status, 400);
+    assert.equal((await get(port, '/api/runs?limit=0')).status, 400);
+  });
+
+  test('events page with after_seq and the in-progress run advances over time', async () => {
+    const all = await get(port, '/api/runs/run-a41c07d9/events');
+    assert.equal(all.status, 200, all.text);
+    const seqs = all.json.events.map((e) => e.event_seq);
+    assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
+    assert.equal(all.json.next_after_seq, seqs.at(-1));
+    for (const e of all.json.events) {
+      assert.deepEqual(Object.keys(e).sort(), ['created_at', 'detail', 'event_seq', 'kind']);
+      assert.ok(['turn_started', 'tool_call', 'tool_result', 'model_text', 'budget_warning', 'note'].includes(e.kind));
+      assert.equal(typeof e.detail, 'object');
+    }
+    const none = await get(port, `/api/runs/run-a41c07d9/events?after_seq=${seqs.at(-1)}`);
+    assert.deepEqual(none.json.events, []);
+    assert.equal(none.json.next_after_seq, seqs.at(-1));
+    const page = await get(port, '/api/runs/run-7f3a91c2/events?after_seq=3&limit=2');
+    assert.deepEqual(page.json.events.map((e) => e.event_seq), [4, 5]);
+    assert.equal((await get(port, '/api/runs/run-nope/events')).status, 404);
+    assert.equal((await get(port, '/api/runs/run-a41c07d9/events?after_seq=x')).status, 400);
+
+    const findingsBefore = (await get(port, '/api/incidents/inc-2026-0042')).json.findings.length;
+    clock += 90_000;
+    const more = await get(port, `/api/runs/run-a41c07d9/events?after_seq=${seqs.at(-1)}`);
+    assert.ok(more.json.events.length >= 3, 'new events appear as demo time passes');
+    assert.ok(more.json.events.every((e) => e.event_seq > seqs.at(-1)));
+    assert.ok(more.json.events.some((e) => e.kind === 'model_text'));
+    const mid = (await get(port, '/api/runs?incident_id=inc-2026-0042')).json.runs.find((x) => x.run_id === 'run-a41c07d9');
+    assert.equal(mid.status, 'active');
+    assert.equal(mid.findings_count, 1, 'the model recorded a finding');
+    assert.equal((await get(port, '/api/incidents/inc-2026-0042')).json.findings.length, findingsBefore + 1);
+
+    clock += 4 * 60_000;
+    const done = (await get(port, '/api/runs?incident_id=inc-2026-0042')).json.runs.find((x) => x.run_id === 'run-a41c07d9');
+    assert.equal(done.status, 'completed');
+    assert.equal(done.outcome.status, 'completed');
+    assert.ok(done.ended_at);
+    assert.ok(done.outcome.turns >= 3 && done.outcome.tool_calls >= 4);
+    assert.equal(done.outcome.proposals, 1);
+    assert.equal(done.outcome.proposals_accepted, 0);
+  });
+
+  test('trigger queue: statuses, leases, dead letters and filters', async () => {
+    const t = await get(port, '/api/triggers');
+    assert.equal(t.status, 200, t.text);
+    for (const x of t.json.triggers) assert.deepEqual(Object.keys(x).sort(), TRIGGER_KEYS);
+    const byId = Object.fromEntries(t.json.triggers.map((x) => [x.event_id, x]));
+    assert.equal(byId[4121].status, 'dead_letter');
+    assert.equal(byId[4121].retry_count, 3);
+    assert.match(byId[4121].reason, /retry budget exhausted/);
+    assert.equal(byId[4129].status, 'pending');
+    assert.equal(byId[4127].status, 'done', 'the lease is released when the run completes');
+    const open = await get(port, '/api/triggers?status=pending,leased');
+    assert.deepEqual(open.json.triggers.map((x) => x.event_id), [4129]);
+    assert.deepEqual((await get(port, '/api/triggers?incident_id=inc-2026-0039&status=done')).json.triggers.map((x) => x.event_id), [4102]);
+    assert.equal((await get(port, '/api/triggers?host_id=edge-vm-03')).json.triggers.every((x) => x.host_id === 'edge-vm-03'), true);
+    const bad = await get(port, '/api/triggers?status=pending,bogus');
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.error.code, 'invalid_request');
+  });
+
+  test('operator sessions are listed separately and log what the operator submitted', async () => {
+    const noRun = await post(port, '/api/incidents/inc-2026-0039/findings', { kind: 'hypothesis', summary: 's' });
+    assert.equal(noRun.status, 409);
+    assert.match(noRun.json.error.message, /operator session/);
+    const s = await post(port, '/api/incidents/inc-2026-0039/runs', {});
+    assert.equal(s.status, 200, s.text);
+    await post(port, '/api/incidents/inc-2026-0039/findings', { run_id: s.json.run_id, kind: 'hypothesis', summary: 'Probably the CHG-4471 push' });
+    const runs = (await get(port, '/api/runs?incident_id=inc-2026-0039')).json.runs;
+    const op = runs.find((x) => x.run_id === s.json.run_id);
+    assert.equal(op.origin, 'operator');
+    assert.equal(op.backend_id, 'operator-console');
+    assert.equal(op.status, 'active');
+    assert.equal(op.findings_count, 1);
+    assert.equal(runs.find((x) => x.run_id === 'run-19bd04e7').origin, 'automated');
+    const ev = (await get(port, `/api/runs/${s.json.run_id}/events`)).json.events;
+    assert.deepEqual(ev.map((e) => e.kind), ['note', 'tool_call', 'tool_result']);
+    await post(port, '/api/admin/incidents/inc-2026-0039/close', { actor: 'j.rivera', resolution: 'approved config push' });
+    const ended = (await get(port, '/api/runs?incident_id=inc-2026-0039')).json.runs.find((x) => x.run_id === s.json.run_id);
+    assert.equal(ended.status, 'cancelled');
+  });
+
+  test('a pending trigger with no active run is visible as a stall', async () => {
+    // Long after every demo run ended, trigger 4129 is still pending.
+    clock += 10 * 60_000;
+    const runs = (await get(port, '/api/runs')).json.runs.filter((x) => x.origin === 'automated');
+    assert.ok(runs.every((x) => x.status !== 'active'));
+    const pending = (await get(port, '/api/triggers?status=pending')).json.triggers;
+    assert.equal(pending.length, 1);
+    assert.ok(clock - Date.parse(pending[0].created_at) > 120_000);
+  });
+});
+
+describe('reasoner activity over a mock control-d', () => {
+  test('exact frames on the browse token, secrets stripped, nothing starts a run', async () => {
+    const dir = shortTmp('dsr-');
+    const inv = path.join(dir, 'iv.sock');
+    const seen = [];
+    const now = new Date().toISOString();
+    const run = {
+      run_id: 'run-1', incident_id: 'inc-1', host_id: 'edge-x', principal_id: 'reasoner-d', backend_id: 'anthropic-direct', model_id: 'claude-sonnet-5-5',
+      status: 'active', started_at: now, expires_at: now, ended_at: null, outcome: null,
+      last_event: { event_seq: 2, kind: 'tool_call', detail: { tool: 'query_observations', args_preview: '{}', capability_token: 'cap-secret-LEAK' }, created_at: now },
+      event_count: 2, findings_count: 0, proposals_count: 0, run_token: 'run-secret-LEAK',
+    };
+    const op = { ...run, run_id: 'run-2', principal_id: 'console-run-5bc7e050', backend_id: 'operator-console', model_id: 'human-operator', status: 'completed', last_event: null };
+    const invSrv = await mockUdsServer(inv, (frame) => {
+      seen.push({ token: frame.capability_token, request: frame.request });
+      switch (frame.request.op) {
+        case 'list_investigation_runs':
+          return { result: 'runs', runs: [run, op] };
+        case 'get_run_events':
+          return { result: 'run_events', run_id: frame.request.run_id, events: [
+            { event_seq: 4, kind: 'tool_result', detail: { tool: 'query_observations', ok: true, code: null, nested: { lease_token: 'lease-secret-LEAK', tokens: 12 } }, created_at: now },
+            { event_seq: 3, kind: 'turn_started', detail: { turn: 2, tokens: 5123 }, created_at: now },
+          ] };
+        case 'list_trigger_queue':
+          return { result: 'trigger_queue', triggers: [{ event_id: 7, incident_id: 'inc-1', host_id: 'edge-x', watch_id: 'w', status: 'leased', created_at: now, updated_at: now, lease_owner: 'reasoner-d@h', lease_expires_at: now, retry_count: 0, reason: null, lease_token: 'lease-secret-LEAK' }] };
+        default:
+          return { result: 'error', code: 'invalid_request', message: 'unexpected' };
+      }
+    });
+    const { app, port } = await startConsole(createLiveBackend({ investigateSock: inv, token: 'browse-token-LEAK' }));
+    try {
+      const runs = await get(port, '/api/runs?incident_id=inc-1&limit=5');
+      assert.equal(runs.status, 200, runs.text);
+      assert.deepEqual(seen.at(-1), { token: 'browse-token-LEAK', request: { op: 'list_investigation_runs', limit: 5, incident_id: 'inc-1' } });
+      assert.equal(runs.json.available, true);
+      assert.deepEqual(runs.json.runs.map((r) => r.origin), ['automated', 'operator']);
+      for (const r of runs.json.runs) assert.deepEqual(Object.keys(r).sort(), RUN_KEYS);
+      assert.deepEqual(runs.json.runs[0].last_event.detail, { tool: 'query_observations', args_preview: '{}' });
+
+      const ev = await get(port, '/api/runs/run-1/events?after_seq=2&limit=10');
+      assert.equal(ev.status, 200, ev.text);
+      assert.deepEqual(seen.at(-1).request, { op: 'get_run_events', run_id: 'run-1', limit: 10, after_seq: 2 });
+      assert.deepEqual(ev.json.events.map((e) => e.event_seq), [3, 4], 'sorted by event_seq');
+      assert.equal(ev.json.next_after_seq, 4);
+      assert.deepEqual(ev.json.events[1].detail.nested, { tokens: 12 }, 'counters stay, tokens go');
+      await get(port, '/api/runs/run-1/events');
+      assert.deepEqual(seen.at(-1).request, { op: 'get_run_events', run_id: 'run-1', limit: 200 });
+
+      const tq = await get(port, '/api/triggers?host_id=edge-x&status=pending,leased');
+      assert.equal(tq.status, 200, tq.text);
+      assert.deepEqual(seen.at(-1).request, { op: 'list_trigger_queue', limit: 100, host_id: 'edge-x', statuses: ['pending', 'leased'] });
+      assert.deepEqual(Object.keys(tq.json.triggers[0]).sort(), TRIGGER_KEYS);
+      assert.equal(tq.json.triggers[0].lease_owner, 'reasoner-d@h');
+
+      for (const r of [runs, ev, tq]) assert.ok(!/LEAK/.test(r.text), `no token in ${r.text.slice(0, 80)}`);
+      assert.ok(seen.every((x) => x.token === 'browse-token-LEAK'));
+      assert.ok(!seen.some((x) => x.request.op === 'start_investigation_run'), 'reading reasoner activity never starts a run');
+    } finally {
+      await app.close();
+      invSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an older control-d degrades to "not available" instead of failing the page', async () => {
+    const dir = shortTmp('dsr-');
+    const old = path.join(dir, 'old.sock');
+    const forb = path.join(dir, 'fb.sock');
+    // Pre-Phase-9 control-d cannot deserialize the new ops and closes the connection.
+    const oldSrv = await mockUdsServer(old, (frame) => (frame.request.op === 'list_hosts' ? { result: 'hosts', hosts: [] } : undefined));
+    const fbSrv = await mockUdsServer(forb, (frame) =>
+      frame.request.op === 'get_run_events'
+        ? { result: 'error', code: 'invalid_request', message: 'unknown variant `get_run_events`' }
+        : { result: 'error', code: 'forbidden', message: 'capability does not allow this operation' },
+    );
+    const a = await startConsole(createLiveBackend({ investigateSock: old, token: 't' }));
+    const b = await startConsole(createLiveBackend({ investigateSock: forb, token: 't' }));
+    try {
+      for (const p of ['/api/runs', '/api/runs/run-1/events', '/api/triggers']) {
+        const r = await get(a.port, p);
+        assert.equal(r.status, 200, `${p}: ${r.text}`);
+        assert.equal(r.json.available, false);
+        assert.equal(r.json.reason, 'unsupported');
+        assert.match(r.json.message, /control-d ≥ Phase 9/);
+      }
+      assert.equal((await get(a.port, '/api/status')).status, 200, 'the rest of the console keeps working');
+      const f = await get(b.port, '/api/runs');
+      assert.equal(f.json.available, false);
+      assert.equal(f.json.reason, 'forbidden');
+      const u = await get(b.port, '/api/runs/run-1/events');
+      assert.equal(u.json.reason, 'unsupported');
+      const gone = await startConsole(createLiveBackend({ investigateSock: path.join(dir, 'missing.sock'), token: 't' }));
+      try {
+        assert.equal((await get(gone.port, '/api/runs')).status, 503, 'an unreachable socket is still an error');
+      } finally {
+        await gone.app.close();
+      }
+    } finally {
+      await a.app.close();
+      await b.app.close();
+      oldSrv.close();
+      fbSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('operator console copy and identity binding', () => {
+  test('the manual session is called an operator session everywhere', () => {
+    const files = ['public/app.js', 'public/index.html', 'README.md', 'lib/live-backend.mjs', 'lib/demo-data.mjs'].map((f) => fs.readFileSync(path.join(CONSOLE_DIR, f), 'utf8'));
+    for (const text of files) assert.ok(!/start (an )?investigation run/i.test(text), 'old wording is gone');
+    const app = files[0];
+    assert.ok(app.includes("'Start operator session'"));
+    assert.match(app, /does not start the model/);
+    assert.ok(files[1].includes('#/reasoner'), 'Reasoner activity is in the navigation');
+  });
+
+  test('with an access gate, approver and actor are the signed-in account', async () => {
+    const backend = createDemoBackend();
+    const auth = createAuth({ mode: 'proxy-header', proxyRoleHeader: 'x-forwarded-groups', proxyAdminGroup: 'defsec-admins' });
+    const { app, port } = await startConsole(backend, { auth });
+    const alice = { headers: { 'X-Forwarded-User': 'alice@example.com', 'X-Forwarded-Groups': 'defsec-admins' } };
+    try {
+      const rows = (await get(port, '/api/hosts/edge-vm-07/baselines', alice)).json.three_state;
+      const r = rows.find((x) => x.promotable_observation_id);
+      const p = await post(port, '/api/admin/baselines/promote', { host_id: 'edge-vm-07', watch_id: r.watch_id, observation_id: r.promotable_observation_id, approver: 'mallory', rationale: 'Accept observed change' }, alice);
+      assert.equal(p.status, 200, p.text);
+      const c = await post(port, '/api/admin/incidents/inc-2026-0039/close', { actor: 'mallory', resolution: 'expected change' }, alice);
+      assert.equal(c.status, 200, c.text);
+      const audit = backend._state().audit;
+      assert.equal(audit.findLast((e) => e.event_type === 'baseline_promoted').actor, 'alice@example.com');
+      assert.equal(audit.findLast((e) => e.event_type === 'incident_closed').actor, 'alice@example.com');
+      assert.equal((await post(port, '/api/admin/baselines/promote', { host_id: 'edge-vm-07', watch_id: r.watch_id, observation_id: r.promotable_observation_id, approver: 'x' }, alice)).status, 400, 'rationale is still validated server-side');
+    } finally {
+      await app.close();
     }
   });
 });
