@@ -2,12 +2,14 @@ use std::{
     collections::HashMap,
     future::Future,
     io,
+    net::SocketAddr,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use defsec_mtls::MtlsAcceptor;
 use defsec_protocol::{
     rpc::{AdminRequest, InvestigationCall},
     signing::SignedEnvelope,
@@ -15,8 +17,8 @@ use defsec_protocol::{
     wire::{AgentToControl, ControlToAgent, read_frame, write_frame},
 };
 use tokio::{
-    io::AsyncWrite,
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UnixListener, UnixStream},
     sync::Semaphore,
     task::{JoinSet, spawn_blocking},
     time::timeout,
@@ -25,8 +27,61 @@ use tokio::{
 use crate::{ControlService, service::uuid};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+const AGENT_CONNECTION_LIMIT: usize = 128;
 type ServerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Registry = Arc<Mutex<HashMap<String, String>>>;
+pub(crate) type Registry = Arc<Mutex<HashMap<String, String>>>;
+
+pub struct MtlsAgentServer {
+    listener: TcpListener,
+    acceptor: MtlsAcceptor,
+}
+
+impl MtlsAgentServer {
+    pub async fn bind(addr: SocketAddr, acceptor: MtlsAcceptor) -> io::Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind(addr).await?,
+            acceptor,
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub async fn serve_agent(self, service: ControlService) -> io::Result<()> {
+        let registry = service.agent_registry();
+        let mut tasks = JoinSet::new();
+        let capacity = Arc::new(Semaphore::new(AGENT_CONNECTION_LIMIT));
+        loop {
+            tokio::select! {
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!(%error, "mTLS agent task failed");
+                    }
+                }
+                accepted = self.listener.accept() => {
+                    let (stream, addr) = accepted?;
+                    let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
+                    let acceptor = self.acceptor.clone();
+                    let service = service.clone();
+                    let registry = registry.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        match timeout(IO_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok((stream, peer))) => {
+                                if let Err(error) = agent_connection(stream, service, registry, Some(peer.host_id)).await {
+                                    tracing::debug!(%addr, %error, "mTLS agent connection ended");
+                                }
+                            }
+                            Ok(Err(error)) => tracing::debug!(%addr, %error, "mTLS agent rejected"),
+                            Err(error) => tracing::debug!(%addr, %error, "mTLS agent handshake timed out"),
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SocketPolicy {
@@ -75,8 +130,8 @@ impl UnixServer {
     }
 
     pub async fn serve_agent(self, service: ControlService) -> io::Result<()> {
-        let registry: Registry = Arc::default();
-        self.serve(move |stream| agent_connection(stream, service.clone(), registry.clone()))
+        let registry = service.agent_registry();
+        self.serve(move |stream| agent_connection(stream, service.clone(), registry.clone(), None))
             .await
     }
 
@@ -126,7 +181,7 @@ impl UnixServer {
         Fut: Future<Output = ServerResult<()>> + Send + 'static,
     {
         let mut tasks = JoinSet::new();
-        let capacity = Arc::new(Semaphore::new(128));
+        let capacity = Arc::new(Semaphore::new(AGENT_CONNECTION_LIMIT));
         loop {
             tokio::select! {
                 result = tasks.join_next(), if !tasks.is_empty() => {
@@ -187,11 +242,15 @@ impl Drop for RegisteredAgent {
     }
 }
 
-async fn agent_connection(
-    mut stream: UnixStream,
+async fn agent_connection<S>(
+    mut stream: S,
     service: ControlService,
     registry: Registry,
-) -> ServerResult<()> {
+    authenticated_host_id: Option<String>,
+) -> ServerResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let register = timeout(IO_TIMEOUT, read_frame::<_, AgentToControl>(&mut stream)).await??;
     let Some(msg @ AgentToControl::Register { .. }) = register else {
         return Ok(());
@@ -205,6 +264,13 @@ async fn agent_connection(
     else {
         unreachable!()
     };
+    if let Some(cert_host_id) = authenticated_host_id
+        && cert_host_id != *host_id
+    {
+        tracing::warn!(%cert_host_id, registered_host_id = %host_id, "mTLS agent host ID mismatch");
+        timeout(IO_TIMEOUT, stream.shutdown()).await??;
+        return Ok(());
+    }
     let mut bundle_version = *active_bundle_version;
     let session = session_id.clone();
     let agent = Arc::new(RegisteredAgent {
@@ -236,7 +302,7 @@ async fn agent_connection(
         replies.first(),
         Some(ControlToAgent::RegisterAck { accepted: true, .. })
     );
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     send_replies(&mut writer, replies, &mut bundle_version).await?;
     if !accepted {
         return Ok(());

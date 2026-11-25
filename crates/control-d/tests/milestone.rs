@@ -291,6 +291,42 @@ fn baseline_is_explicit_and_rollback_creates_a_revision() {
 }
 
 #[test]
+fn distinct_drift_diffs_on_same_watch_coalesce_until_closed() {
+    let f = Fixture::new();
+    f.setup_host("edge");
+    let baseline = f.put("edge", 1, "active");
+    f.promote("edge", baseline);
+
+    // Two distinct drift states on the same watch coalesce into one open incident.
+    f.put("edge", 2, "inactive");
+    f.put("edge", 3, "failed");
+    let db = f.db();
+    assert_eq!(count(&db, "incidents"), 1);
+    assert_eq!(count(&db, "trigger_events"), 2);
+    assert_eq!(count(&db, "trigger_evidence"), 2);
+
+    // Closing the incident allows subsequent drift on the same watch to open a new one.
+    let incident_id: String = db
+        .query_row(
+            "SELECT incident_id FROM incidents WHERE host_id='edge'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        f.service
+            .handle_admin_request(AdminRequest::CloseIncident {
+                incident_id,
+                actor: "ops".into(),
+                resolution: "resolved".into(),
+            }),
+        AdminResponse::IncidentClosed { .. }
+    ));
+    f.put("edge", 4, "deactivating");
+    assert_eq!(count(&db, "incidents"), 2);
+}
+
+#[test]
 fn contiguous_ack_deduplicates_and_distinguishes_gaps_from_checkpoints() {
     let f = Fixture::new();
     f.setup_host("edge");

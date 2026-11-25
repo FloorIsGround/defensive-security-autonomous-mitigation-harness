@@ -17,6 +17,9 @@ use defsec_protocol::{
 };
 use tokio::net::UnixStream;
 
+mod pki;
+use pki::PkiCommand;
+
 #[derive(Parser)]
 #[command(about = "DefSecAutMit operator CLI")]
 struct Args {
@@ -28,6 +31,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(subcommand)]
+    Pki(PkiCommand),
     Enroll {
         host_id: String,
         #[arg(long)]
@@ -188,6 +193,7 @@ impl Command {
             Self::GenerateOperatorKey { .. } | Self::ApproveAction { .. } => {
                 return Err("command requires local operator key handling".into());
             }
+            Self::Pki(_) => return Err("PKI commands operate on local files".into()),
             Self::ListHosts => AdminRequest::ListHosts,
             Self::ListIncidents => AdminRequest::ListIncidents,
             Self::VerifyAudit => AdminRequest::VerifyAuditChain,
@@ -245,6 +251,10 @@ async fn exchange(
 
 async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
     let response = match args.command {
+        Command::Pki(command) => {
+            println!("{}", serde_json::to_string_pretty(&command.run()?)?);
+            return Ok(false);
+        }
         Command::GenerateOperatorKey { key_id, out } => {
             println!(
                 "{}",

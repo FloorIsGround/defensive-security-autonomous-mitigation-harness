@@ -204,6 +204,8 @@ fn migrates_v1_without_rewriting_existing_records() {
         db.execute_batch(
             "
             INSERT INTO hosts (host_id, agent_version) VALUES ('legacy','v1');
+            INSERT INTO incidents (incident_id,host_id,status,priority_json,summary,created_at,updated_at)
+            VALUES ('legacy-incident','legacy','open','\"high\"','original incident','now','now');
             INSERT INTO policy_decisions (actor,request_id,decision_json,created_at)
             VALUES ('original','request','{}','now');
         ",
@@ -215,7 +217,7 @@ fn migrates_v1_without_rewriting_existing_records() {
         let version: i32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let agent: String = db
             .query_row(
                 "SELECT agent_version FROM hosts WHERE host_id='legacy'",
@@ -224,6 +226,14 @@ fn migrates_v1_without_rewriting_existing_records() {
             )
             .unwrap();
         assert_eq!(agent, "v1");
+        let incident: (String, bool) = db
+            .query_row(
+                "SELECT summary, is_liveness FROM incidents WHERE incident_id='legacy-incident'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(incident, ("original incident".into(), false));
         let policy: (String, Option<i64>) = db
             .query_row(
                 "SELECT actor, action_proposal_id FROM policy_decisions WHERE request_id='request'",

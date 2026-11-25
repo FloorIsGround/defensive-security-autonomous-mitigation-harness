@@ -20,7 +20,7 @@ flowchart LR
   subgraph Execution[Isolated execution domain]
     E[action-exec-d]
   end
-  A <-->|local UDS| C
+  A <-->|local UDS or TLS 1.3 mTLS| C
   R & M & W <-->|scoped local UDS| C
   C -. signed intent .-> E
 ```
@@ -29,13 +29,13 @@ flowchart LR
 
 | Area | Status |
 |---|---|
-| Phases 1–5: protocol, control, edge, investigation and reasoning | Implemented for local use |
+| Phases 1–5: protocol, control, edge, investigation and reasoning | Implemented |
+| Phase 6: fleet mTLS, internal PKI CLI, and liveness watchdog | Implemented |
 | Phase 8: bounded mitigation | Implemented, opt-in; executor defaults to dry-run |
 | Operator Web Console | Implemented, demo and local live modes |
-| Phase 6: fleet mTLS and PKI | Planned |
 | Phase 7: external telemetry adapters | Planned |
 
-Use it to track service, listening socket, file metadata and journal changes, preserve evidence, and investigate drift with controlled follow-up collection. It is not a replacement for an eBPF syscall EDR, a comprehensive SIEM, or a production multi-host WAN deployment. The current transport is local Unix sockets; fleet identity, rotation and mTLS remain future work.
+Use it to track service, listening socket, file metadata and journal changes, preserve evidence, and investigate drift with controlled follow-up collection. Agents can connect locally over Unix sockets or across a LAN/VPN using outbound-only TLS 1.3 mTLS with host-bound SPIFFE URI SANs and live certificate revocation. It is not a replacement for an eBPF syscall EDR or a comprehensive SIEM.
 
 The Python reasoner and Node console have no third-party runtime dependencies. Resource use depends on workload and system configuration; benchmark a deployment before setting service limits.
 
