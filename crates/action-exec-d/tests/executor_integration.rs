@@ -1,7 +1,7 @@
 //! In-process integration tests driving `ActionExecutor` exactly the way
 //! `control-d` integration harnesses do: through the public library API.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use action_exec_d::driver::{ActionDriver, FakeActionDriver};
@@ -75,7 +75,7 @@ fn signed_intent(
 }
 
 fn new_executor<D: ActionDriver>(
-    dir: &PathBuf,
+    dir: &Path,
     host_id: &str,
     cfg: ActionSafetyConfig,
     control_keys: VerifyingKeyStore,
@@ -87,7 +87,7 @@ fn new_executor<D: ActionDriver>(
         cfg,
         control_keys,
         operator_keys,
-        dir.clone(),
+        dir.to_path_buf(),
         driver,
     )
     .unwrap()

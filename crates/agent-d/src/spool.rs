@@ -147,7 +147,7 @@ impl ObservationSpool {
             let Some(id_str) = stripped.strip_suffix(".ndjson") else {
                 continue;
             };
-            if let Ok(id) = u64::from_str_radix(id_str, 10) {
+            if let Ok(id) = id_str.parse::<u64>() {
                 segment_ids.push(id);
             }
         }
@@ -204,13 +204,12 @@ impl ObservationSpool {
         self.records.push_back(spooled);
 
         if self.profile.is_durable() {
-            self.append_segment(&line).map_err(|e| {
+            self.append_segment(&line).inspect_err(|_| {
                 // Roll back the in-memory push: the durability guarantee was
                 // NOT satisfied, so the sequence must not advance silently.
                 if let Some(back) = self.records.pop_back() {
                     self.bytes_used = self.bytes_used.saturating_sub(back.encoded_len);
                 }
-                e
             })?;
         }
 
@@ -246,13 +245,10 @@ impl ObservationSpool {
                 .records
                 .iter()
                 .position(|r| !r.is_error && !r.is_reconciliation)
-                .or_else(|| {
-                    // Everything is protected; fall back to oldest overall.
-                    if self.records.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    }
+                .or(if self.records.is_empty() {
+                    None
+                } else {
+                    Some(0)
                 });
             let Some(idx) = candidate else {
                 break;

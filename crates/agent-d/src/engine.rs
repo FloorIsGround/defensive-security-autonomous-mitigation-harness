@@ -221,24 +221,24 @@ impl<C: CollectorBackend> AgentEngine<C> {
         // Cached verified bundle (verified BEFORE trusting it).
         let mut active_bundle: Option<ActiveBundle> = None;
         let mut hwm: Option<BundleHighWaterMark> = None;
-        if let Some(envelope) = load_json::<SignedEnvelope>(&state_dir.join(BUNDLE_FILE)) {
-            if let Ok((payload, digest)) = self_verify(&store, &envelope) {
-                hwm = load_json::<PersistedHwm>(&state_dir.join(BUNDLE_HWM_FILE))
-                    .map(|p| BundleHighWaterMark {
-                        bundle_version: p.bundle_version,
-                        payload_digest: p.payload_digest,
+        if let Some(envelope) = load_json::<SignedEnvelope>(&state_dir.join(BUNDLE_FILE))
+            && let Ok((payload, digest)) = self_verify(&store, &envelope)
+        {
+            hwm = load_json::<PersistedHwm>(&state_dir.join(BUNDLE_HWM_FILE))
+                .map(|p| BundleHighWaterMark {
+                    bundle_version: p.bundle_version,
+                    payload_digest: p.payload_digest,
+                })
+                .or_else(|| {
+                    Some(BundleHighWaterMark {
+                        bundle_version: payload.bundle_version,
+                        payload_digest: digest.clone(),
                     })
-                    .or_else(|| {
-                        Some(BundleHighWaterMark {
-                            bundle_version: payload.bundle_version,
-                            payload_digest: digest.clone(),
-                        })
-                    });
-                active_bundle = Some(ActiveBundle {
-                    payload,
-                    payload_digest: digest,
                 });
-            }
+            active_bundle = Some(ActiveBundle {
+                payload,
+                payload_digest: digest,
+            });
         }
 
         // Journal cursors: durable profile only — cursors are checkpointed

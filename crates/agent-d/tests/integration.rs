@@ -4,7 +4,7 @@
 //! in-process against `FakeHostCollectors`.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -140,31 +140,33 @@ fn signed_bundle(
 }
 
 fn fake_sockets_host(count: i64) -> FakeHostCollectors {
-    let mut state = FakeHostState::default();
-    state.sockets = SocketsListeningSnapshot {
-        count: count as usize,
-        partial_attribution: false,
-        sockets: (0..count.max(0))
-            .map(|i| ListeningSocketEntry {
-                socket_key: format!("tcp:0.0.0.0:{i}:uid=0"),
-                protocol: "tcp".into(),
-                local_addr: "0.0.0.0".into(),
-                local_port: 1000 + i as u16,
-                uid: 0,
-                inode: i as u64,
-                pid: None,
-                pid_start_time_ticks: None,
-                comm: None,
-                systemd_unit: None,
-            })
-            .collect(),
+    let state = FakeHostState {
+        sockets: SocketsListeningSnapshot {
+            count: count as usize,
+            partial_attribution: false,
+            sockets: (0..count.max(0))
+                .map(|i| ListeningSocketEntry {
+                    socket_key: format!("tcp:0.0.0.0:{i}:uid=0"),
+                    protocol: "tcp".into(),
+                    local_addr: "0.0.0.0".into(),
+                    local_port: 1000 + i as u16,
+                    uid: 0,
+                    inode: i as u64,
+                    pid: None,
+                    pid_start_time_ticks: None,
+                    comm: None,
+                    systemd_unit: None,
+                })
+                .collect(),
+        },
+        ..FakeHostState::default()
     };
     FakeHostCollectors::from_state(state)
 }
 
 fn engine_with(
     kp: &SigningKeyPair,
-    dir: &PathBuf,
+    dir: &Path,
     host: FakeHostCollectors,
     durable: bool,
 ) -> AgentEngine<FakeHostCollectors> {
@@ -181,7 +183,7 @@ fn engine_with(
         EdgeSafetyConfig::default(),
         HOST.into(),
         durability,
-        dir.clone(),
+        dir.to_path_buf(),
         store_for(kp),
         Arc::new(host),
     )
@@ -580,19 +582,21 @@ async fn journal_stream_always_emits_and_checkpoints_cursors_across_restart() {
         partial_reasons: Vec::new(),
     };
 
-    let mut state = FakeHostState::default();
-    state.journal_batches = VecDeque::from(vec![
-        batch("c1", "identical text"),
-        batch("c2", "identical text"), // identical recurring text still emits
-        batch("c3", "identical text"),
-    ]);
-    // Once scripted batches run out, an explicit gap event follows.
-    state.journal_default = agent_d::collectors::journal::JournalFetchOutcome {
-        status: ObservationStatus::Ok,
-        events: Vec::new(),
-        cursor_after: None,
-        gap_detected: true,
-        partial_reasons: vec!["journal cursor invalidated".into()],
+    let state = FakeHostState {
+        journal_batches: VecDeque::from(vec![
+            batch("c1", "identical text"),
+            batch("c2", "identical text"), // identical recurring text still emits
+            batch("c3", "identical text"),
+        ]),
+        // Once scripted batches run out, an explicit gap event follows.
+        journal_default: agent_d::collectors::journal::JournalFetchOutcome {
+            status: ObservationStatus::Ok,
+            events: Vec::new(),
+            cursor_after: None,
+            gap_detected: true,
+            partial_reasons: vec!["journal cursor invalidated".into()],
+        },
+        ..FakeHostState::default()
     };
     let host = FakeHostCollectors::from_state(state);
 
@@ -670,9 +674,11 @@ async fn collector_error_status_is_always_emitted_never_suppressed() {
     let kp = key_pair();
     let dir = state_dir("errors");
 
-    let mut state = FakeHostState::default();
-    state.sockets_status = Some(ObservationStatus::PermissionDenied);
-    state.sockets_partial_reasons = vec!["hidepid=2 blocks /proc/<pid>/fd".into()];
+    let state = FakeHostState {
+        sockets_status: Some(ObservationStatus::PermissionDenied),
+        sockets_partial_reasons: vec!["hidepid=2 blocks /proc/<pid>/fd".into()],
+        ..FakeHostState::default()
+    };
     let host = FakeHostCollectors::from_state(state);
 
     let mut engine = engine_with(&kp, &dir, host, false);
@@ -704,8 +710,10 @@ async fn collector_timeout_produces_explicit_timeout_status() {
     let kp = key_pair();
     let dir = state_dir("timeout");
 
-    let mut state = FakeHostState::default();
-    state.sleep_ms = Some(2_000); // watch timeout is 5s? No: make it 10x the cap.
+    let state = FakeHostState {
+        sleep_ms: Some(2_000), // watch timeout is 5s? No: make it 10x the cap.
+        ..FakeHostState::default()
+    };
     let host = FakeHostCollectors::from_state(state);
 
     let mut engine = engine_with(&kp, &dir, host, false);

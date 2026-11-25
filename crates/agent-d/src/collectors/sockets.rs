@@ -565,8 +565,8 @@ mod tests {
     fn proc_stat_parse_extracts_comm_and_start_ticks() {
         // Realistic /proc/<pid>/stat line; field 22 (starttime) = 9876543.
         let stat = "12345 (my cool proc) R 1 12345 12345 0 -1 4194624 0 0 0 3 2 19 0 0 20 0 9 0 9876543 0 0 0 0";
-        assert_eq!(parse_proc_stat_comm(&stat).as_deref(), Some("my cool proc"));
-        assert_eq!(parse_proc_stat_start_ticks(&stat), Some(9876543));
+        assert_eq!(parse_proc_stat_comm(stat).as_deref(), Some("my cool proc"));
+        assert_eq!(parse_proc_stat_start_ticks(stat), Some(9876543));
         assert_eq!(parse_proc_stat_start_ticks("garbage"), None);
     }
 

@@ -215,7 +215,8 @@ impl CollectorBackend for FakeHostCollectors {
             }
         };
 
-        if let Some(ms) = self.state.lock().expect("fake host state poisoned").sleep_ms {
+        let sleep_ms = self.state.lock().expect("fake host state poisoned").sleep_ms;
+        if let Some(ms) = sleep_ms {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
 
@@ -339,25 +340,27 @@ mod tests {
 
     #[tokio::test]
     async fn fake_host_routes_all_four_collectors_and_records_calls() {
-        let mut state = FakeHostState::default();
-        state.sockets = SocketsListeningSnapshot {
-            count: 1,
-            partial_attribution: true,
-            sockets: vec![defsec_protocol::observation::ListeningSocketEntry {
-                socket_key: "tcp:0.0.0.0:22:uid=0".into(),
-                protocol: "tcp".into(),
-                local_addr: "0.0.0.0".into(),
-                local_port: 22,
-                uid: 0,
-                inode: 1,
-                pid: Some(10),
-                pid_start_time_ticks: Some(77),
-                comm: Some("sshd".into()),
-                systemd_unit: Some("sshd.service".into()),
-            }],
+        let mut state = FakeHostState {
+            sockets: SocketsListeningSnapshot {
+                count: 1,
+                partial_attribution: true,
+                sockets: vec![defsec_protocol::observation::ListeningSocketEntry {
+                    socket_key: "tcp:0.0.0.0:22:uid=0".into(),
+                    protocol: "tcp".into(),
+                    local_addr: "0.0.0.0".into(),
+                    local_port: 22,
+                    uid: 0,
+                    inode: 1,
+                    pid: Some(10),
+                    pid_start_time_ticks: Some(77),
+                    comm: Some("sshd".into()),
+                    systemd_unit: Some("sshd.service".into()),
+                }],
+            },
+            sockets_status: Some(ObservationStatus::Partial),
+            sockets_partial_reasons: vec!["hidepid".into()],
+            ..FakeHostState::default()
         };
-        state.sockets_status = Some(ObservationStatus::Partial);
-        state.sockets_partial_reasons = vec!["hidepid".into()];
         state.systemd.insert(
             "sshd.service".into(),
             SystemdUnitSnapshot {
@@ -485,9 +488,11 @@ mod tests {
 
     #[tokio::test]
     async fn fake_host_timeout_scripting_and_error_status() {
-        let mut state = FakeHostState::default();
-        state.sleep_ms = Some(200);
-        state.sockets_status = Some(ObservationStatus::PermissionDenied);
+        let state = FakeHostState {
+            sleep_ms: Some(200),
+            sockets_status: Some(ObservationStatus::PermissionDenied),
+            ..FakeHostState::default()
+        };
         let host = FakeHostCollectors::from_state(state);
         let cfg = EdgeSafetyConfig::default();
 

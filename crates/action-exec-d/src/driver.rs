@@ -515,8 +515,7 @@ fn listing_ends_with_drop(stdout: &str) -> bool {
         .lines()
         .rev()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && *l != "}")
-        .next()
+        .find(|l| !l.is_empty() && *l != "}")
         .is_some_and(|l| l == "drop" || l.starts_with("drop "))
 }
 
