@@ -1,9 +1,15 @@
 // node --test console/test/server.test.mjs
 //
 // 1. UDS framing roundtrip against a mock Unix socket server
-// 2. Live integration against target/debug/control-d (skipped if not built)
+// 2. Live integration against target/debug/control-d (skipped if not built),
+//    including the Phase 8 actions API over the real admin/investigate sockets
 // 3. Demo-mode API walkthrough
 // 4. Security headers, Host/Origin validation and XSS hygiene
+// 5. Phase 8 mitigations in demo mode (signed intents, approval rules, lifecycle)
+// 6. Access gate: --create-user, local sessions, rate limiting, roles
+// 7. Access gate: trusted reverse-proxy identity headers
+// 8. Mitigation proposals (demo + exact mock frames), stream watches, per-run
+//    token isolation against the real control-d (fake agent opens incidents)
 
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,14 +18,17 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { AdminClient, FrameDecoder, FrameError, InvestigationClient, MAX_FRAME_BYTES, encodeFrame, udsRequest } from '../lib/uds-client.mjs';
-import { computeAuditHash, verifyEntries } from '../lib/audit-chain.mjs';
+import { canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from '../lib/audit-chain.mjs';
+import { SESSION_COOKIE, createAuth, createPeerMatcher, normalizeIp, readUsersFile, upsertUser } from '../lib/auth.mjs';
 import { createDemoBackend } from '../lib/demo-data.mjs';
 import { createLiveBackend } from '../lib/live-backend.mjs';
-import { createConsoleServer, parseArgs } from '../server.mjs';
+import { deriveThreeState } from '../lib/domain.mjs';
+import { createConsoleServer, parseArgs, runCreateUser } from '../server.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONSOLE_DIR = path.resolve(HERE, '..');
@@ -82,6 +91,16 @@ async function waitFor(fn, timeoutMs = 20_000, stepMs = 50) {
     await new Promise((r) => setTimeout(r, stepMs));
   }
   return false;
+}
+
+/** SIGTERM a daemon and wait for it to exit, so its shutdown cannot race temp-dir removal. */
+async function stopChild(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+  await exited;
+  clearTimeout(timer);
 }
 
 function mockUdsServer(sockPath, handler) {
@@ -214,6 +233,66 @@ describe('UDS framing (4-byte big-endian length + UTF-8 JSON)', () => {
   });
 });
 
+describe('Phase 8 actions over a mock control-d', () => {
+  test('investigation list_actions frame and admin detail/approve frames are schema-exact', async () => {
+    const dir = shortTmp();
+    const invPath = path.join(dir, 'inv.sock');
+    const admPath = path.join(dir, 'adm.sock');
+    const TOKEN = 'tok-incident-scoped-never-leak';
+    const summary = {
+      proposal_id: 9, intent_id: '2b1f0b4e-6c1a-4f53-9a77-1d1b0d8f3c21', host_id: 'edge-vm-07', incident_id: 'inc-1',
+      auth_mode: 'dual_signed_operator', status: 'pending_approval', verb: { verb: 'host_isolate', preserve_mgmt_cidrs: ['10.0.0.0/24'], ttl_seconds: 600 },
+      expected_effect: 'e', blast_radius: 'b', rollback_plan: 'r', created_at: '2026-11-24T10:00:00Z', approver: null,
+    };
+    const payload = {
+      schema_version: 1, intent_id: summary.intent_id, nonce: 'n-1', host_id: 'edge-vm-07', incident_id: 'inc-1', proposal_id: 9,
+      auth_mode: 'dual_signed_operator', verb: summary.verb, policy_version: 1, issued_at: '2026-11-24T10:00:00Z',
+      expires_at: '2026-11-24T10:10:00Z', rollback_plan: 'r', evidence_observation_ids: [4, 7],
+    };
+    const seen = [];
+    const inv = await mockUdsServer(invPath, (f) => (seen.push(f), { result: 'actions', actions: [summary] }));
+    const adm = await mockUdsServer(admPath, (f) => {
+      seen.push(f);
+      if (f.admin_op === 'get_action_intent') return { admin_result: 'action_intent_detail', payload, authorized_intent: null, status: 'pending_approval' };
+      if (f.admin_op === 'list_actions') return { admin_result: 'actions', actions: [summary] };
+      if (f.admin_op === 'list_audit_entries') return { admin_result: 'audit_entries', entries: [] };
+      if (f.admin_op === 'approve_action') return { admin_result: 'action_approved', intent_id: f.intent_id, authorized_intent: { control_envelope: { domain: 'defsecautmit.action_intent.v1', signing_key_id: 'control-key-01', raw_payload: f.operator_approval.raw_payload, signature_hex: 'cd'.repeat(64) }, operator_approval: f.operator_approval } };
+      return { admin_result: 'error', code: 'invalid_request', message: 'unexpected' };
+    });
+    const scoped = await startConsole(createLiveBackend({ investigateSock: invPath, token: TOKEN }));
+    const admin = await startConsole(createLiveBackend({ investigateSock: invPath, token: TOKEN, adminSock: admPath, enableAdmin: true }));
+    try {
+      const r = await get(scoped.port, '/api/actions?incident_id=inc-1');
+      assert.equal(r.status, 200, r.text);
+      assert.equal(r.json.source, 'investigate');
+      assert.deepEqual(r.json.actions, [summary]);
+      assert.equal(r.json.denied, null, 'denials need the admin audit log');
+      assert.deepEqual(seen.at(-1).request, { op: 'list_actions', host_id: null, incident_id: 'inc-1' });
+      assert.ok(!r.text.includes(TOKEN));
+
+      const d = await get(admin.port, `/api/admin/actions/${summary.intent_id}`);
+      assert.equal(d.status, 200, d.text);
+      assert.deepEqual(seen.find((f) => f.admin_op === 'get_action_intent'), { admin_op: 'get_action_intent', intent_id: summary.intent_id });
+      assert.deepEqual(d.json.payload, payload);
+      assert.deepEqual(d.json.summary, summary);
+      assert.equal(d.json.signing.canonical_payload, canonicalJson(payload));
+      assert.equal(d.json.signing.payload_sha256, sha256Hex(canonicalJson(payload)));
+
+      const envelope = { domain: 'defsecautmit.action_approval.v1', signing_key_id: 'operator-01', raw_payload: canonicalJson(payload), signature_hex: 'AB'.repeat(64) };
+      const ok = await post(admin.port, `/api/admin/actions/${summary.intent_id}/approve`, { approver: 'j.rivera', operator_approval: envelope });
+      assert.equal(ok.status, 200, ok.text);
+      assert.deepEqual(seen.at(-1), { admin_op: 'approve_action', intent_id: summary.intent_id, approver: 'j.rivera', operator_approval: { ...envelope, signature_hex: 'ab'.repeat(64) } });
+      assert.equal(ok.json.authorized_intent.operator_approval.signing_key_id, 'operator-01');
+    } finally {
+      await scoped.app.close();
+      await admin.app.close();
+      inv.close();
+      adm.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 2. Live integration against the compiled control-d
 // ---------------------------------------------------------------------------
@@ -257,8 +336,8 @@ describe('live integration with target/debug/control-d', { skip: !fs.existsSync(
     token = minted.token;
   });
 
-  after(() => {
-    child?.kill('SIGTERM');
+  after(async () => {
+    await stopChild(child);
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -388,6 +467,379 @@ describe('live integration with target/debug/control-d', { skip: !fs.existsSync(
     } finally {
       await bad.app.close();
       await gone.app.close();
+    }
+  });
+
+  test('Phase 8 actions API speaks control-d\'s exact admin + investigation schema', async () => {
+    const adminBackend = createLiveBackend({ investigateSock: invSock, token, adminSock, enableAdmin: true });
+    const scopedBackend = createLiveBackend({ investigateSock: invSock, token, adminSock, enableAdmin: false });
+    const a = await startConsole(adminBackend);
+    const s = await startConsole(scopedBackend);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    try {
+      // Admin interface: ListActions (+ audit-derived denials) for the whole fleet.
+      const list = track(await get(a.port, '/api/actions'));
+      assert.equal(list.status, 200, list.text);
+      assert.equal(list.json.source, 'admin');
+      assert.deepEqual(list.json.actions, []);
+      assert.deepEqual(list.json.denied, []);
+      assert.equal(list.json.admin_sock, adminSock);
+      const filtered = track(await get(a.port, '/api/actions?host_id=edge-vm-07&incident_id=inc-none'));
+      assert.equal(filtered.status, 200, filtered.text);
+      assert.equal((await get(a.port, '/api/actions?host_id=bad%20host')).status, 400);
+
+      // GetActionIntent / ApproveAction frames are accepted by control-d's
+      // deny_unknown_fields parser (a malformed frame would close the socket -> 502).
+      const intent = crypto.randomUUID();
+      const detail = track(await get(a.port, `/api/admin/actions/${intent}`));
+      assert.equal(detail.status, 404, detail.text);
+      assert.equal(detail.json.error.code, 'not_found');
+      assert.match(detail.json.error.message, /action intent not found/);
+      const envelope = {
+        domain: 'defsecautmit.action_approval.v1',
+        signing_key_id: 'operator-01',
+        raw_payload: canonicalJson({ intent_id: intent }),
+        signature_hex: 'ab'.repeat(64),
+      };
+      const approve = track(await post(a.port, `/api/admin/actions/${intent}/approve`, { approver: 'j.rivera', operator_approval: envelope }));
+      assert.equal(approve.status, 404, approve.text);
+      assert.match(approve.json.error.message, /action intent not found/);
+
+      // The BFF validates the envelope before anything reaches control-d.
+      for (const [body, re] of [
+        [{ approver: 'x' }, /operator_approval/],
+        [{ approver: 'x', operator_approval: { ...envelope, extra: 1 } }, /exactly/],
+        [{ approver: 'x', operator_approval: { ...envelope, domain: 'defsecautmit.action_intent.v1' } }, /domain/],
+        [{ approver: 'x', operator_approval: { ...envelope, signature_hex: 'zz' } }, /signature_hex/],
+        [{ approver: 'x', operator_approval: 'not json' }, /SignedEnvelope/],
+        [{ operator_approval: envelope }, /approver/],
+        [{ approver: 'x', private_key_hex: 'ab'.repeat(32) }, /private keys never reach the console/],
+      ]) {
+        const r = track(await post(a.port, `/api/admin/actions/${intent}/approve`, body));
+        assert.equal(r.status, 400, JSON.stringify(body));
+        assert.match(r.json.error.message, re);
+      }
+      assert.equal((await post(a.port, `/api/admin/actions/${intent}/approve`, { approver: 'x', operator_approval: envelope }, { headers: { Origin: 'http://evil.example' } })).status, 403);
+
+      // Investigation socket: control-d only lists actions for an incident-scoped
+      // capability, and the console surfaces that decision verbatim.
+      const scoped = track(await get(s.port, '/api/actions'));
+      assert.equal(scoped.status, 403, scoped.text);
+      assert.equal(scoped.json.error.code, 'forbidden');
+      assert.match(scoped.json.error.message, /incident scope/);
+      for (const r of [await get(s.port, `/api/admin/actions/${intent}`), await post(s.port, `/api/admin/actions/${intent}/approve`, { approver: 'x', operator_approval: envelope })]) {
+        assert.equal(r.status, 403);
+        assert.equal(r.json.error.code, 'admin_disabled');
+      }
+
+      const audit = (await get(a.port, '/api/admin/audit?limit=500')).json;
+      assert.equal(audit.independent.valid, true);
+      assert.ok(!audit.entries.some((e) => e.event_type === 'action_approved'), 'no approval may be recorded');
+      for (const text of bodies) assert.ok(!text.includes(token), 'capability token leaked');
+    } finally {
+      await a.app.close();
+      await s.app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. Per-run token isolation against the compiled control-d
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal agent-d stand-in on control-d's agent socket: one persistent
+ * connection, Register first, then hashed observation deltas. Enough to make
+ * control-d open genuine incidents through its own trigger evaluation.
+ */
+class FakeAgent {
+  constructor(socketPath, hostId) {
+    this.socketPath = socketPath;
+    this.hostId = hostId;
+    this.session = `sess-${crypto.randomBytes(4).toString('hex')}`;
+    this.seq = 0;
+    this.frames = [];
+    this.waiters = new Set();
+  }
+
+  connect() {
+    return new Promise((resolve, reject) => {
+      const decoder = new FrameDecoder();
+      this.sock = net.createConnection({ path: this.socketPath }, resolve);
+      this.sock.on('error', reject);
+      this.sock.on('data', (chunk) => {
+        for (const f of decoder.push(chunk)) {
+          this.frames.push(f);
+          for (const w of this.waiters) w();
+        }
+      });
+    });
+  }
+
+  waitFrame(match, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        const f = this.frames.find(match);
+        if (!f) return;
+        this.waiters.delete(check);
+        clearTimeout(timer);
+        resolve(f);
+      };
+      const timer = setTimeout(() => {
+        this.waiters.delete(check);
+        reject(new Error(`agent frame timeout; got ${JSON.stringify(this.frames.map((x) => x.msg))}`));
+      }, timeoutMs);
+      this.waiters.add(check);
+      check();
+    });
+  }
+
+  async register() {
+    this.sock.write(encodeFrame({
+      msg: 'register', protocol_version: 1, host_id: this.hostId, agent_version: 'fake-0.0.1',
+      boot_id: 'boot-fake', session_id: this.session, active_bundle_version: 0, active_bundle_digest: null, sent_at: new Date().toISOString(),
+    }));
+    const ack = await this.waitFrame((f) => f.msg === 'register_ack');
+    assert.equal(ack.accepted, true, JSON.stringify(ack));
+  }
+
+  async push(watchId, collectorType, payload, { observedAt = new Date() } = {}) {
+    const seq = ++this.seq;
+    const hashed = payload.kind === 'snapshot' ? payload.data : payload.events;
+    this.sock.write(encodeFrame({
+      msg: 'push_observation_delta',
+      observation: {
+        host_id: this.hostId, session_id: this.session, seq_no: seq, watch_id: watchId, spec_version: 1, collector_type: collectorType,
+        observed_at: observedAt.toISOString(), status: 'ok', state_hash: sha256Hex(canonicalJson(hashed)), payload, is_reconciliation: false, partial_reasons: [],
+      },
+    }));
+    await this.waitFrame((f) => f.msg === 'observation_ack' && f.acked_seq_no >= seq);
+  }
+
+  close() {
+    this.sock?.destroy();
+  }
+}
+
+const liveSocket = (port, comm, unit, inode) => ({
+  socket_key: `tcp:0.0.0.0:${port}:uid=0`, protocol: 'tcp', local_addr: '0.0.0.0', local_port: port, uid: 0, inode, pid: 4000 + port % 1000, comm, systemd_unit: unit,
+});
+const sockSnapshot = (list) => ({ kind: 'snapshot', data: { count: list.length, partial_attribution: false, sockets: list } });
+
+describe('per-run token isolation with target/debug/control-d', { skip: !fs.existsSync(CONTROL_D) && 'control-d binary not built (cargo build -p control-d)' }, () => {
+  const HOST = 'edge-live-01';
+  let dir;
+  let child;
+  let adminSock;
+  let invSock;
+  let agentSock;
+  let agent;
+  let browseToken;
+  let stderr = '';
+
+  const baselineSpec = (id, collector, trigger) => ({
+    id, version: 1, host_id: HOST, class: 'baseline', incident_id: null, collector,
+    schedule: { interval_seconds: 60, timeout_seconds: 10 }, trigger,
+    wake_policy: { cooldown_seconds: 60, max_wakeups_per_hour: 30 }, lifecycle: { enabled: true, expires_at: null, max_runs: null },
+  });
+
+  before(async () => {
+    dir = shortTmp('dsr-');
+    adminSock = path.join(dir, 'ad.sock');
+    invSock = path.join(dir, 'iv.sock');
+    agentSock = path.join(dir, 'ag.sock');
+    child = spawn(CONTROL_D, ['--data-dir', path.join(dir, 'data'), '--agent-sock', agentSock, '--admin-sock', adminSock, '--investigate-sock', invSock], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, RUST_LOG: 'warn' },
+    });
+    child.stderr.on('data', (c) => {
+      stderr += c;
+    });
+    assert.ok(await waitFor(() => fs.existsSync(adminSock) && fs.existsSync(invSock) && fs.existsSync(agentSock)), `control-d did not start:\n${stderr}`);
+
+    const admin = new AdminClient({ socketPath: adminSock });
+    assert.equal((await admin.call({ admin_op: 'enroll_host', host_id: HOST, agent_public_key_hex: null })).admin_result, 'host_enrolled');
+    for (const spec of [
+      baselineSpec('base-sockets', { type: 'sockets.listening', parameters: { include_tcp: true, include_udp: true, include_ipv6: true, resolve_process: true } }, { type: 'set_diff', compare_against: 'last_observed', set_field: 'sockets', identity_key: 'socket_key' }),
+      baselineSpec('base-ssh-unit', { type: 'systemd.unit_state', parameters: { unit: 'sshd.service', hash_unit_files: false } }, { type: 'field_changed', compare_against: 'last_observed', fields: ['active_state'] }),
+      baselineSpec('base-sshd-journal', { type: 'journal.unit_events', parameters: { unit: 'sshd.service' } }, { type: 'collector_stale_or_error', max_stale_seconds: 600, consecutive_errors: 3 }),
+    ]) {
+      const r = await admin.call({ admin_op: 'apply_baseline_watch', spec, actor: 'it-operator', rationale: 'integration fixture' });
+      assert.equal(r.admin_result, 'watch_applied', JSON.stringify(r));
+    }
+
+    agent = new FakeAgent(agentSock, HOST);
+    await agent.connect();
+    await agent.register();
+    const ssh = liveSocket(22, 'sshd', 'ssh.service', 101);
+    const rogue = liveSocket(4444, 'helperd', 'custom-helper.service', 202);
+    const unitSnap = (active) => ({ kind: 'snapshot', data: { unit: 'sshd.service', load_state: 'loaded', active_state: active, sub_state: active === 'active' ? 'running' : 'dead', unit_file_state: 'enabled', main_pid: active === 'active' ? 101 : null, main_pid_start_time_ticks: null, exec_start_hash: null, unit_files: [] } });
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh]), { observedAt: new Date(Date.now() - 60_000) });
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([ssh, rogue])); // incident A
+    await agent.push('base-ssh-unit', 'systemd.unit_state', unitSnap('active'), { observedAt: new Date(Date.now() - 60_000) });
+    await agent.push('base-ssh-unit', 'systemd.unit_state', unitSnap('inactive')); // incident B
+    const event = (i, msg) => ({
+      cursor: `s=fake;i=${i}`, timestamp_us: Date.now() * 1000, unit: 'sshd.service', priority: 6, pid: 811, uid: 0,
+      message_redacted: msg, truncated: false, redaction_applied: false, classification: 'bounded_redacted_text',
+    });
+    for (const [i, msg] of [[1, 'Accepted publickey for deploy'], [2, 'session closed for user deploy']]) {
+      await agent.push('base-sshd-journal', 'journal.unit_events', { kind: 'stream_batch', events: [event(i, msg)], cursor_before: null, cursor_after: `s=fake;i=${i}`, gap_detected: false });
+    }
+
+    const minted = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-browse', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 900 });
+    assert.equal(minted.admin_result, 'token_minted');
+    browseToken = minted.token;
+  });
+
+  after(async () => {
+    agent?.close();
+    await stopChild(child);
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('starting a run never narrows the console browse session, before or after closing it', async () => {
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: true });
+    const { app, port } = await startConsole(backend);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    try {
+      const list = track(await get(port, '/api/incidents'));
+      assert.equal(list.status, 200, list.text);
+      const open = list.json.incidents.filter((i) => i.status === 'open' && i.host_id === HOST).sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+      assert.equal(open.length, 2, `fake agent should have opened two incidents: ${list.text}\n${stderr}`);
+      const [A, B] = open;
+
+      // Premise check: a token that calls StartInvestigationRun itself is
+      // permanently narrowed by control-d to that run's incident and host.
+      const admin = new AdminClient({ socketPath: adminSock });
+      const victim = await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-premise-check', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ALL_COLLECTORS, ttl_seconds: 300 });
+      const direct = new InvestigationClient({ socketPath: invSock, token: victim.token });
+      const started = await direct.call({ op: 'start_investigation_run', incident_id: A.incident_id, backend_id: 'operator-console', model_id: 'premise-check', prompt_schema_version: 'v1' });
+      assert.equal(started.result, 'run_started', JSON.stringify(started));
+      const narrowed = await direct.call({ op: 'get_incident_context', incident_id: B.incident_id });
+      assert.equal(narrowed.result, 'error', 'control-d narrows the calling token');
+      assert.match(narrowed.message, /scope/);
+
+      const hosts = track(await get(port, '/api/hosts'));
+      assert.equal(hosts.status, 200, hosts.text);
+      assert.equal(hosts.json.hosts[0].watch_count, 3, 'host card shows the real active watch count');
+      assert.equal(hosts.json.hosts[0].stream_watch_count, 1);
+
+      const run = track(await post(port, `/api/incidents/${A.incident_id}/runs`, {}));
+      assert.equal(run.status, 200, run.text);
+      assert.deepEqual(Object.keys(run.json).sort(), ['expires_at', 'incident_id', 'run_id'], 'no token is returned');
+      const again = track(await post(port, `/api/incidents/${A.incident_id}/runs`, {}));
+      assert.equal(again.json.run_id, run.json.run_id, 'an active run is reused');
+
+      // The browse token still reads every incident and host (this used to be 403).
+      const ctxB = track(await get(port, `/api/incidents/${B.incident_id}`));
+      assert.equal(ctxB.status, 200, ctxB.text);
+      assert.equal(ctxB.json.run, null);
+      assert.equal(track(await get(port, '/api/hosts')).status, 200);
+      const ctxA = track(await get(port, `/api/incidents/${A.incident_id}`));
+      assert.equal(ctxA.json.run.run_id, run.json.run_id);
+
+      // Mutations go through the per-run token, so control-d binds them to run A.
+      const evidence = ctxA.json.recent_observations.filter((o) => o.watch_id === 'base-sockets').map((o) => o.observation_id);
+      assert.ok(evidence.length, 'incident A has socket evidence');
+      const finding = track(await post(port, `/api/incidents/${A.incident_id}/findings`, { kind: 'hypothesis', summary: 'helperd opened 4444', evidence_observation_ids: evidence.slice(0, 1) }));
+      assert.equal(finding.status, 200, finding.text);
+      const watch = track(await post(port, `/api/incidents/${A.incident_id}/proposals`, { collector_type: 'systemd.unit_state', parameters: { unit: 'custom-helper.service' }, interval_seconds: 30, timeout_seconds: 5, ttl_seconds: 1800, max_runs: 60, rationale: 'track the helper unit' }));
+      assert.equal(watch.status, 200, watch.text);
+      assert.equal(typeof watch.json.decision.allowed, 'boolean');
+
+      // ProposeAction: exact schema, real gate verdicts.
+      const action = (verb, ids = evidence.slice(0, 1)) => post(port, `/api/incidents/${A.incident_id}/actions`, {
+        verb, evidence_observation_ids: ids, expected_effect: 'contain helperd', blast_radius: 'one host', rollback_plan: 'TTL expiry',
+      });
+      const protectedIp = track(await action({ verb: 'nft_block_ip', ip: '10.1.2.3', direction: 'both', ttl_seconds: 600 }));
+      assert.equal(protectedIp.status, 200, protectedIp.text);
+      assert.equal(protectedIp.json.decision.allowed, false);
+      assert.equal(protectedIp.json.decision.rule_id, 'action.protected_ip');
+      assert.equal(protectedIp.json.status, 'rejected');
+      assert.equal(protectedIp.json.intent_id, null);
+      const noEvidence = track(await action({ verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 600 }, []));
+      assert.equal(noEvidence.json.decision.rule_id, 'action.evidence_required');
+      const isolate = track(await action({ verb: 'host_isolate', preserve_mgmt_cidrs: '10.20.0.0/24, 10.20.8.15/32', ttl_seconds: 3600 }));
+      assert.equal(isolate.status, 200, isolate.text);
+      assert.equal(isolate.json.decision.allowed, true, isolate.text);
+      assert.equal(isolate.json.decision.rule_id, 'action.pending_dual_approval');
+      assert.equal(isolate.json.auth_mode, 'dual_signed_operator');
+      assert.equal(isolate.json.status, 'pending_approval');
+      assert.match(isolate.json.intent_id, /^[0-9a-f-]{36}$/);
+      assert.deepEqual(isolate.json.verb, { verb: 'host_isolate', preserve_mgmt_cidrs: ['10.20.0.0/24', '10.20.8.15/32'], ttl_seconds: 3600 });
+      const listed = track(await get(port, '/api/actions'));
+      assert.ok(listed.json.actions.some((a) => a.intent_id === isolate.json.intent_id && a.status === 'pending_approval'));
+      assert.ok(listed.json.denied.some((d) => d.decision.rule_id === 'action.protected_ip'));
+      assert.equal(track(await post(port, `/api/incidents/${A.incident_id}/actions`, { verb: { verb: 'rm_rf' }, expected_effect: 'x', blast_radius: 'y', rollback_plan: 'z' })).status, 400);
+      const noRun = track(await post(port, `/api/incidents/${B.incident_id}/actions`, { verb: { verb: 'nft_block_ip', ip: '203.0.113.9', ttl_seconds: 60 }, expected_effect: 'x', blast_radius: 'y', rollback_plan: 'z' }));
+      assert.equal(noRun.status, 409);
+      assert.equal(noRun.json.error.code, 'run_required');
+
+      // What changed + stream derivation + automation status.
+      const changes = track(await get(port, `/api/incidents/${B.incident_id}/changes`));
+      assert.equal(changes.status, 200, changes.text);
+      const unitChange = changes.json.changes.find((c) => c.watch_id === 'base-ssh-unit');
+      assert.equal(unitChange.basis, 'before_incident');
+      assert.ok(unitChange.diff.fields.some((f) => f.field === 'active_state' && f.before === 'active' && f.after === 'inactive'));
+      const changesA = track(await get(port, `/api/incidents/${A.incident_id}/changes`));
+      assert.deepEqual(changesA.json.changes.find((c) => c.watch_id === 'base-sockets').diff.added.map((s) => s.local_port), [4444]);
+      const tri = track(await get(port, `/api/hosts/${HOST}/baselines`)).json.three_state;
+      const journal = tri.find((r) => r.watch_id === 'base-sshd-journal');
+      assert.equal(journal.state, 'stream');
+      assert.equal(journal.promotable_observation_id, null);
+      assert.equal(journal.stream.batches_in_window, 2);
+      assert.equal(tri.find((r) => r.watch_id === 'base-sockets').state, 'baseline_absent');
+      const auto = track(await get(port, '/api/automation'));
+      assert.equal(auto.json.available, true);
+      assert.equal(auto.json.reasoner_runs, 0);
+      assert.ok(auto.json.console_runs >= 1);
+
+      // Closing A ends its run but must not brick the console.
+      const closed = track(await post(port, `/api/admin/incidents/${A.incident_id}/close`, { actor: 'it-operator', resolution: 'contained' }));
+      assert.equal(closed.status, 200, closed.text);
+      for (const p of ['/api/hosts', '/api/incidents', `/api/incidents/${B.incident_id}`, `/api/incidents/${A.incident_id}`, `/api/hosts/${HOST}/watches`]) {
+        const r = track(await get(port, p));
+        assert.equal(r.status, 200, `${p} after closing A: ${r.text}`);
+      }
+      const after = track(await post(port, `/api/incidents/${A.incident_id}/findings`, { kind: 'hypothesis', summary: 'late' }));
+      assert.equal(after.status, 409, 'closed incident run was dropped');
+      const runB = track(await post(port, `/api/incidents/${B.incident_id}/runs`, {}));
+      assert.equal(runB.status, 200, runB.text);
+      assert.notEqual(runB.json.run_id, run.json.run_id);
+      assert.equal(track(await get(port, '/api/incidents')).status, 200);
+
+      // Each run used its own minted, incident-scoped principal.
+      const audit = track(await get(port, '/api/admin/audit?limit=500')).json;
+      const minted = audit.entries.filter((e) => e.event_type === 'capability_minted').map((e) => JSON.stringify(e.payload));
+      assert.ok(minted.some((p) => p.includes(`console-run-${A.incident_id.slice(0, 8)}`) && p.includes(A.incident_id)), minted.join('\n'));
+      assert.ok(minted.some((p) => p.includes(`console-run-${B.incident_id.slice(0, 8)}`)));
+      const starts = audit.entries.filter((e) => e.event_type === 'run_started');
+      assert.ok(!starts.some((e) => e.actor === 'console-browse'), 'the browse principal never started a run');
+      assert.equal(starts.filter((e) => e.actor.startsWith('console-run-')).length, 2);
+      assert.equal(audit.independent.valid, true);
+      for (const text of bodies) assert.ok(!text.includes(browseToken), 'browse token leaked');
+    } finally {
+      await app.close();
+    }
+  });
+
+  test('without --enable-admin, runs are refused instead of narrowing the shared token', async () => {
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: false });
+    const { app, port } = await startConsole(backend);
+    try {
+      const open = (await get(port, '/api/incidents')).json.incidents.filter((i) => i.status === 'open');
+      assert.ok(open.length);
+      const r = await post(port, `/api/incidents/${open[0].incident_id}/runs`, {});
+      assert.equal(r.status, 403);
+      assert.equal(r.json.error.code, 'admin_required_for_runs');
+      assert.match(r.json.error.message, /--enable-admin/);
+      assert.equal((await get(port, '/api/incidents')).status, 200, 'browse session untouched');
+      const auto = await get(port, '/api/automation');
+      assert.equal(auto.json.available, false);
+    } finally {
+      await app.close();
     }
   });
 });
@@ -747,5 +1199,655 @@ describe('security headers, origin/host validation and XSS hygiene', () => {
     const v = verifyEntries(entries);
     assert.equal(v.valid, false);
     assert.equal(v.broken_seq, entries[2].seq_no);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Phase 8 mitigations in demo mode
+// ---------------------------------------------------------------------------
+
+const SUMMARY_KEYS = ['approver', 'auth_mode', 'blast_radius', 'created_at', 'expected_effect', 'host_id', 'incident_id', 'intent_id', 'proposal_id', 'rollback_plan', 'status', 'verb'];
+const PAYLOAD_KEYS = ['auth_mode', 'evidence_observation_ids', 'expires_at', 'host_id', 'incident_id', 'intent_id', 'issued_at', 'nonce', 'policy_version', 'proposal_id', 'rollback_plan', 'schema_version', 'verb'];
+const ENVELOPE_KEYS = ['domain', 'raw_payload', 'signature_hex', 'signing_key_id'];
+const STATUSES = ['pending_approval', 'authorized', 'executed', 'dry_run_simulated', 'rolled_back', 'rejected', 'verification_failed', 'expired'];
+
+describe('Phase 8 mitigations (demo)', () => {
+  let app;
+  let port;
+  let clock;
+  let backend;
+  before(async () => {
+    clock = Date.now();
+    backend = createDemoBackend({ now: () => clock });
+    ({ app, port } = await startConsole(backend));
+  });
+  after(() => app.close());
+
+  const byVerb = (list, verb) => list.find((a) => a.verb.verb === verb && a.status === 'pending_approval');
+
+  test('list shows every lifecycle state with control-d\'s exact ActionSummary schema', async () => {
+    const r = await get(port, '/api/actions');
+    assert.equal(r.status, 200, r.text);
+    const { actions, denied } = r.json;
+    for (const a of actions) {
+      assert.deepEqual(Object.keys(a).sort(), SUMMARY_KEYS);
+      assert.ok(STATUSES.includes(a.status), a.status);
+      assert.ok(['policy_bounded_autonomous', 'dual_signed_operator'].includes(a.auth_mode));
+      assert.match(a.intent_id, /^[0-9a-f-]{36}$/);
+      assert.ok(['nft_block_ip', 'systemd_stop_unit', 'host_isolate'].includes(a.verb.verb));
+    }
+    const statuses = new Set(actions.map((a) => a.status));
+    for (const s of ['pending_approval', 'executed', 'rolled_back', 'expired']) assert.ok(statuses.has(s), s);
+    const auto = actions.find((a) => a.status === 'executed');
+    assert.equal(auto.auth_mode, 'policy_bounded_autonomous');
+    assert.equal(auto.verb.verb, 'nft_block_ip');
+    assert.ok(auto.verb.ttl_seconds <= 1800, 'autonomous TTL bounded by policy');
+    const iso = byVerb(actions, 'host_isolate');
+    assert.equal(iso.auth_mode, 'dual_signed_operator');
+    assert.ok(iso.verb.preserve_mgmt_cidrs.length >= 1, 'host_isolate always preserves management CIDRs');
+    assert.ok(byVerb(actions, 'systemd_stop_unit'));
+
+    const rules = denied.map((d) => d.decision.rule_id).sort();
+    assert.deepEqual(rules, ['action.protected_ip', 'action.protected_unit']);
+    const ssh = denied.find((d) => d.decision.rule_id === 'action.protected_unit');
+    assert.equal(ssh.verb.unit, 'ssh.service');
+    assert.equal(ssh.decision.allowed, false);
+    assert.ok(!actions.some((a) => a.verb.unit === 'ssh.service'), 'a denied proposal never becomes an intent');
+
+    const scoped = (await get(port, '/api/actions?host_id=edge-vm-03')).json;
+    assert.ok(scoped.actions.length >= 1 && scoped.actions.every((a) => a.host_id === 'edge-vm-03'));
+    assert.deepEqual(scoped.denied, []);
+    const inc = (await get(port, '/api/actions?incident_id=inc-2026-0042')).json;
+    assert.ok(inc.actions.every((a) => a.incident_id === 'inc-2026-0042'));
+    assert.equal((await get(port, '/api/actions?incident_id=..%2F..')).status, 400);
+
+    const decisions = (await get(port, '/api/admin/policy-decisions?rule_id=action.protected_unit')).json.decisions;
+    assert.equal(decisions.length, 1);
+  });
+
+  test('detail returns the signed intent payload, receipts and offline-signing digest', async () => {
+    const { actions } = (await get(port, '/api/actions')).json;
+    const pending = byVerb(actions, 'host_isolate');
+    const d = (await get(port, `/api/admin/actions/${pending.intent_id}`)).json;
+    assert.deepEqual(Object.keys(d.payload).sort(), PAYLOAD_KEYS);
+    assert.equal(d.status, 'pending_approval');
+    assert.equal(d.authorized_intent, null, 'control envelope is released only once authorized');
+    assert.equal(d.payload.intent_id, pending.intent_id);
+    assert.equal(d.payload.auth_mode, 'dual_signed_operator');
+    assert.equal(Date.parse(d.payload.expires_at) - Date.parse(d.payload.issued_at), pending.verb.ttl_seconds * 1000);
+    assert.ok(d.payload.evidence_observation_ids.length >= 1);
+    assert.equal(d.signing.domain, 'defsecautmit.action_approval.v1');
+    assert.equal(d.signing.canonical_payload, canonicalJson(d.payload));
+    assert.equal(d.signing.payload_sha256, sha256Hex(d.signing.canonical_payload));
+
+    const executed = actions.find((a) => a.status === 'executed');
+    const e = (await get(port, `/api/admin/actions/${executed.intent_id}`)).json;
+    assert.deepEqual(Object.keys(e.authorized_intent.control_envelope).sort(), ENVELOPE_KEYS);
+    assert.equal(e.authorized_intent.control_envelope.domain, 'defsecautmit.action_intent.v1');
+    assert.equal(e.authorized_intent.control_envelope.raw_payload, canonicalJson(e.payload));
+    assert.match(e.authorized_intent.control_envelope.signature_hex, /^[0-9a-f]{128}$/);
+    assert.equal(e.authorized_intent.operator_approval, null);
+    assert.equal(e.receipts.at(-1).status, 'executed');
+    assert.ok(e.receipts.at(-1).rollback_handle);
+    assert.equal(e.receipts.at(-1).verification_passed, true);
+
+    const rolled = actions.find((a) => a.status === 'rolled_back');
+    const rb = (await get(port, `/api/admin/actions/${rolled.intent_id}`)).json;
+    assert.deepEqual(rb.receipts.map((x) => x.status), ['executed', 'rolled_back']);
+
+    assert.equal((await get(port, `/api/admin/actions/${crypto.randomUUID()}`)).status, 404);
+  });
+
+  test('approval enforces control-d rules, then authorizes, executes and rolls back', async () => {
+    const { actions } = (await get(port, '/api/actions')).json;
+    const iso = byVerb(actions, 'host_isolate');
+    const stop = byVerb(actions, 'systemd_stop_unit');
+    const auditLen = async () => (await get(port, '/api/admin/audit?limit=500')).json.entries.length;
+    const before = await auditLen();
+    const url = `/api/admin/actions/${iso.intent_id}/approve`;
+    const detail = (await get(port, `/api/admin/actions/${iso.intent_id}`)).json;
+
+    assert.equal((await post(port, url, {})).status, 400, 'approver is required');
+    const cross = await post(port, url, { approver: 'mallory' }, { headers: { Origin: 'http://evil.example' } });
+    assert.equal(cross.status, 403);
+    const forged = { domain: 'defsecautmit.action_approval.v1', signing_key_id: 'demo-operator-01', raw_payload: detail.signing.canonical_payload, signature_hex: '00'.repeat(64) };
+    const f1 = await post(port, url, { approver: 'mallory', operator_approval: forged });
+    assert.equal(f1.status, 403);
+    assert.match(f1.json.error.message, /invalid operator approval: signature verification failed/);
+    const f2 = await post(port, url, { approver: 'mallory', operator_approval: { ...forged, signing_key_id: 'attacker-key' } });
+    assert.match(f2.json.error.message, /unknown signing key id/);
+    const f3 = await post(port, url, { approver: 'mallory', operator_approval: { ...forged, raw_payload: canonicalJson({ ...detail.payload, host_id: 'edge-vm-03' }) } });
+    assert.match(f3.json.error.message, /payload differs from control intent/);
+    const f4 = await post(port, url, { approver: 'mallory', operator_approval: { ...forged, signing_key_id: 'control-key-01' } });
+    assert.match(f4.json.error.message, /independent signing key/);
+    assert.equal(await auditLen(), before, 'rejected approvals leave no trace in state');
+
+    const ok = await post(port, url, { approver: 'j.rivera', note: 'confirmed with host owner' });
+    assert.equal(ok.status, 200, ok.text);
+    const ai = ok.json.authorized_intent;
+    assert.equal(ai.operator_approval.domain, 'defsecautmit.action_approval.v1');
+    assert.equal(ai.operator_approval.raw_payload, ai.control_envelope.raw_payload, 'operator signs the exact control payload');
+    assert.notEqual(ai.operator_approval.signing_key_id, ai.control_envelope.signing_key_id);
+
+    const again = await post(port, url, { approver: 'j.rivera' });
+    assert.equal(again.status, 403);
+    assert.match(again.json.error.message, /not pending dual approval/);
+    const cooldown = await post(port, `/api/admin/actions/${stop.intent_id}/approve`, { approver: 'j.rivera' });
+    assert.equal(cooldown.status, 403);
+    assert.match(cooldown.json.error.message, /rate limit or cooldown/);
+
+    let list = (await get(port, '/api/actions')).json.actions;
+    const authorized = list.find((a) => a.intent_id === iso.intent_id);
+    assert.equal(authorized.status, 'authorized');
+    assert.equal(authorized.approver, 'j.rivera');
+
+    const audit = (await get(port, '/api/admin/audit?limit=500')).json;
+    const approved = audit.entries.filter((e) => e.event_type === 'action_approved').at(-1);
+    assert.equal(approved.actor, 'j.rivera');
+    assert.equal(approved.payload.intent_id, iso.intent_id);
+    assert.equal(approved.payload.payload_digest, sha256Hex(ai.operator_approval.raw_payload));
+    assert.equal(audit.chain.valid, true);
+    assert.equal(audit.independent.valid, true);
+
+    // action-exec-d picks it up a few seconds later, then the TTL lifts it.
+    clock += 5_000;
+    list = (await get(port, '/api/actions')).json.actions;
+    assert.equal(list.find((a) => a.intent_id === iso.intent_id).status, 'executed');
+    clock += iso.verb.ttl_seconds * 1000 + 1_000;
+    const done = (await get(port, `/api/admin/actions/${iso.intent_id}`)).json;
+    assert.equal(done.status, 'rolled_back');
+    assert.deepEqual(done.receipts.map((r) => r.status), ['executed', 'rolled_back']);
+    const late = await post(port, `/api/admin/actions/${stop.intent_id}/approve`, { approver: 'j.rivera' });
+    assert.equal(late.status, 403, 'approval window elapsed');
+    assert.match(late.json.error.message, /expired/);
+    const final = (await get(port, '/api/admin/audit?limit=500')).json;
+    assert.equal(final.independent.valid, true);
+    for (const t of ['action_proposed', 'action_approved', 'action_receipt_recorded', 'action_rolled_back']) {
+      assert.ok(final.entries.some((e) => e.event_type === t), t);
+    }
+    await post(port, '/api/demo/reset', {});
+  });
+
+  test('read-only demo keeps the list but gates detail and approval', async () => {
+    const ro = await startConsole(createDemoBackend({ enableAdmin: false }));
+    try {
+      const list = await get(ro.port, '/api/actions');
+      assert.equal(list.status, 200);
+      const id = list.json.actions[0].intent_id;
+      assert.equal((await get(ro.port, `/api/admin/actions/${id}`)).json.error.code, 'admin_disabled');
+      assert.equal((await post(ro.port, `/api/admin/actions/${id}/approve`, { approver: 'x' })).status, 403);
+    } finally {
+      await ro.app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Access gate: local accounts
+// ---------------------------------------------------------------------------
+
+const cookieOf = (r) => (r.headers['set-cookie'] ?? [])[0] ?? '';
+const cookieHeader = (setCookie) => setCookie.split(';')[0];
+
+describe('access gate: --create-user and local sessions', () => {
+  let dir;
+  let usersFile;
+  let app;
+  let port;
+  let auth;
+  const ADMIN_PW = 'correct horse battery staple';
+  const OBS_PW = 'observer pass phrase 1';
+
+  before(async () => {
+    dir = shortTmp('dsa-');
+    usersFile = path.join(dir, 'users.json');
+    // Real CLI, password over stdin (never argv).
+    const cli = spawnSync(process.execPath, [path.join(CONSOLE_DIR, 'server.mjs'), '--create-user', '--auth-users-file', usersFile, '--username', 'alice', '--role', 'admin', '--password-stdin'], { input: `${ADMIN_PW}\n`, encoding: 'utf8' });
+    assert.equal(cli.status, 0, cli.stderr);
+    assert.match(cli.stdout, /created admin account 'alice'/);
+    // Password from an environment variable.
+    const opts = parseArgs(['--create-user', '--auth-users-file', usersFile, '--username', 'bob', '--role', 'observer', '--password-env', 'BOB_PW'], {});
+    const out = { text: '', write(t) { this.text += t; } };
+    await runCreateUser(opts, { env: { BOB_PW: OBS_PW }, out });
+    assert.match(out.text, /created observer account 'bob'/);
+    auth = createAuth({ mode: 'local', usersFile });
+    ({ app, port } = await startConsole(createDemoBackend(), { auth }));
+  });
+  after(async () => {
+    await app?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const login = (username, password, opts = {}) => post(port, '/api/auth/login', { username, password }, opts);
+
+  test('users file is 0600, salted scrypt, no plaintext; CLI rejects weak input', async () => {
+    assert.equal(fs.statSync(usersFile).mode & 0o777, 0o600);
+    const raw = fs.readFileSync(usersFile, 'utf8');
+    assert.ok(!raw.includes(ADMIN_PW) && !raw.includes(OBS_PW));
+    const data = readUsersFile(usersFile);
+    assert.deepEqual(Object.keys(data.users).sort(), ['alice', 'bob']);
+    const a = data.users.alice;
+    assert.equal(a.role, 'admin');
+    assert.equal(a.algo, 'scrypt');
+    assert.equal(Buffer.from(a.salt, 'base64').length, 16);
+    assert.notEqual(a.salt, data.users.bob.salt);
+    assert.equal(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp')).length, 0, 'atomic write leaves no temp files');
+
+    assert.throws(() => upsertUser(usersFile, { username: 'carol', role: 'admin', password: 'short' }), /at least 12/);
+    assert.throws(() => upsertUser(usersFile, { username: '__proto__', role: 'admin', password: 'long enough password' }), /username/);
+    assert.throws(() => upsertUser(usersFile, { username: 'carol', role: 'root', password: 'long enough password' }), /role/);
+    assert.throws(() => parseArgs(['--create-user', '--auth-users-file', usersFile, '--username', 'x'], {}), /--role/);
+    const bad = spawnSync(process.execPath, [path.join(CONSOLE_DIR, 'server.mjs'), '--create-user', '--auth-users-file', usersFile, '--username', 'eve', '--role', 'admin', '--password-env', 'NOPE'], { encoding: 'utf8', env: {} });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /NOPE is not set/);
+    assert.throws(() => parseArgs(['--demo', '--auth-mode', 'local'], {}), /--auth-users-file/);
+    assert.throws(() => parseArgs(['--demo', '--auth-mode', 'kerberos'], {}), /--auth-mode/);
+    assert.equal(parseArgs(['--demo', '--auth-mode', 'local', '--auth-users-file', usersFile], {}).authMode, 'local');
+    assert.equal(parseArgs(['--demo'], { DEFSEC_CONSOLE_AUTH_MODE: 'local', DEFSEC_CONSOLE_USERS_FILE: usersFile }).authMode, 'local');
+  });
+
+  test('unauthenticated: session reachable, every other /api route 401, no telemetry leaks', async () => {
+    const s = await get(port, '/api/auth/session');
+    assert.equal(s.status, 200);
+    assert.deepEqual(s.json, { auth_mode: 'local', authenticated: false, user: null });
+    for (const p of ['/api/status', '/api/hosts', '/api/incidents/inc-2026-0042', '/api/actions', '/api/admin/audit', '/api/nope']) {
+      const r = await get(port, p);
+      assert.equal(r.status, 401, p);
+      assert.ok(!r.text.includes('edge-vm-07'), `${p} leaked telemetry`);
+    }
+    assert.equal((await post(port, '/api/incidents/inc-2026-0042/runs', {})).status, 401);
+    const shell = await get(port, '/');
+    assert.equal(shell.status, 200, 'static shell loads so the sign-in view can render');
+    assert.ok(!shell.text.includes('edge-vm-07'));
+    assert.equal((await get(port, '/api/hosts', { headers: { Cookie: `${SESSION_COOKIE}=forged.token` } })).status, 401);
+  });
+
+  test('wrong password and unknown user are indistinguishable 401s; login is CSRF-guarded', async () => {
+    const wrong = await login('alice', 'not the password');
+    const unknown = await login('nobody', 'not the password');
+    for (const r of [wrong, unknown]) {
+      assert.equal(r.status, 401);
+      assert.deepEqual(r.json.error, { code: 'invalid_credentials', message: 'invalid username or password' });
+      assert.equal(r.headers['set-cookie'], undefined);
+    }
+    assert.equal((await login('alice', ADMIN_PW, { headers: { Origin: 'http://evil.example' } })).status, 403);
+    assert.equal((await post(port, '/api/auth/login', undefined, { rawBody: 'username=alice', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })).status, 415);
+    assert.equal((await get(port, '/api/auth/login')).status, 405);
+  });
+
+  test('successful login sets an HttpOnly SameSite=Strict cookie; roles gate admin routes', async () => {
+    const r = await login('bob', OBS_PW);
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(r.json.user, { username: 'bob', role: 'observer' });
+    const sc = cookieOf(r);
+    assert.match(sc, new RegExp(`^${SESSION_COOKIE}=[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{43};`));
+    for (const attr of ['HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=28800']) assert.ok(sc.includes(attr), attr);
+    assert.ok(!/;\s*Secure/.test(sc), 'no Secure on plain loopback HTTP');
+    const obs = { headers: { Cookie: cookieHeader(sc) } };
+
+    assert.deepEqual((await get(port, '/api/auth/session', obs)).json, { auth_mode: 'local', authenticated: true, user: { username: 'bob', role: 'observer' } });
+    assert.equal((await get(port, '/api/hosts', obs)).status, 200);
+    assert.equal((await get(port, '/api/actions', obs)).status, 200);
+    for (const p of ['/api/admin/audit', '/api/admin/policy-decisions']) {
+      const x = await get(port, p, obs);
+      assert.equal(x.status, 403, p);
+      assert.equal(x.json.error.code, 'admin_role_required');
+    }
+    const { actions } = (await get(port, '/api/actions', obs)).json;
+    const pending = actions.find((a) => a.status === 'pending_approval');
+    assert.equal((await get(port, `/api/admin/actions/${pending.intent_id}`, obs)).status, 403);
+    assert.equal((await post(port, `/api/admin/actions/${pending.intent_id}/approve`, { approver: 'bob' }, obs)).json.error.code, 'admin_role_required');
+    assert.equal((await post(port, '/api/demo/tamper', {}, obs)).status, 403);
+    const ro = await post(port, '/api/incidents/inc-2026-0042/runs', {}, obs);
+    assert.equal(ro.status, 403);
+    assert.equal(ro.json.error.code, 'read_only_role');
+
+    const a = await login('alice', ADMIN_PW);
+    const adm = { headers: { Cookie: cookieHeader(cookieOf(a)) } };
+    assert.equal(a.json.user.role, 'admin');
+    assert.equal((await get(port, '/api/admin/audit', adm)).status, 200);
+    assert.equal((await get(port, `/api/admin/actions/${pending.intent_id}`, adm)).status, 200);
+    assert.equal((await post(port, '/api/incidents/inc-2026-0042/runs', {}, adm)).status, 200);
+  });
+
+  test('logout invalidates the server-side session; credential changes revoke sessions', async () => {
+    const a = await login('alice', ADMIN_PW);
+    const jar = { headers: { Cookie: cookieHeader(cookieOf(a)) } };
+    assert.equal((await get(port, '/api/hosts', jar)).status, 200);
+    const out = await post(port, '/api/auth/logout', {}, jar);
+    assert.equal(out.status, 200);
+    assert.equal(out.json.logged_out, true);
+    assert.match(cookieOf(out), new RegExp(`^${SESSION_COOKIE}=;.*Max-Age=0`));
+    const reuse = await get(port, '/api/hosts', jar);
+    assert.equal(reuse.status, 401, 'replaying the old cookie after logout must fail');
+    assert.equal((await get(port, '/api/auth/session', jar)).json.authenticated, false);
+    assert.equal((await post(port, '/api/auth/logout', {}, { ...jar, headers: { ...jar.headers, Origin: 'http://evil.example' } })).status, 403);
+
+    const b = await login('bob', OBS_PW);
+    const bj = { headers: { Cookie: cookieHeader(cookieOf(b)) } };
+    assert.equal((await get(port, '/api/hosts', bj)).status, 200);
+    upsertUser(usersFile, { username: 'bob', role: 'observer', password: 'a brand new passphrase' });
+    const revoked = await get(port, '/api/hosts', bj);
+    assert.equal(revoked.status, 401);
+    assert.equal(revoked.json.error.code, 'session_revoked');
+    assert.equal((await login('bob', 'a brand new passphrase')).status, 200);
+  });
+
+  test('per-IP sliding-window rate limit returns 429 with Retry-After', async () => {
+    let t = 1_000_000;
+    const limited = createAuth({ mode: 'local', usersFile, now: () => t });
+    const s = await startConsole(createDemoBackend(), { auth: limited });
+    try {
+      const attempt = (pw) => post(s.port, '/api/auth/login', { username: 'alice', password: pw });
+      for (let i = 0; i < 10; i++) assert.equal((await attempt(`wrong-${i}`)).status, 401, `attempt ${i}`);
+      const blocked = await attempt(ADMIN_PW);
+      assert.equal(blocked.status, 429, 'even the right password is refused while limited');
+      assert.equal(blocked.json.error.code, 'rate_limited');
+      const retry = Number(blocked.headers['retry-after']);
+      assert.ok(retry > 0 && retry <= 300, `Retry-After ${retry}`);
+      assert.equal(blocked.headers['set-cookie'], undefined);
+      t += 301_000; // the window slides past every failure
+      assert.equal((await attempt(ADMIN_PW)).status, 200);
+    } finally {
+      await s.app.close();
+    }
+  });
+
+  test('Secure cookie with --secure-cookies or https from a trusted proxy only', async () => {
+    const secure = await startConsole(createDemoBackend(), { auth: createAuth({ mode: 'local', usersFile, secureCookies: true }) });
+    const proxied = await startConsole(createDemoBackend(), { auth: createAuth({ mode: 'local', usersFile, trustForwarded: true }) });
+    const untrusted = await startConsole(createDemoBackend(), { auth: createAuth({ mode: 'local', usersFile, trustForwarded: true, trustedProxyIps: ['10.9.9.9'] }) });
+    try {
+      const body = { username: 'alice', password: ADMIN_PW };
+      assert.match(cookieOf(await post(secure.port, '/api/auth/login', body)), /; Secure/);
+      assert.match(cookieOf(await post(proxied.port, '/api/auth/login', body, { headers: { 'X-Forwarded-Proto': 'https' } })), /; Secure/);
+      assert.doesNotMatch(cookieOf(await post(proxied.port, '/api/auth/login', body)), /Secure/);
+      assert.doesNotMatch(cookieOf(await post(untrusted.port, '/api/auth/login', body, { headers: { 'X-Forwarded-Proto': 'https' } })), /Secure/, 'X-Forwarded-Proto from an untrusted peer is ignored');
+    } finally {
+      await secure.app.close();
+      await proxied.app.close();
+      await untrusted.app.close();
+    }
+  });
+
+  test('auth mode none reports open access and keeps the original behaviour', async () => {
+    const open = await startConsole(createDemoBackend());
+    try {
+      assert.deepEqual((await get(open.port, '/api/auth/session')).json, { auth_mode: 'none', authenticated: true, user: null });
+      assert.equal((await get(open.port, '/api/admin/audit')).status, 200);
+      assert.equal((await post(open.port, '/api/auth/login', { username: 'a', password: 'b' })).json.error.code, 'login_not_supported');
+    } finally {
+      await open.app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Access gate: trusted reverse-proxy identity headers
+// ---------------------------------------------------------------------------
+
+describe('access gate: --auth-mode proxy-header', () => {
+  let app;
+  let port;
+  before(async () => {
+    const auth = createAuth({ mode: 'proxy-header', proxyRoleHeader: 'x-forwarded-groups', proxyAdminGroup: 'defsec-admins' });
+    ({ app, port } = await startConsole(createDemoBackend(), { auth }));
+  });
+  after(() => app.close());
+
+  const as = (user, groups) => ({ headers: { 'X-Forwarded-User': user, ...(groups !== undefined ? { 'X-Forwarded-Groups': groups } : {}) } });
+
+  test('trusted proxy + admin group -> admin; other groups -> observer (403 on admin)', async () => {
+    const admin = as('alice@example.com', 'devs, defsec-admins');
+    assert.deepEqual((await get(port, '/api/auth/session', admin)).json, { auth_mode: 'proxy-header', authenticated: true, user: { username: 'alice@example.com', role: 'admin' } });
+    assert.equal((await get(port, '/api/admin/audit', admin)).status, 200);
+    assert.equal((await post(port, '/api/incidents/inc-2026-0042/runs', {}, admin)).status, 200);
+
+    const obs = as('bob@example.com', 'devs,defsec-admins-readonly');
+    assert.equal((await get(port, '/api/auth/session', obs)).json.user.role, 'observer');
+    assert.equal((await get(port, '/api/hosts', obs)).status, 200);
+    const denied = await get(port, '/api/admin/audit', obs);
+    assert.equal(denied.status, 403);
+    assert.equal(denied.json.error.code, 'admin_role_required');
+    assert.equal((await post(port, '/api/incidents/inc-2026-0042/runs', {}, obs)).json.error.code, 'read_only_role');
+    assert.equal((await get(port, '/api/admin/audit', as('carol@example.com'))).status, 403, 'no group header -> observer');
+  });
+
+  test('trusted proxy without a usable identity -> 401', async () => {
+    const none = await get(port, '/api/hosts');
+    assert.equal(none.status, 401);
+    assert.equal(none.json.error.code, 'proxy_identity_missing');
+    assert.equal((await get(port, '/api/hosts', as('   '))).status, 401);
+    assert.equal((await get(port, '/api/hosts', as('alice, bob'))).json.error.code, 'proxy_identity_invalid');
+    assert.deepEqual((await get(port, '/api/auth/session')).json, { auth_mode: 'proxy-header', authenticated: false, user: null });
+    assert.equal((await post(port, '/api/auth/login', { username: 'alice', password: 'x' }, as('alice'))).json.error.code, 'login_not_supported');
+  });
+
+  test('untrusted peer is refused with 403 even with spoofed identity headers', async () => {
+    const auth = createAuth({ mode: 'proxy-header', trustedProxyIps: ['10.9.9.9', '192.0.2.0/24'], proxyRoleHeader: 'x-forwarded-groups', proxyAdminGroup: 'defsec-admins' });
+    const s = await startConsole(createDemoBackend(), { auth });
+    try {
+      const spoof = as('root', 'defsec-admins');
+      for (const r of [await get(s.port, '/api/admin/audit', spoof), await get(s.port, '/api/auth/session', spoof), await get(s.port, '/', spoof), await post(s.port, '/api/demo/reset', {}, spoof)]) {
+        assert.equal(r.status, 403);
+        assert.equal(r.json.error.code, 'untrusted_proxy');
+        assert.ok(!r.text.includes('edge-vm-07'));
+      }
+    } finally {
+      await s.app.close();
+    }
+  });
+
+  test('default role, peer normalisation and flag validation', async () => {
+    const adminDefault = await startConsole(createDemoBackend(), { auth: createAuth({ mode: 'proxy-header', proxyDefaultRole: 'admin', proxyUserHeader: 'remote-user' }) });
+    try {
+      assert.equal((await get(adminDefault.port, '/api/admin/audit', { headers: { 'Remote-User': 'ops' } })).status, 200);
+      assert.equal((await get(adminDefault.port, '/api/admin/audit', as('ops'))).status, 401, 'only the configured header counts');
+    } finally {
+      await adminDefault.app.close();
+    }
+    assert.equal(normalizeIp('::ffff:127.0.0.1'), '127.0.0.1');
+    assert.equal(normalizeIp('[::1]'), '::1');
+    assert.equal(normalizeIp('fe80::1%eth0'), 'fe80::1');
+    const match = createPeerMatcher(['127.0.0.1', '::1', '10.0.0.0/8', 'fd00::/8']);
+    for (const ok of ['127.0.0.1', '::ffff:127.0.0.1', '::1', '10.20.0.5', 'fd12::4']) assert.ok(match(ok), ok);
+    for (const no of ['127.0.0.2', '11.0.0.1', '::2', '', 'not-an-ip']) assert.ok(!match(no), no);
+    assert.throws(() => createPeerMatcher(['300.1.1.1']), /invalid trusted proxy/);
+    assert.throws(() => parseArgs(['--demo', '--auth-mode', 'proxy-header', '--proxy-role-header', 'x-forwarded-groups'], {}), /--proxy-admin-group/);
+    assert.throws(() => parseArgs(['--demo', '--auth-mode', 'proxy-header', '--trusted-proxy-ips', 'nope'], {}), /invalid trusted proxy/);
+    assert.throws(() => parseArgs(['--demo', '--auth-mode', 'proxy-header', '--proxy-default-role', 'root'], {}), /--proxy-default-role/);
+    const o = parseArgs(['--demo', '--auth-mode', 'proxy-header', '--trusted-proxy-ips', '127.0.0.1,10.0.0.0/8', '--proxy-role-header', 'X-Forwarded-Groups', '--proxy-admin-group', 'defsec-admins'], {});
+    assert.deepEqual(o.trustedProxyIps, ['127.0.0.1', '10.0.0.0/8']);
+    assert.equal(o.proxyRoleHeader, 'x-forwarded-groups');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Mitigation proposals, stream watches and automation status
+// ---------------------------------------------------------------------------
+
+describe('deriveThreeState: append-only streams are never drift', () => {
+  const watch = (id, type, cls = 'baseline') => ({ id, class: cls, collector: { type, parameters: {} } });
+  const obs = (id, watchId, payload, hash = `h${id}`) => ({ observation_id: id, host_id: 'h', watch_id: watchId, spec_version: 1, observed_at: new Date(Date.now() - (100 - id) * 1000).toISOString(), status: 'ok', state_hash: hash, payload });
+  const batch = (n) => ({ kind: 'stream_batch', events: Array.from({ length: n }, (_, i) => ({ cursor: `c${i}` })), cursor_before: null, cursor_after: 'c', gap_detected: false });
+
+  test('journal.unit_events and stream_batch watches derive as stream, unpromotable', () => {
+    const rows = deriveThreeState(
+      [watch('j', 'journal.unit_events'), watch('s', 'sockets.listening'), watch('x', 'files.metadata')],
+      [{ watch_id: 's', revision_id: 1, state_hash: 'h1' }],
+      [obs(1, 's', { kind: 'snapshot', data: {} }), obs(2, 's', { kind: 'snapshot', data: {} }), obs(3, 'j', batch(2)), obs(4, 'j', batch(3)), obs(5, 'x', batch(1))],
+    );
+    const j = rows.find((r) => r.watch_id === 'j');
+    assert.equal(j.state, 'stream');
+    assert.equal(j.promotable_observation_id, null);
+    assert.equal(j.changed_since_last, false);
+    assert.deepEqual([j.stream.latest_observation_id, j.stream.latest_event_count, j.stream.events_in_window, j.stream.batches_in_window], [4, 3, 5, 2]);
+    // Any watch whose observations are stream batches is a stream, whatever its collector label.
+    assert.equal(rows.find((r) => r.watch_id === 'x').state, 'stream');
+    // Snapshot watches keep their three-state semantics.
+    const s = rows.find((r) => r.watch_id === 's');
+    assert.equal(s.state, 'drift');
+    assert.equal(s.promotable_observation_id, 2);
+    assert.equal(deriveThreeState([watch('j', 'journal.unit_events')], [], [])[0].state, 'no_data');
+  });
+
+  test('demo: baseline journal watch is a stream and never offered for promotion', async () => {
+    const backend = createDemoBackend();
+    const tri = (await backend.baselines('edge-vm-07')).three_state;
+    for (const r of tri.filter((x) => x.collector_type === 'journal.unit_events')) {
+      assert.equal(r.state, 'stream', r.watch_id);
+      assert.equal(r.promotable_observation_id, null);
+    }
+    assert.ok(tri.some((r) => r.watch_id === 'base-sshd-journal' && r.class === 'baseline'));
+    const v12 = (await backend.baselines('edge-vm-12')).three_state;
+    assert.equal(v12.filter((r) => r.state === 'baseline_absent' && r.promotable_observation_id != null).length, 2, 'two never-accepted snapshot baselines');
+  });
+});
+
+describe('POST /api/incidents/:id/actions (demo)', () => {
+  let app;
+  let port;
+  const INC = 'inc-2026-0039';
+  before(async () => {
+    ({ app, port } = await startConsole(createDemoBackend()));
+  });
+  after(() => app.close());
+
+  const body = (verb, extra = {}) => ({ verb, evidence_observation_ids: [], expected_effect: 'contain', blast_radius: 'one host', rollback_plan: 'TTL', ...extra });
+
+  test('needs a run, validates the closed verb catalog and returns the gate verdict', async () => {
+    const ctx = (await get(port, `/api/incidents/${INC}`)).json;
+    const evidence = ctx.recent_observations.map((o) => o.observation_id);
+    assert.ok(evidence.length);
+    const noRun = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }));
+    assert.equal(noRun.status, 409);
+    assert.equal(noRun.json.error.code, 'run_required');
+    assert.equal((await post(port, `/api/incidents/${INC}/runs`, {})).status, 200);
+
+    for (const [verb, re] of [
+      [{ verb: 'shell_exec', cmd: 'id' }, /verb\.verb must be one of/],
+      [{ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'sideways', ttl_seconds: 60 }, /direction/],
+      [{ verb: 'nft_block_ip', ip: '198.51.100.7' }, /ttl_seconds/],
+      [{ verb: 'systemd_stop_unit' }, /verb\.unit/],
+    ]) {
+      const r = await post(port, `/api/incidents/${INC}/actions`, body(verb, { evidence_observation_ids: evidence.slice(0, 1) }));
+      assert.equal(r.status, 400, JSON.stringify(verb));
+      assert.match(r.json.error.message, re);
+    }
+    assert.equal((await post(port, `/api/incidents/${INC}/actions`, { verb: { verb: 'host_isolate', preserve_mgmt_cidrs: ['10.0.0.0/8'], ttl_seconds: 60 } })).status, 400, 'justification is required');
+
+    const cite = { evidence_observation_ids: evidence.slice(0, 1) };
+    const prot = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'systemd_stop_unit', unit: 'ssh.service', ttl_seconds: 600 }, cite));
+    assert.equal(prot.status, 200, prot.text);
+    assert.equal(prot.json.decision.rule_id, 'action.protected_unit');
+    assert.equal(prot.json.status, 'rejected');
+    assert.equal(prot.json.intent_id, null);
+    const foreign = (await get(port, '/api/hosts/edge-vm-07/observations?limit=1')).json.observations[0].observation_id;
+    const outside = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { evidence_observation_ids: [foreign] }));
+    assert.equal(outside.json.decision.rule_id, 'action.evidence_out_of_scope');
+
+    const auto = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(auto.status, 200, auto.text);
+    assert.equal(auto.json.decision.rule_id, 'action.autonomous_authorized');
+    assert.equal(auto.json.auth_mode, 'policy_bounded_autonomous');
+    assert.equal(auto.json.status, 'authorized');
+    assert.match(auto.json.intent_id, /^[0-9a-f-]{36}$/);
+    const replay = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.7', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(replay.json.intent_id, auto.json.intent_id, 'same idempotency key replays the verdict');
+    const reused = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'nft_block_ip', ip: '198.51.100.8', direction: 'inbound', ttl_seconds: 600 }, { ...cite, idempotency_key: 'k-1' }));
+    assert.equal(reused.status, 400);
+    const cooldown = await post(port, `/api/incidents/${INC}/actions`, body({ verb: 'host_isolate', preserve_mgmt_cidrs: '10.20.0.0/24', ttl_seconds: 3600 }, cite));
+    assert.equal(cooldown.json.decision.rule_id, 'action.causal_cooldown');
+
+    const list = (await get(port, `/api/actions?incident_id=${INC}`)).json;
+    const intent = list.actions.find((a) => a.intent_id === auto.json.intent_id);
+    assert.deepEqual(Object.keys(intent).sort(), SUMMARY_KEYS);
+    assert.ok(list.denied.some((d) => d.decision.rule_id === 'action.protected_unit'));
+    const detail = (await get(port, `/api/admin/actions/${auto.json.intent_id}`)).json;
+    assert.deepEqual(Object.keys(detail.payload).sort(), PAYLOAD_KEYS);
+    const audit = (await get(port, '/api/admin/audit?limit=500')).json;
+    assert.equal(audit.independent.valid, true);
+    assert.ok(audit.entries.some((e) => e.event_type === 'action_proposed' && e.payload.intent_id === auto.json.intent_id));
+  });
+
+  test('host watch counts, incident changes and automation status', async () => {
+    const hosts = (await get(port, '/api/hosts')).json.hosts;
+    const h07 = hosts.find((h) => h.host_id === 'edge-vm-07');
+    assert.ok(h07.watch_count >= 7);
+    assert.equal(h07.stream_watch_count, 2);
+    const changes = (await get(port, '/api/incidents/inc-2026-0042/changes')).json.changes;
+    const sock = changes.find((c) => c.watch_id === 'base-sockets-listening');
+    assert.equal(sock.basis, 'accepted_baseline');
+    assert.deepEqual(sock.diff.added.map((s) => s.local_port), [4444]);
+    assert.ok(!changes.some((c) => c.collector_type === 'journal.unit_events'), 'streams are not diffed');
+    const auto = (await get(port, '/api/automation')).json;
+    assert.equal(auto.available, true);
+    assert.equal(auto.reasoner_runs, 2);
+    assert.equal(auto.last_run.model_id, 'claude-sonnet-5-5');
+  });
+});
+
+describe('ProposeAction frames over a mock control-d', () => {
+  test('runs mint an isolated incident-scoped token and every run mutation uses it', async () => {
+    const dir = shortTmp('dsm-');
+    const inv = path.join(dir, 'iv.sock');
+    const adm = path.join(dir, 'ad.sock');
+    const seen = [];
+    const incident = { incident_id: '5bc7e050-0000-4000-8000-000000000001', host_id: 'edge-x', status: 'open', priority: 'medium', summary: 's', created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const invSrv = await mockUdsServer(inv, (frame) => {
+      seen.push({ sock: 'inv', token: frame.capability_token, request: frame.request });
+      switch (frame.request.op) {
+        case 'get_incident_context':
+          return { result: 'incident_context', incident, active_watches: [], recent_observations: [], findings: [] };
+        case 'list_collector_capabilities':
+          return { result: 'capabilities', capabilities: [{ collector_type: 'sockets.listening' }, { collector_type: 'journal.unit_events' }] };
+        case 'start_investigation_run':
+          return { result: 'run_started', run_id: 'run-1', incident_id: incident.incident_id, expires_at: new Date(Date.now() + 3_600_000).toISOString() };
+        case 'propose_action':
+          return { result: 'action_proposal_evaluated', decision: { allowed: true, rule_id: 'action.pending_dual_approval', reason: 'r', policy_version: 1 }, proposal_id: 7, intent_id: 'i-1', auth_mode: 'dual_signed_operator', status: 'pending_approval', authorized_intent: null };
+        default:
+          return { result: 'error', code: 'invalid_request', message: 'unexpected' };
+      }
+    });
+    const admSrv = await mockUdsServer(adm, (frame) => {
+      seen.push({ sock: 'admin', request: frame });
+      return frame.admin_op === 'mint_capability_token' ? { admin_result: 'token_minted', token: 'run-scoped-token', expires_at: new Date(Date.now() + 3_600_000).toISOString() } : { admin_result: 'error', code: 'invalid_request', message: 'unexpected' };
+    });
+    const { app, port } = await startConsole(createLiveBackend({ investigateSock: inv, token: 'browse-token', adminSock: adm, enableAdmin: true }));
+    try {
+      const run = await post(port, `/api/incidents/${incident.incident_id}/runs`, {});
+      assert.equal(run.status, 200, run.text);
+      const mint = seen.find((x) => x.sock === 'admin').request;
+      assert.deepEqual(mint, {
+        admin_op: 'mint_capability_token', principal_id: 'console-run-5bc7e050', role: 'investigator', allowed_hosts: ['edge-x'],
+        allowed_collectors: ['sockets.listening', 'journal.unit_events'], incident_id: incident.incident_id, ttl_seconds: 3600,
+      });
+      const start = seen.find((x) => x.request.op === 'start_investigation_run');
+      assert.equal(start.token, 'run-scoped-token', 'the run starts on its own token');
+      const r = await post(port, `/api/incidents/${incident.incident_id}/actions`, {
+        verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900, extra: 'dropped' },
+        evidence_observation_ids: [3, '2', 3],
+        expected_effect: 'e',
+        blast_radius: 'b',
+        rollback_plan: 'r',
+        idempotency_key: 'idem-1',
+      });
+      assert.equal(r.status, 200, r.text);
+      assert.deepEqual(r.json, { decision: { allowed: true, rule_id: 'action.pending_dual_approval', reason: 'r', policy_version: 1 }, proposal_id: 7, intent_id: 'i-1', auth_mode: 'dual_signed_operator', status: 'pending_approval', authorized: false, verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900 }, idempotency_key: 'idem-1' });
+      const frame = seen.find((x) => x.request.op === 'propose_action');
+      assert.equal(frame.token, 'run-scoped-token');
+      assert.deepEqual(frame.request, {
+        op: 'propose_action', run_id: 'run-1', incident_id: incident.incident_id, idempotency_key: 'idem-1',
+        verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 900 },
+        evidence_observation_ids: [2, 3], expected_effect: 'e', blast_radius: 'b', rollback_plan: 'r',
+      });
+      assert.ok(seen.filter((x) => x.sock === 'inv' && x.token === 'browse-token').every((x) => !['start_investigation_run', 'propose_action'].includes(x.request.op)), 'the browse token never starts runs or proposes');
+      assert.ok(!r.text.includes('run-scoped-token') && !run.text.includes('run-scoped-token'), 'run token never leaves the BFF');
+    } finally {
+      await app.close();
+      invSrv.close();
+      admSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

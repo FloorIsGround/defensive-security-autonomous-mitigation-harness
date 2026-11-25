@@ -213,6 +213,26 @@ export function parseFindingBody(body, incidentId) {
 const slim = (o) =>
   o && { observation_id: o.observation_id, state_hash: o.state_hash, observed_at: o.observed_at, status: o.status };
 
+/** Append-only collectors: every batch hashes differently, so there is no snapshot to baseline. */
+export function isStreamWatch(w, latest = null) {
+  return w?.collector?.type === 'journal.unit_events' || latest?.payload?.kind === 'stream_batch';
+}
+
+function streamSummary(obs) {
+  const latest = obs[0] ?? null;
+  const events = (o) => (Array.isArray(o?.payload?.events) ? o.payload.events.length : 0);
+  return {
+    batches_in_window: obs.length,
+    events_in_window: obs.reduce((n, o) => n + events(o), 0),
+    latest_observation_id: latest?.observation_id ?? null,
+    latest_observed_at: latest?.observed_at ?? null,
+    latest_status: latest?.status ?? null,
+    latest_event_count: events(latest),
+    gap_detected: Boolean(latest?.payload?.gap_detected),
+    cursor_after: latest?.payload?.cursor_after ?? null,
+  };
+}
+
 /** Derive accepted_baseline vs last_observed vs current_observed per watch. */
 export function deriveThreeState(watches, baselines, observations) {
   const byWatch = new Map();
@@ -224,8 +244,22 @@ export function deriveThreeState(watches, baselines, observations) {
     .map((w) => {
       const obs = (byWatch.get(w.id) ?? []).sort((a, b) => b.observation_id - a.observation_id);
       const current = obs[0] ?? null;
-      const last = current ? obs.find((o) => o.observation_id < current.observation_id && VALID_OBS.has(o.status)) ?? null : null;
       const accepted = baselines.find((b) => b.watch_id === w.id) ?? null;
+      if (isStreamWatch(w, current)) {
+        return {
+          watch_id: w.id,
+          class: w.class,
+          collector_type: w.collector?.type,
+          accepted_baseline: accepted,
+          last_observed: null,
+          current_observed: slim(current),
+          state: current ? 'stream' : 'no_data',
+          stream: streamSummary(obs),
+          changed_since_last: false,
+          promotable_observation_id: null,
+        };
+      }
+      const last = current ? obs.find((o) => o.observation_id < current.observation_id && VALID_OBS.has(o.status)) ?? null : null;
       let state;
       if (!current) state = 'no_data';
       else if (!VALID_OBS.has(current.status)) state = 'collector_error';
@@ -248,4 +282,192 @@ export function deriveThreeState(watches, baselines, observations) {
       };
     })
     .sort((a, b) => (a.class === b.class ? a.watch_id.localeCompare(b.watch_id) : a.class === 'baseline' ? -1 : 1));
+}
+
+// ---------------------------------------------------------------------------
+// Mitigation proposals (InvestigationRequest::ProposeAction)
+// ---------------------------------------------------------------------------
+
+export const ACTION_VERBS = Object.freeze(['nft_block_ip', 'systemd_stop_unit', 'host_isolate']);
+export const TRAFFIC_DIRECTIONS = Object.freeze(['inbound', 'outbound', 'both']);
+
+function cidrList(raw) {
+  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/[\s,]+/) : [];
+  return list.map((s) => String(s).trim()).filter(Boolean).slice(0, 32);
+}
+
+/**
+ * Build the exact closed-catalog ActionVerb (crates/protocol/src/action.rs,
+ * deny_unknown_fields). Policy limits (protected units/CIDRs, TTL ceilings)
+ * are deliberately left to control-d's action gate so the operator sees the
+ * real PolicyDecision.
+ */
+export function buildActionVerb(raw) {
+  if (!raw || typeof raw !== 'object') throw new ApiError(400, 'invalid_request', 'verb must be an object');
+  const verb = requireEnum(raw.verb, ACTION_VERBS, 'verb.verb');
+  const ttl = (optional) => int(raw.ttl_seconds, 'verb.ttl_seconds', { min: 0, max: 10 * 365 * 86_400, optional });
+  switch (verb) {
+    case 'nft_block_ip':
+      return {
+        verb,
+        ip: requireText(typeof raw.ip === 'string' ? raw.ip.trim() : raw.ip, 'verb.ip', 64),
+        direction: requireEnum(raw.direction ?? 'both', TRAFFIC_DIRECTIONS, 'verb.direction'),
+        ttl_seconds: ttl(false),
+      };
+    case 'systemd_stop_unit': {
+      const out = { verb, unit: requireText(typeof raw.unit === 'string' ? raw.unit.trim() : raw.unit, 'verb.unit', 256) };
+      const t = ttl(true);
+      if (t !== null) out.ttl_seconds = t;
+      return out;
+    }
+    case 'host_isolate':
+      return { verb, preserve_mgmt_cidrs: cidrList(raw.preserve_mgmt_cidrs), ttl_seconds: ttl(false) };
+  }
+}
+
+export function parseActionBody(body) {
+  if (!body || typeof body !== 'object') throw new ApiError(400, 'invalid_request', 'action proposal body must be an object');
+  const ids = Array.isArray(body.evidence_observation_ids) ? body.evidence_observation_ids : [];
+  if (ids.length > 100) throw new ApiError(400, 'invalid_request', 'at most 100 evidence observation IDs');
+  return {
+    run_id: body.run_id ? requireText(body.run_id, 'run_id', 128) : null,
+    idempotency_key: body.idempotency_key ? requireText(body.idempotency_key, 'idempotency_key', 128) : `console-action-${randomBytes(8).toString('hex')}`,
+    verb: buildActionVerb(body.verb),
+    evidence_observation_ids: [...new Set(ids.map((v) => int(v, 'evidence_observation_ids[]', { min: 1 })))].sort((a, b) => a - b),
+    expected_effect: requireText(body.expected_effect, 'expected_effect', 4096),
+    blast_radius: requireText(body.blast_radius, 'blast_radius', 4096),
+    rollback_plan: requireText(body.rollback_plan, 'rollback_plan', 4096),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// "What changed": snapshot diffs for an incident's host
+// ---------------------------------------------------------------------------
+
+const FILE_FIELDS = ['status', 'mode_octal', 'uid', 'gid', 'size_bytes', 'sha256', 'mtime_unix'];
+const UNIT_FIELDS = ['load_state', 'active_state', 'sub_state', 'unit_file_state', 'main_pid', 'exec_start_hash'];
+const SOCKET_FIELDS = ['pid', 'comm', 'systemd_unit', 'uid'];
+
+function setDiff(before, after, key, fields) {
+  const a = new Map((before ?? []).map((x) => [x[key], x]));
+  const b = new Map((after ?? []).map((x) => [x[key], x]));
+  const added = [...b.values()].filter((x) => !a.has(x[key]));
+  const removed = [...a.values()].filter((x) => !b.has(x[key]));
+  const changed = [];
+  for (const [k, now] of b) {
+    const was = a.get(k);
+    if (!was) continue;
+    const delta = fields.filter((f) => (was[f] ?? null) !== (now[f] ?? null)).map((f) => ({ field: f, before: was[f] ?? null, after: now[f] ?? null }));
+    if (delta.length) changed.push({ key: k, fields: delta });
+  }
+  return { added, removed, changed };
+}
+
+/** Structured difference between two normalized snapshots of one collector. */
+export function diffSnapshot(collectorType, before, after) {
+  const b = before ?? {};
+  const a = after ?? {};
+  switch (collectorType) {
+    case 'sockets.listening':
+      return { kind: 'set', identity: 'socket_key', ...setDiff(b.sockets, a.sockets, 'socket_key', SOCKET_FIELDS) };
+    case 'files.metadata':
+      return { kind: 'set', identity: 'path', ...setDiff(b.files, a.files, 'path', FILE_FIELDS) };
+    case 'systemd.unit_state': {
+      const fields = UNIT_FIELDS.filter((f) => (b[f] ?? null) !== (a[f] ?? null)).map((f) => ({ field: f, before: b[f] ?? null, after: a[f] ?? null }));
+      const files = setDiff(b.unit_files, a.unit_files, 'path', ['status', 'sha256', 'size_bytes']);
+      return { kind: 'fields', unit: a.unit ?? b.unit ?? null, fields, unit_files: files };
+    }
+    default:
+      return { kind: 'opaque' };
+  }
+}
+
+const diffSize = (d) =>
+  d.kind === 'set'
+    ? d.added.length + d.removed.length + d.changed.length
+    : d.kind === 'fields'
+      ? d.fields.length + d.unit_files.added.length + d.unit_files.removed.length + d.unit_files.changed.length
+      : 0;
+
+const snapshotData = (o) => (o && (o.payload?.kind === 'snapshot' || o.payload?.kind === 'delta') ? o.payload.data : null);
+
+/**
+ * For each snapshot watch on the incident's host, compare the accepted
+ * baseline (when one exists and its observation is still in the window) or,
+ * failing that, the state just before the incident opened, against the
+ * latest valid observation.
+ */
+export function buildIncidentChanges({ incident, watches, baselines, observationsByWatch }) {
+  const opened = Date.parse(incident.created_at);
+  const changes = [];
+  for (const w of watches) {
+    if (isStreamWatch(w)) continue;
+    const type = w.collector?.type;
+    const obs = (observationsByWatch.get(w.id) ?? []).filter((o) => VALID_OBS.has(o.status) && snapshotData(o)).sort((x, y) => y.observation_id - x.observation_id);
+    const latest = obs[0];
+    if (!latest) continue;
+    const accepted = baselines.find((b) => b.watch_id === w.id) ?? null;
+    let reference = null;
+    let basis;
+    if (accepted) {
+      if (accepted.state_hash === latest.state_hash) continue;
+      basis = 'accepted_baseline';
+      reference = obs.find((o) => o.state_hash === accepted.state_hash) ?? null;
+    } else {
+      basis = 'before_incident';
+      // State at incident open, and the valid sample right before it.
+      const atOpen = obs.find((o) => Date.parse(o.observed_at) <= opened + 2_000) ?? obs.at(-1);
+      const prior = obs.find((o) => o.observation_id < atOpen.observation_id);
+      // This watch did not change when the incident opened.
+      if (!prior || prior.state_hash === atOpen.state_hash) continue;
+      reference = prior;
+    }
+    const diff = reference ? diffSnapshot(type, snapshotData(reference), snapshotData(latest)) : { kind: 'unavailable' };
+    if (reference && diff.kind !== 'opaque' && diffSize(diff) === 0) continue;
+    changes.push({
+      watch_id: w.id,
+      class: w.class,
+      collector_type: type,
+      basis,
+      accepted_baseline: accepted ? { revision_id: accepted.revision_id, state_hash: accepted.state_hash, approver: accepted.approver, approved_at: accepted.approved_at } : null,
+      reference: reference ? slim(reference) : null,
+      latest: slim(latest),
+      diff,
+      size: reference ? diffSize(diff) : null,
+    });
+  }
+  return changes.sort((a, b) => (b.size ?? 0) - (a.size ?? 0) || a.watch_id.localeCompare(b.watch_id));
+}
+
+// ---------------------------------------------------------------------------
+// Automation status (derived from the audit log; admin interface only)
+// ---------------------------------------------------------------------------
+
+const CONSOLE_BACKENDS = new Set(['operator-console']);
+const isConsoleActor = (actor) => /^console[-:]/.test(String(actor ?? '')) || actor === 'console-operator';
+
+/** Summarise reasoner-d activity seen in the audit window, separating console-driven runs. */
+export function automationSummary(entries) {
+  const runs = entries.filter((e) => e.event_type === 'run_started');
+  const auto = runs.filter((e) => !CONSOLE_BACKENDS.has(e.payload?.backend_id) && !isConsoleActor(e.actor));
+  const autoActors = new Set(auto.map((e) => e.actor));
+  const by = (type) => entries.filter((e) => e.event_type === type && !isConsoleActor(e.actor) && (autoActors.has(e.actor) || /reasoner/i.test(String(e.actor))));
+  const last = auto.reduce((m, e) => (!m || e.seq_no > m.seq_no ? e : m), null);
+  return {
+    window_entries: entries.length,
+    reasoner_runs: auto.length,
+    console_runs: runs.length - auto.length,
+    watch_proposals: by('watch_proposed').length,
+    findings: by('finding_recorded').length,
+    action_proposals: by('action_proposed').length,
+    last_run: last
+      ? {
+          at: last.timestamp,
+          actor: last.actor,
+          incident_id: last.payload?.incident_id ?? null,
+          backend_id: last.payload?.backend_id ?? null,
+          model_id: last.payload?.model_id ?? null,
+        }
+      : null,
+  };
 }

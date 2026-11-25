@@ -1,4 +1,4 @@
-// Offline demo backend: a realistic DefSecAutMit fleet with an open two-stage
+// Offline demo backend: a realistic Defensive Security Autonomous Mitigation Harness fleet with an open two-stage
 // incident, three-state baseline drift, active and expired ephemeral watches,
 // accepted and rejected policy decisions, and a real SHA-256 hash-chained audit
 // log. Mutations (runs, proposals, findings, promotion, closure, enrollment)
@@ -7,12 +7,17 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
+import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
   COLLECTOR_TYPES,
+  automationSummary,
+  buildIncidentChanges,
   buildWatchSpec,
   deriveThreeState,
   int,
+  isStreamWatch,
+  parseActionBody,
   parseFindingBody,
   requireIdent,
   requireText,
@@ -67,6 +72,8 @@ const unitColl = (unit) => ({ type: 'systemd.unit_state', parameters: { unit, ha
 const unitTrig = { type: 'field_changed', compare_against: 'accepted_baseline', fields: ['active_state', 'sub_state', 'exec_start_hash'] };
 const filesColl = (paths) => ({ type: 'files.metadata', parameters: { paths, compute_hash: true } });
 const filesTrig = { type: 'set_diff', compare_against: 'accepted_baseline', set_field: 'files', identity_key: 'path' };
+const journalColl = (unit) => ({ type: 'journal.unit_events', parameters: { unit, min_priority: 6, max_events_per_batch: 50, max_message_bytes: 512 } });
+const healthTrig = { type: 'collector_stale_or_error', max_stale_seconds: 300, consecutive_errors: 3 };
 
 // ---------------------------------------------------------------------------
 // Observation payload fixtures
@@ -135,14 +142,14 @@ const jEvent = (now, ago, cursorN, pid, prio, msg, { redacted = false, truncated
 // State construction
 // ---------------------------------------------------------------------------
 
-function buildState(now) {
+function buildState(now, signer) {
   const iso = (ago) => new Date(now - ago).toISOString();
 
   const hosts = [
-    { host_id: 'edge-vm-07', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 6, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
+    { host_id: 'edge-vm-07', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 7, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
     { host_id: 'edge-vm-03', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 9, hb: 12_000, health: { rss_bytes: 19_116_032, spool_bytes_used: 401_408, spool_bytes_cap: 67_108_864, active_watches: 3, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-11' },
     { host_id: 'edge-vm-11', agent_version: '0.1.9', liveness_status: 'stale', active_bundle_version: 7, hb: 4 * MIN + 12_000, health: { rss_bytes: 31_870_976, spool_bytes_used: 58_720_256, spool_bytes_cap: 67_108_864, active_watches: 1, dropped_events_total: 214 }, vm: 'vSphere / cl-edge-b / esx-02' },
-    { host_id: 'edge-vm-12', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 2, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
+    { host_id: 'edge-vm-12', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 4, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
     { host_id: 'edge-db-02', agent_version: '0.1.9', liveness_status: 'offline', active_bundle_version: 6, hb: 3 * HOUR + 7 * MIN, health: null, vm: 'vSphere / cl-data / esx-21' },
   ];
 
@@ -189,6 +196,9 @@ function buildState(now) {
     baselineWatch('edge-vm-11', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-vm-12', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-vm-12', 'base-sshd-unit', unitColl('sshd.service'), unitTrig),
+    baselineWatch('edge-vm-12', 'base-cron-config', filesColl(['/etc/cron.d/popularity-contest', '/etc/cron.d/e2scrub_all']), filesTrig, 300, 20),
+    baselineWatch('edge-vm-12', 'base-timesyncd-unit', unitColl('systemd-timesyncd.service'), unitTrig),
+    baselineWatch('edge-vm-07', 'base-sshd-journal', journalColl('sshd.service'), healthTrig),
     baselineWatch('edge-db-02', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-db-02', 'base-postgres-unit', unitColl('postgresql.service'), unitTrig),
   ];
@@ -271,6 +281,32 @@ function buildState(now) {
     ['v12_sock', 'edge-vm-12', 'base-sockets-listening', 9 * MIN, 'ok', snap(sockSnap(BASE_SOCKETS.slice(0, 2)))],
     ['v12_sshd_old', 'edge-vm-12', 'base-sshd-unit', 2 * DAY, 'ok', snap(unitSnap('sshd.service', 790, '/usr/sbin/sshd -D', '[Service]\nExecStart=/usr/sbin/sshd -D\n', 538))],
     ['v12_sshd', 'edge-vm-12', 'base-sshd-unit', 8 * MIN, 'ok', snap(unitSnap('sshd.service', 1402, '/usr/sbin/sshd -D', '[Service]\nExecStart=/usr/sbin/sshd -D\n', 538))],
+    ['v12_cron', 'edge-vm-12', 'base-cron-config', 7 * MIN, 'ok', snap({ count: 2, files: [
+      fileEntry('/etc/cron.d/popularity-contest', 'SHELL=/bin/sh\n17 4 * * * root test -x /etc/cron.daily/popularity-contest\n', 312, 120 * DAY, now),
+      fileEntry('/etc/cron.d/e2scrub_all', '30 3 * * 0 root test -e /run/systemd/system || /usr/sbin/e2scrub_all\n', 201, 90 * DAY, now),
+    ] })],
+    ['v12_tsync', 'edge-vm-12', 'base-timesyncd-unit', 6 * MIN, 'ok', snap(unitSnap('systemd-timesyncd.service', 655, '/usr/lib/systemd/systemd-timesyncd', '[Service]\nExecStart=/usr/lib/systemd/systemd-timesyncd\n', 1630))],
+    ['sshj_1', 'edge-vm-07', 'base-sshd-journal', 30 * MIN, 'ok', {
+      kind: 'stream_batch',
+      events: [
+        jEvent(now, 31 * MIN, 21, 811, 6, 'Accepted publickey for deploy from 10.20.8.15 port 51022 ssh2: ED25519 SHA256:[REDACTED]', { redacted: true, unit: 'sshd.service' }),
+        jEvent(now, 31 * MIN - 2_000, 22, 811, 6, 'pam_unix(sshd:session): session opened for user deploy(uid=1001) by (uid=0)', { unit: 'sshd.service' }),
+      ],
+      cursor_before: 's=8c1f42;i=4a200',
+      cursor_after: 's=8c1f42;i=4a202',
+      gap_detected: false,
+    }],
+    ['sshj_2', 'edge-vm-07', 'base-sshd-journal', 9 * MIN, 'ok', {
+      kind: 'stream_batch',
+      events: [
+        jEvent(now, 10 * MIN, 23, 811, 5, 'Connection closed by authenticating user root 203.0.113.47 port 40188 [preauth]', { unit: 'sshd.service' }),
+        jEvent(now, 10 * MIN - 800, 24, 811, 5, 'Connection closed by authenticating user root 203.0.113.47 port 40190 [preauth]', { unit: 'sshd.service' }),
+        jEvent(now, 10 * MIN - 1_500, 25, 811, 6, 'pam_unix(sshd:session): session closed for user deploy', { unit: 'sshd.service' }),
+      ],
+      cursor_before: 's=8c1f42;i=4a202',
+      cursor_after: 's=8c1f42;i=4a205',
+      gap_detected: false,
+    }],
 
     ['db_sock', 'edge-db-02', 'base-sockets-listening', 3 * HOUR + 9 * MIN, 'ok', snap(sockSnap([sock('tcp', '10.20.4.12', 5432, 113, 33120, 950, 'postgres', 'postgresql.service'), BASE_SOCKETS[0]]))],
     ['db_pg', 'edge-db-02', 'base-postgres-unit', 3 * HOUR + 9 * MIN, 'ok', snap(unitSnap('postgresql.service', 950, '/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main', '[Service]\nExecStart=/usr/lib/postgresql/16/bin/postgres\n', 703))],
@@ -404,6 +440,9 @@ function buildState(now) {
     dec(57, 77, 'operator:t3-mcp-session', 31 * MIN, false, 'spec.safety_floor', "invalid watch 'ephem-0042-sock-fast': interval_seconds 5 is below local floor 15"),
   ];
 
+  // --- Phase 8 mitigations (typed intents, signed envelopes, receipts) -----
+  const actionSet = buildDemoActions({ now, iso, ids, signer });
+
   // --- audit events, chained in timestamp order -----------------------------
   const ev = (ago, event_type, actor, payload) => ({ ago, event_type, actor, payload });
   const events = [
@@ -430,6 +469,7 @@ function buildState(now) {
     ev(32 * MIN - 1000, 'bundle_issued', 'control-d', { host_id: 'edge-vm-07', version: 14, digest: h('bundle-14') }),
     ev(30 * MIN, 'finding_recorded', REASONER, { finding_id: 302, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'verified_finding' }),
     ev(12 * MIN, 'finding_recorded', REASONER, { finding_id: 303, run_id: 'run-7f3a91c2', incident_id: 'inc-2026-0042', kind: 'hypothesis' }),
+    ...actionSet.events,
   ].sort((a, b) => b.ago - a.ago);
 
   const audit = [];
@@ -443,13 +483,14 @@ function buildState(now) {
     incidents,
     findings,
     proposals,
-    policyDecisions,
+    policyDecisions: [...policyDecisions, ...actionSet.decisions],
+    actions: { intents: actionSet.intents, denied: actionSet.denied, nextProposalId: actionSet.nextProposalId },
     audit,
     runs: new Map(),
     nextObservationId: 9001 + observations.length,
     nextRevisionId: 40,
     nextFindingId: 310,
-    nextDecisionId: 60,
+    nextDecisionId: 70,
     nextProposalId: 80,
     tampered: false,
     createdAt: now,
@@ -477,7 +518,9 @@ function appendAudit(audit, event_type, actor, payload, timestamp = new Date().t
 // ---------------------------------------------------------------------------
 
 export function createDemoBackend({ enableAdmin = true, now = () => Date.now() } = {}) {
-  let S = buildState(now());
+  const signer = createDemoSigner();
+  let S = buildState(now(), signer);
+  const advance = () => advanceDemoActions(S, now(), appendAudit);
 
   const host = (id) => {
     requireIdent(id, 'host_id');
@@ -533,6 +576,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     adminEnabled: enableAdmin,
 
     async status() {
+      advance();
       return {
         mode: 'demo',
         admin_enabled: enableAdmin,
@@ -561,6 +605,9 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
             liveness_status: hst.liveness_status,
             active_bundle_version: hst.active_bundle_version,
             last_heartbeat_at: last === null ? null : new Date(last).toISOString(),
+            watch_count: hostWatches(hst.host_id).length,
+            baseline_watch_count: hostWatches(hst.host_id).filter((w) => w.class === 'baseline').length,
+            stream_watch_count: hostWatches(hst.host_id).filter((w) => isStreamWatch(w)).length,
             health: hst.health ?? undefined,
             placement: hst.vm ?? undefined,
           };
@@ -724,8 +771,44 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       return { finding_id, verified_evidence_count: Object.keys(evidence).length };
     },
 
+    async proposeAction(incidentId, body = {}) {
+      const inc = incidentRow(incidentId);
+      const a = parseActionBody(body);
+      const run = resolveRun(incidentId, a.run_id);
+      if (inc.status !== 'open') throw new ApiError(403, 'forbidden', 'incident is not open');
+      advance();
+      // scoped_evidence: every cited observation must exist on this host and inside the incident's scope.
+      const evidenceOk = a.evidence_observation_ids.every((id) => {
+        const o = S.observations.find((x) => x.observation_id === id);
+        const w = o && S.watches.find((x) => x.host_id === o.host_id && x.id === o.watch_id);
+        return o && o.host_id === inc.host_id && !(w?.incident_id && w.incident_id !== incidentId);
+      });
+      const { run_id: _r, ...proposal } = a;
+      const res = proposeDemoAction(S, { incident: inc, run, actor: 'console-operator', proposal, evidenceOk, signer, nowMs: now(), appendAudit });
+      inc.updated_at = new Date(now()).toISOString();
+      return res;
+    },
+
+    async changes(incidentId) {
+      const inc = incidentRow(incidentId);
+      const ws = hostWatches(inc.host_id).filter((w) => (!w.incident_id || w.incident_id === incidentId) && !isStreamWatch(w));
+      const observationsByWatch = new Map(ws.map((w) => [w.id, S.observations.filter((o) => o.host_id === inc.host_id && o.watch_id === w.id)]));
+      return {
+        incident_id: incidentId,
+        host_id: inc.host_id,
+        changes: buildIncidentChanges({ incident: publicIncident(inc), watches: ws.map(publicWatch), baselines: currentBaselines(inc.host_id), observationsByWatch }),
+      };
+    },
+
+    async automation() {
+      if (!enableAdmin) return { available: false, reason: 'admin_disabled' };
+      advance();
+      return { available: true, ...automationSummary(S.audit.slice(-500)) };
+    },
+
     async audit({ limit = 200 } = {}) {
       requireAdmin();
+      advance();
       const lim = int(limit, 'limit', { min: 1, max: 500 });
       const entries = S.audit.slice(-lim);
       return { chain: chainStatus(), independent: verifyEntries(entries), entries };
@@ -819,6 +902,53 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       return { host_id: hostId, control_signing_key_id: 'control-key-01', control_public_key_hex: h('demo-control-signing-key') };
     },
 
+    // ---- Phase 8 mitigations ---------------------------------------------------
+    async actions({ host_id = null, incident_id = null } = {}) {
+      if (host_id !== null) requireIdent(host_id, 'host_id');
+      if (incident_id !== null) requireIdent(incident_id, 'incident_id');
+      advance();
+      const match = (x) => (!host_id || x.host_id === host_id) && (!incident_id || x.incident_id === incident_id);
+      return {
+        source: 'demo',
+        actions: S.actions.intents.map(summaryOf).filter(match).sort((a, b) => b.proposal_id - a.proposal_id),
+        denied: S.actions.denied.filter(match).sort((a, b) => b.proposal_id - a.proposal_id),
+        admin_sock: './control-data/admin.sock',
+      };
+    },
+
+    async actionDetail(intentId) {
+      requireAdmin();
+      requireIdent(intentId, 'intent_id');
+      advance();
+      const rec = S.actions.intents.find((r) => r.payload.intent_id === intentId);
+      if (!rec) throw new ApiError(404, 'not_found', 'action intent not found');
+      const live = rec.status === 'authorized' && Date.parse(rec.payload.expires_at) > now();
+      return {
+        payload: rec.payload,
+        authorized_intent: live || ['executed', 'rolled_back'].includes(rec.status)
+          ? { control_envelope: rec.control_envelope, operator_approval: rec.operator_approval }
+          : null,
+        status: rec.status,
+        summary: summaryOf(rec),
+        receipts: rec.receipts,
+        signing: signingInfo(rec.payload),
+        admin_sock: './control-data/admin.sock',
+      };
+    },
+
+    async approveAction(intentId, body = {}) {
+      requireAdmin();
+      advance();
+      return approveDemoAction(S, {
+        intentId,
+        body,
+        signer,
+        nowMs: now(),
+        incidentOpen: (id) => S.incidents.find((i) => i.incident_id === id)?.status === 'open',
+        appendAudit,
+      });
+    },
+
     // ---- demo-only helpers ---------------------------------------------------
     async demoTamper() {
       const target = S.audit[Math.floor(S.audit.length / 2)];
@@ -828,7 +958,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     },
 
     async demoReset() {
-      S = buildState(now());
+      S = buildState(now(), signer);
       return { reset: true };
     },
 
