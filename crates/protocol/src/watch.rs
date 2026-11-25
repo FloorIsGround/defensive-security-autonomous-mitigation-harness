@@ -26,6 +26,10 @@ pub enum CollectorType {
     FilesMetadata,
     #[serde(rename = "journal.unit_events")]
     JournalUnitEvents,
+    #[serde(rename = "connections.outbound")]
+    ConnectionsOutbound,
+    #[serde(rename = "packages.inventory")]
+    PackagesInventory,
 }
 
 impl CollectorType {
@@ -35,6 +39,8 @@ impl CollectorType {
             Self::SystemdUnitState => "systemd.unit_state",
             Self::FilesMetadata => "files.metadata",
             Self::JournalUnitEvents => "journal.unit_events",
+            Self::ConnectionsOutbound => "connections.outbound",
+            Self::PackagesInventory => "packages.inventory",
         }
     }
 
@@ -55,6 +61,10 @@ pub enum CollectorSpec {
     FilesMetadata(FilesMetadataParams),
     #[serde(rename = "journal.unit_events")]
     JournalUnitEvents(JournalUnitEventsParams),
+    #[serde(rename = "connections.outbound")]
+    ConnectionsOutbound(ConnectionsOutboundParams),
+    #[serde(rename = "packages.inventory")]
+    PackagesInventory(PackagesInventoryParams),
 }
 
 impl CollectorSpec {
@@ -64,6 +74,8 @@ impl CollectorSpec {
             Self::SystemdUnitState(_) => CollectorType::SystemdUnitState,
             Self::FilesMetadata(_) => CollectorType::FilesMetadata,
             Self::JournalUnitEvents(_) => CollectorType::JournalUnitEvents,
+            Self::ConnectionsOutbound(_) => CollectorType::ConnectionsOutbound,
+            Self::PackagesInventory(_) => CollectorType::PackagesInventory,
         }
     }
 }
@@ -110,6 +122,43 @@ pub struct JournalUnitEventsParams {
     pub max_events_per_batch: Option<u32>,
     #[serde(default)]
     pub max_message_bytes: Option<usize>,
+}
+
+/// Default retained outbound flow groups when `max_flows` is unset.
+pub const OUTBOUND_FLOWS_DEFAULT: u32 = 256;
+/// Hard ceiling for `max_flows` regardless of local configuration.
+pub const OUTBOUND_FLOWS_HARD_MAX: u32 = 1024;
+
+/// Default retained package entries when `max_packages` is unset.
+pub const PACKAGES_INVENTORY_DEFAULT: u32 = 4096;
+/// Hard ceiling for `max_packages` regardless of local configuration.
+pub const PACKAGES_INVENTORY_HARD_MAX: u32 = 16384;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionsOutboundParams {
+    #[serde(default = "default_true")]
+    pub include_tcp: bool,
+    /// Connected UDP sockets only (unconnected rows carry a zero remote).
+    #[serde(default)]
+    pub include_udp: bool,
+    #[serde(default = "default_true")]
+    pub include_ipv6: bool,
+    #[serde(default = "default_true")]
+    pub resolve_process: bool,
+    #[serde(default = "default_true")]
+    pub exclude_loopback: bool,
+    /// Retained flow groups; defaults to [`OUTBOUND_FLOWS_DEFAULT`].
+    #[serde(default)]
+    pub max_flows: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackagesInventoryParams {
+    /// Retained package entries; defaults to [`PACKAGES_INVENTORY_DEFAULT`].
+    #[serde(default)]
+    pub max_packages: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -276,5 +325,58 @@ mod tests {
         }"#;
         let parsed: Result<CollectorSpec, _> = serde_json::from_str(raw);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn outbound_and_packages_specs_roundtrip_with_defaults() {
+        let raw = r#"{"type": "connections.outbound", "parameters": {}}"#;
+        let spec: CollectorSpec = serde_json::from_str(raw).unwrap();
+        assert_eq!(spec.collector_type(), CollectorType::ConnectionsOutbound);
+        assert!(!spec.collector_type().is_stream());
+        let CollectorSpec::ConnectionsOutbound(p) = &spec else {
+            panic!("wrong variant");
+        };
+        assert!(p.include_tcp && p.include_ipv6 && p.resolve_process && p.exclude_loopback);
+        assert!(!p.include_udp);
+        assert_eq!(p.max_flows, None);
+        // Round trip is stable and unknown fields are rejected.
+        assert_eq!(serde_json::to_value(&spec).unwrap(), serde_json::json!({
+            "type": "connections.outbound",
+            "parameters": {
+                "include_tcp": true, "include_udp": false, "include_ipv6": true,
+                "resolve_process": true, "exclude_loopback": true, "max_flows": null
+            }
+        }));
+        assert!(serde_json::from_str::<CollectorSpec>(
+            r#"{"type": "connections.outbound", "parameters": {"shell_cmd": "x"}}"#
+        )
+        .is_err());
+
+        let raw = r#"{"type": "packages.inventory", "parameters": {"max_packages": 10}}"#;
+        let spec: CollectorSpec = serde_json::from_str(raw).unwrap();
+        assert_eq!(spec.collector_type(), CollectorType::PackagesInventory);
+        assert!(!spec.collector_type().is_stream());
+        let CollectorSpec::PackagesInventory(p) = &spec else {
+            panic!("wrong variant");
+        };
+        assert_eq!(p.max_packages, Some(10));
+        assert!(serde_json::from_str::<CollectorSpec>(
+            r#"{"type": "packages.inventory", "parameters": {"path": "/etc/passwd"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_type_wire_names_are_stable() {
+        assert_eq!(CollectorType::ConnectionsOutbound.as_str(), "connections.outbound");
+        assert_eq!(
+            serde_json::to_value(CollectorType::ConnectionsOutbound).unwrap(),
+            serde_json::json!("connections.outbound")
+        );
+        assert_eq!(CollectorType::PackagesInventory.as_str(), "packages.inventory");
+        assert_eq!(
+            serde_json::to_value(CollectorType::PackagesInventory).unwrap(),
+            serde_json::json!("packages.inventory")
+        );
     }
 }

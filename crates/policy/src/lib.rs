@@ -6,4 +6,7 @@
 pub mod action_gate;
 pub mod control_gate;
 pub mod edge_floor;
+pub mod host_profile;
 pub mod predicate;
+
+pub use host_profile::apply_host_profile;

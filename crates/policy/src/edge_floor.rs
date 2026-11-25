@@ -29,6 +29,10 @@ pub struct EdgeSafetyConfig {
     pub max_file_hash_bytes: u64,
     pub max_journal_batch_events: u32,
     pub max_journal_message_bytes: usize,
+    /// Local ceiling for `connections.outbound` retained flow groups.
+    pub max_outbound_flows: u32,
+    /// Local ceiling for `packages.inventory` retained package entries.
+    pub max_packages: u32,
     pub max_clock_skew_seconds: i64,
     pub allowed_collectors: BTreeSet<CollectorType>,
     pub approved_file_roots: Vec<PathBuf>,
@@ -44,6 +48,8 @@ impl Default for EdgeSafetyConfig {
         allowed_collectors.insert(CollectorType::SystemdUnitState);
         allowed_collectors.insert(CollectorType::FilesMetadata);
         allowed_collectors.insert(CollectorType::JournalUnitEvents);
+        allowed_collectors.insert(CollectorType::ConnectionsOutbound);
+        allowed_collectors.insert(CollectorType::PackagesInventory);
 
         Self {
             expected_policy_version: 1,
@@ -58,6 +64,8 @@ impl Default for EdgeSafetyConfig {
             max_file_hash_bytes: 10 * 1024 * 1024, // 10 MiB
             max_journal_batch_events: 100,
             max_journal_message_bytes: 512,
+            max_outbound_flows: 512,
+            max_packages: 16384,
             max_clock_skew_seconds: 300,
             allowed_collectors,
             approved_file_roots: vec![
@@ -386,6 +394,43 @@ fn validate_collector_params(
             }
             Ok(())
         }
+        CollectorSpec::ConnectionsOutbound(p) => {
+            if !p.include_tcp && !p.include_udp {
+                return Err(
+                    "connections.outbound must include at least one of tcp or udp".into(),
+                );
+            }
+            if let Some(max_flows) = p.max_flows {
+                let ceiling = cfg
+                    .max_outbound_flows
+                    .min(defsec_protocol::watch::OUTBOUND_FLOWS_HARD_MAX);
+                if max_flows == 0 || max_flows > ceiling {
+                    return Err(format!(
+                        "max_flows {} must be within 1..={ceiling} (hard max {}, local ceiling {})",
+                        max_flows,
+                        defsec_protocol::watch::OUTBOUND_FLOWS_HARD_MAX,
+                        cfg.max_outbound_flows
+                    ));
+                }
+            }
+            Ok(())
+        }
+        CollectorSpec::PackagesInventory(p) => {
+            if let Some(max_packages) = p.max_packages {
+                let ceiling = cfg
+                    .max_packages
+                    .min(defsec_protocol::watch::PACKAGES_INVENTORY_HARD_MAX);
+                if max_packages == 0 || max_packages > ceiling {
+                    return Err(format!(
+                        "max_packages {} must be within 1..={ceiling} (hard max {}, local ceiling {})",
+                        max_packages,
+                        defsec_protocol::watch::PACKAGES_INVENTORY_HARD_MAX,
+                        cfg.max_packages
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -686,5 +731,78 @@ mod tests {
             max_file_bytes: Some(1024),
         });
         assert!(validate_watch_spec(&bad_files, &cfg, now).is_err());
+    }
+
+    #[test]
+    fn new_collectors_are_allowed_and_bounds_enforced() {
+        use defsec_protocol::watch::{
+            ConnectionsOutboundParams, PackagesInventoryParams, OUTBOUND_FLOWS_HARD_MAX,
+            PACKAGES_INVENTORY_HARD_MAX,
+        };
+
+        let now = Utc::now();
+        let cfg = EdgeSafetyConfig::default();
+        assert!(cfg.allowed_collectors.contains(&CollectorType::ConnectionsOutbound));
+        assert!(cfg.allowed_collectors.contains(&CollectorType::PackagesInventory));
+        assert_eq!(cfg.max_outbound_flows, 512);
+        assert_eq!(cfg.max_packages, 16384);
+
+        let outbound_watch = |max_flows: Option<u32>| {
+            let mut w = sample_watch("w-out", "edge-01", WatchClass::Ephemeral, now);
+            w.collector = CollectorSpec::ConnectionsOutbound(ConnectionsOutboundParams {
+                include_tcp: true,
+                include_udp: true,
+                include_ipv6: true,
+                resolve_process: false,
+                exclude_loopback: true,
+                max_flows,
+            });
+            w
+        };
+        assert!(validate_watch_spec(&outbound_watch(None), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&outbound_watch(Some(256)), &cfg, now).is_ok());
+        let zero = validate_watch_spec(&outbound_watch(Some(0)), &cfg, now).unwrap_err();
+        assert!(zero.to_string().contains("max_flows 0"));
+        let over_local = validate_watch_spec(&outbound_watch(Some(513)), &cfg, now).unwrap_err();
+        assert!(over_local.to_string().contains("1..=512"));
+        let over_hard = validate_watch_spec(&outbound_watch(Some(10_000)), &cfg, now).unwrap_err();
+        assert!(over_hard.to_string().contains("hard max"));
+
+        // A tightened local ceiling tightens the acceptance range.
+        let mut tight = cfg.clone();
+        tight.max_outbound_flows = 64;
+        assert!(validate_watch_spec(&outbound_watch(Some(64)), &tight, now).is_ok());
+        let over = validate_watch_spec(&outbound_watch(Some(65)), &tight, now).unwrap_err();
+        assert!(over.to_string().contains("1..=64"));
+
+        // Both protocols disabled is rejected.
+        let mut none = outbound_watch(None);
+        if let CollectorSpec::ConnectionsOutbound(p) = &mut none.collector {
+            p.include_tcp = false;
+            p.include_udp = false;
+        }
+        assert!(validate_watch_spec(&none, &cfg, now).is_err());
+
+        let packages_watch = |max_packages: Option<u32>| {
+            let mut w = sample_watch("w-pkg", "edge-01", WatchClass::Ephemeral, now);
+            w.collector = CollectorSpec::PackagesInventory(PackagesInventoryParams {
+                max_packages,
+            });
+            w
+        };
+        assert!(validate_watch_spec(&packages_watch(None), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&packages_watch(Some(4096)), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&packages_watch(Some(0)), &cfg, now).is_err());
+        let over = validate_watch_spec(&packages_watch(Some(20_000)), &cfg, now).unwrap_err();
+        assert!(over.to_string().contains("1..=16384"));
+        assert_eq!(PACKAGES_INVENTORY_HARD_MAX, 16384);
+        assert_eq!(OUTBOUND_FLOWS_HARD_MAX, 1024);
+
+        // A collector disabled by a tightened allowlist is rejected.
+        let mut restricted = cfg.clone();
+        restricted.allowed_collectors.remove(&CollectorType::PackagesInventory);
+        let err = validate_watch_spec(&packages_watch(None), &restricted, now).unwrap_err();
+        assert!(err.to_string().contains("packages.inventory"));
+        assert!(err.to_string().contains("not allowed"));
     }
 }

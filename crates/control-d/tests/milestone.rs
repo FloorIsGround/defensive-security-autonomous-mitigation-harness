@@ -176,6 +176,7 @@ fn register(host: &str) -> AgentToControl {
         active_bundle_version: 0,
         active_bundle_digest: None,
         sent_at: Utc::now(),
+        host_profile: None,
     }
 }
 

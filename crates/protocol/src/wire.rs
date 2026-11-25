@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::observation::{ObservationRecord, ObservationStatus};
+use crate::profile::HostProfileSummary;
 use crate::signing::SignedEnvelope;
 
 /// Maximum permitted single wire frame payload size (2 MiB).
@@ -81,6 +82,10 @@ pub enum AgentToControl {
         #[serde(default)]
         active_bundle_digest: Option<String>,
         sent_at: DateTime<Utc>,
+        /// Summary of the admin-owned host profile applied by this agent.
+        /// Optional and informational; older agents omit it.
+        #[serde(default)]
+        host_profile: Option<HostProfileSummary>,
     },
     Heartbeat {
         host_id: String,
@@ -230,6 +235,7 @@ mod tests {
             active_bundle_version: 0,
             active_bundle_digest: None,
             sent_at: Utc::now(),
+            host_profile: None,
         };
         write_frame(&mut client, &msg).await.unwrap();
         drop(client);
@@ -237,5 +243,52 @@ mod tests {
         assert_eq!(decoded, msg);
         let eof: Option<AgentToControl> = read_frame(&mut server).await.unwrap();
         assert!(eof.is_none());
+    }
+
+    #[test]
+    fn register_without_host_profile_still_decodes() {
+        // Backward compatibility: an old agent that omits host_profile must
+        // still register (the field defaults to None).
+        let raw = serde_json::json!({
+            "msg": "register",
+            "protocol_version": WIRE_PROTOCOL_VERSION,
+            "host_id": "edge-01",
+            "agent_version": "0.1.0",
+            "boot_id": "boot-1",
+            "session_id": "sess-1",
+            "active_bundle_version": 3,
+            "sent_at": "2026-01-01T00:00:00Z"
+        });
+        let decoded: AgentToControl = serde_json::from_value(raw).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentToControl::Register {
+                host_profile: None,
+                ..
+            }
+        ));
+
+        // A profile summary round-trips through the same wire type.
+        let with_profile = AgentToControl::Register {
+            protocol_version: WIRE_PROTOCOL_VERSION,
+            host_id: "edge-01".into(),
+            agent_version: "0.1.0".into(),
+            boot_id: "boot-1".into(),
+            session_id: "sess-1".into(),
+            active_bundle_version: 3,
+            active_bundle_digest: None,
+            sent_at: Utc::now(),
+            host_profile: Some(HostProfileSummary {
+                host_tags: vec!["prod".into()],
+                expected_services: vec!["sshd.service".into()],
+                enabled_collectors: vec![
+                    crate::watch::CollectorType::SocketsListening,
+                    crate::watch::CollectorType::ConnectionsOutbound,
+                ],
+            }),
+        };
+        let encoded = serde_json::to_value(&with_profile).unwrap();
+        let decoded: AgentToControl = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, with_profile);
     }
 }
