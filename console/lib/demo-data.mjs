@@ -8,7 +8,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { GENESIS_PREV_HASH, canonicalJson, computeAuditHash, sha256Hex, verifyEntries } from './audit-chain.mjs';
 import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFingerprint } from './demo-policy.mjs';
 import { advanceDemoReasoner, buildDemoReasoner, demoRunEvents, demoRuns, demoTriggers, endRunsForIncident, logOperatorStep, openOperatorSession } from './demo-reasoner.mjs';
-import { buildDemoRules, demoBacktest, demoCreate, demoDecide, demoRevoke, demoRuleAuditEvents, listRules } from './demo-rules.mjs';
+import { RESOLVER_RULE_ID, buildDemoRules, demoBacktest, demoCreate, demoDecide, demoRevoke, demoRuleAuditEvents, listRules } from './demo-rules.mjs';
 import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
 import {
   ApiError,
@@ -99,11 +99,12 @@ const sock = (proto, addr, port, uid, inode, pid, comm, unit) => ({
   systemd_unit: unit,
 });
 
+const RESOLVER_SOCKET = sock('udp', '127.0.0.53', 53, 101, 15502, 602, 'systemd-resolve', 'systemd-resolved.service');
 const BASE_SOCKETS = [
   sock('tcp', '0.0.0.0', 22, 0, 18231, 811, 'sshd', 'sshd.service'),
   sock('tcp6', '::', 22, 0, 18233, 811, 'sshd', 'sshd.service'),
   sock('tcp', '0.0.0.0', 443, 0, 22410, 1290, 'nginx', 'nginx.service'),
-  sock('udp', '127.0.0.53', 53, 101, 15502, 602, 'systemd-resolve', 'systemd-resolved.service'),
+  RESOLVER_SOCKET,
 ];
 const ROGUE = sock('tcp', '0.0.0.0', 4444, 998, 771204, 23817, 'helperd', 'custom-helper.service');
 const sockSnap = (list, partial = false) => ({ count: list.length, partial_attribution: partial, sockets: list });
@@ -682,8 +683,13 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         .filter((o) => o.host_id === inc.host_id && scoped.has(o.watch_id) && Date.parse(o.observed_at) >= since)
         .sort((a, b) => b.observation_id - a.observation_id)
         .slice(0, 40);
+      const resolver = S.rules.find((rule) => rule.rule_id === RESOLVER_RULE_ID);
+      const rule_suppression = incidentId === 'inc-2026-0042'
+        ? { total: 1, rules: [{ rule_id: resolver.rule_id, rationale: resolver.spec.rationale, suppressed_keys: [RESOLVER_SOCKET.socket_key], count: 1 }] }
+        : null;
       return {
         incident: publicIncident(inc),
+        rule_suppression,
         active_watches: ws.map(publicWatch),
         watch_runtime: Object.fromEntries(ws.map((w) => [w.id, watchRuntime(w)])),
         recent_observations: recent,
@@ -994,7 +1000,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
 
     async rules(query = {}) {
       const q = parseRulesQuery(query);
-      return { available: true, source: enableAdmin ? 'admin' : 'investigate', rules: listRules(S, q, now()), server_time: new Date(now()).toISOString() };
+      return { available: true, source: enableAdmin ? 'admin' : 'investigate', ...listRules(S, q, now()), server_time: new Date(now()).toISOString() };
     },
 
     async backtestRule(body = {}) {

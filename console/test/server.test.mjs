@@ -925,7 +925,7 @@ describe('per-run token isolation with target/debug/control-d', { skip: !fs.exis
       assert.equal(wildcard.status, 200, wildcard.text);
       assert.equal(wildcard.json.allowed, false);
       assert.equal(wildcard.json.decision.rule_id, 'rule-gate/wildcard-bind');
-      assert.equal(typeof wildcard.json.decision.policy_version, 'number', 'policy_version is read back from the recorded decision');
+      assert.equal(typeof wildcard.json.decision.policy_version, 'number', 'policy_version comes from the gate response');
       const unknownHost = track(await post(a.port, '/api/admin/rules/backtest', { rule: rule({ scope: { host_id: 'edge-nope', collector: 'sockets.listening', watch_id: null } }) }));
       assert.equal(unknownHost.status, 404, unknownHost.text);
       assert.equal(track(await post(a.port, '/api/admin/rules', { rule: { ...rule(), extra: 1 }, actor: 'it-operator' })).status, 400);
@@ -2547,9 +2547,35 @@ describe('expectation rules (demo)', () => {
     }
   });
 
-  test('a demo trigger reports items suppressed by rules, as control-d appends it to the reason', async () => {
+  test('demo history returns each rule once across pages and validates cursors', async () => {
+    const base = '/api/rules?status=rejected,revoked,expired';
+    const all = (await get(port, base)).json.rules.map((r) => r.rule_id);
+    assert.ok(all.length >= 2);
+    const seen = [];
+    let before = null;
+    do {
+      const r = await get(port, `${base}&limit=1${before === null ? '' : `&before=${encodeURIComponent(before)}`}`);
+      assert.equal(r.status, 200, r.text);
+      assert.equal(r.json.rules.length, 1);
+      seen.push(r.json.rules[0].rule_id);
+      assert.ok(seen.length <= all.length, 'the cursor always advances');
+      before = r.json.next_before;
+    } while (before !== null);
+    assert.deepEqual(seen, all);
+    assert.equal((await get(port, `${base}&before=invalid`)).status, 400);
+  });
+
+  test('demo incident context identifies the rule responsible for suppression', async () => {
     const t = (await get(port, '/api/triggers?incident_id=inc-2026-0042')).json.triggers;
     assert.ok(t.some((x) => /\(1 suppressed by rules\)$/.test(x.reason ?? '')));
+    const ctx = (await get(port, '/api/incidents/inc-2026-0042')).json;
+    const rules = (await get(port, '/api/rules?host_id=edge-vm-07')).json.rules;
+    const resolver = rules.find((r) => r.spec.matches.some((c) => c.value === 'systemd-resolved.service'));
+    assert.deepEqual(ctx.rule_suppression, {
+      total: 1,
+      rules: [{ rule_id: resolver.rule_id, rationale: resolver.spec.rationale, suppressed_keys: ['udp:127.0.0.53:53'], count: 1 }],
+    });
+    assert.equal((await get(port, '/api/incidents/inc-2026-0039')).json.rule_suppression, null);
   });
 });
 
@@ -2565,29 +2591,34 @@ describe('expectation rules over a mock control-d', () => {
       backtest: { observations_scanned: 3, triggered_before: 2, triggered_after: 0, items_matched: 1, sample_keys: ['tcp:0.0.0.0:4444:uid=0'], currently_matching: 1 },
       created_at: now, decided_by: null, decided_at: null, decision_note: null, hit_count: 0, last_matched_at: null,
     };
+    const denial = (code, message, policy_version) => ({ admin_result: 'error', code, message, decision: { allowed: false, rule_id: code, reason: message, policy_version } });
+    const cursor = JSON.stringify([now, record.rule_id]);
+    const rule_suppression = { total: 31, rules: [{ rule_id: record.rule_id, rationale: 'Expected nginx listener', suppressed_keys: ['tcp:127.0.0.1:443'], count: 31 }] };
     const invSeen = [];
     const admSeen = [];
     const invSrv = await mockUdsServer(inv, (frame) => {
       invSeen.push(frame);
-      return frame.request.op === 'list_expectation_rules' ? { result: 'expectation_rules', rules: [{ ...record, capability_token: 'cap-LEAK' }] } : { result: 'error', code: 'invalid_request', message: 'unexpected' };
+      if (frame.request.op === 'get_incident_context') {
+        return { result: 'incident_context', incident: { incident_id: 'inc-1', host_id: 'edge-x' }, active_watches: [], recent_observations: [], findings: [],
+          rule_suppression: { ...rule_suppression, capability_token: 'cap-LEAK' } };
+      }
+      return frame.request.op === 'list_expectation_rules' ? { result: 'expectation_rules', rules: [{ ...record, capability_token: 'cap-LEAK' }], next_before: cursor } : { result: 'error', code: 'invalid_request', message: 'unexpected' };
     });
     const admSrv = await mockUdsServer(adm, (frame) => {
       admSeen.push(frame);
       switch (frame.admin_op) {
         case 'list_expectation_rules':
-          return { admin_result: 'expectation_rules', rules: [record] };
+          return frame.before === cursor ? { admin_result: 'expectation_rules', rules: [] } : { admin_result: 'expectation_rules', rules: [record], next_before: cursor };
         case 'backtest_expectation_rule':
           return frame.rule.matches.length === 1
-            ? { admin_result: 'error', code: 'rule-gate/identity-anchor', message: 'rule must constrain systemd_unit, comm, or uid with eq or in' }
+            ? denial('rule-gate/identity-anchor', 'rule must constrain systemd_unit, comm, or uid with eq or in', 6)
             : { admin_result: 'rule_backtest_result', backtest: record.backtest };
         case 'create_expectation_rule':
           return frame.rule.matches.length === 1
-            ? { admin_result: 'error', code: 'rule-gate/port-bounds', message: 'socket rule must constrain local_port within the allowed bounds' }
+            ? denial('rule-gate/port-bounds', 'socket rule must constrain local_port within the allowed bounds', 7)
             : { admin_result: 'rule_decided', rule_id: 'rule-new', status: 'active' };
-        case 'list_policy_decisions':
-          return { admin_result: 'policy_decisions', decisions: [{ decision_id: 9, proposal_id: null, actor: 'op', request_id: 'r', decision: { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'x', policy_version: 7 }, created_at: now }] };
         case 'decide_expectation_rule':
-          return { admin_result: 'rule_decided', rule_id: frame.rule_id, status: frame.approve ? 'active' : 'rejected' };
+          return frame.approve ? denial('rule-gate/expired', 'rule has expired', 8) : { admin_result: 'rule_decided', rule_id: frame.rule_id, status: 'rejected' };
         case 'revoke_expectation_rule':
           return frame.rule_id === 'rule-gone' ? { admin_result: 'error', code: 'not_found', message: 'expectation rule does not exist' } : { admin_result: 'rule_decided', rule_id: frame.rule_id, status: 'revoked' };
         default:
@@ -2603,15 +2634,25 @@ describe('expectation rules over a mock control-d', () => {
       const l1 = track(await get(ro.port, '/api/rules?status=proposed,active&host_id=edge-x&limit=20'));
       assert.equal(l1.status, 200, l1.text);
       assert.equal(l1.json.source, 'investigate');
+      assert.equal(l1.json.next_before, cursor);
       assert.deepEqual(invSeen.at(-1).request, { op: 'list_expectation_rules', limit: 20, host_id: 'edge-x', statuses: ['proposed', 'active'] });
       assert.equal(invSeen.at(-1).capability_token, 'browse-token-LEAK');
       assert.deepEqual(Object.keys(l1.json.rules[0]).sort(), RULE_KEYS);
       assert.equal(track(await post(ro.port, '/api/admin/rules/backtest', { rule: serviceRule('edge-x', null) })).status, 403);
 
+      const incident = track(await get(ro.port, '/api/incidents/inc-1'));
+      assert.deepEqual(incident.json.rule_suppression, rule_suppression);
+
       // With admin: every host.
       const l2 = track(await get(rw.port, '/api/rules'));
       assert.equal(l2.json.source, 'admin');
       assert.deepEqual(admSeen.at(-1), { admin_op: 'list_expectation_rules', limit: 100 });
+
+      assert.equal(l2.json.next_before, cursor);
+      const l3 = track(await get(rw.port, `/api/rules?before=${encodeURIComponent(cursor)}`));
+      assert.deepEqual(admSeen.at(-1), { admin_op: 'list_expectation_rules', limit: 100, before: cursor });
+      assert.deepEqual(l3.json.rules, []);
+      assert.equal(l3.json.next_before, null);
 
       const rule = serviceRule('edge-x', 'base-sockets');
       const bt = track(await post(rw.port, '/api/admin/rules/backtest', { rule }));
@@ -2621,16 +2662,19 @@ describe('expectation rules over a mock control-d', () => {
       assert.deepEqual(bt.json.backtest, record.backtest);
       const btDenied = track(await post(rw.port, '/api/admin/rules/backtest', { rule: { ...rule, matches: [{ op: 'eq', field: 'local_port', value: 4444 }] } }));
       assert.equal(btDenied.status, 200);
-      assert.deepEqual(btDenied.json.decision, { allowed: false, rule_id: 'rule-gate/identity-anchor', reason: 'rule must constrain systemd_unit, comm, or uid with eq or in', policy_version: null });
+      assert.deepEqual(btDenied.json.decision, { allowed: false, rule_id: 'rule-gate/identity-anchor', reason: 'rule must constrain systemd_unit, comm, or uid with eq or in', policy_version: 6 });
 
       const created = track(await post(rw.port, '/api/admin/rules', { rule, actor: 'op' }));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'create_expectation_rule', rule, actor: 'op' });
       assert.deepEqual([created.json.allowed, created.json.rule_id, created.json.status], [true, 'rule-new', 'active']);
       const cDenied = track(await post(rw.port, '/api/admin/rules', { rule: { ...rule, matches: [{ op: 'eq', field: 'comm', value: 'x' }] }, actor: 'op' }));
       assert.equal(cDenied.status, 200);
-      assert.deepEqual(cDenied.json.decision, { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'socket rule must constrain local_port within the allowed bounds', policy_version: 7 }, 'policy_version read back from the recorded decision');
+      assert.deepEqual(cDenied.json.decision, { allowed: false, rule_id: 'rule-gate/port-bounds', reason: 'socket rule must constrain local_port within the allowed bounds', policy_version: 7 });
 
-      track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: true, actor: 'op' }));
+      const approval = track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: true, actor: 'op' }));
+      assert.deepEqual(approval.json.decision, { allowed: false, rule_id: 'rule-gate/expired', reason: 'rule has expired', policy_version: 8 });
+      assert.equal(approval.json.status, 'proposed');
+      assert.ok(!admSeen.some((f) => f.admin_op === 'list_policy_decisions'));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'decide_expectation_rule', rule_id: 'rule-abc', approve: true, actor: 'op' }, 'a null note is omitted');
       track(await post(rw.port, '/api/admin/rules/rule-abc/decide', { approve: false, note: 'noisy', actor: 'op' }));
       assert.deepEqual(admSeen.at(-1), { admin_op: 'decide_expectation_rule', rule_id: 'rule-abc', approve: false, actor: 'op', note: 'noisy' });

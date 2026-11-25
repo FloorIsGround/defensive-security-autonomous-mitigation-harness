@@ -14,6 +14,7 @@ use defsec_protocol::{
     observation::{ObservationPayload, ObservationRecord, ObservationStatus},
     profile::HostProfileSummary,
     rpc::{PolicyDecision, Severity},
+    rules::{RuleSuppression, RuleSuppressionEntry},
     watch::{
         CollectorSpec, CompareTarget, DataClassification, TriggerPredicate, WatchClass, WatchSpec,
     },
@@ -528,7 +529,7 @@ fn ingest(
             errors,
             0,
         );
-        let outcome = if let TriggerPredicate::SetDiff {
+        let (outcome, rule_suppression) = if let TriggerPredicate::SetDiff {
             compare_against, ..
         } = &spec.trigger
             && matches!(
@@ -550,9 +551,32 @@ fn ingest(
                 &rules,
             );
             record_rule_hits(db, &evaluation.matched_rule_ids, now)?;
-            evaluation.outcome
+            let suppression = if !evaluation.suppressed.is_empty()
+                && matches!(evaluation.outcome, PredicateOutcome::Triggered { .. })
+            {
+                let rules = rules
+                    .into_iter()
+                    .filter_map(|rule| {
+                        let keys = evaluation.suppressed.get(&rule.rule_id)?;
+                        let count = evaluation.suppressed_counts[&rule.rule_id];
+                        Some(RuleSuppressionEntry {
+                            rule_id: rule.rule_id,
+                            rationale: rule.spec.rationale,
+                            suppressed_keys: keys.iter().take(20).cloned().collect(),
+                            count,
+                        })
+                    })
+                    .collect();
+                Some(RuleSuppression {
+                    total: evaluation.suppressed_counts.values().sum(),
+                    rules,
+                })
+            } else {
+                None
+            };
+            (evaluation.outcome, suppression)
         } else {
-            outcome
+            (outcome, None)
         };
         let freshness = sample.map(|_| {
             let observed = o.observed_at.min(now);
@@ -590,6 +614,7 @@ fn ingest(
                 &spec,
                 &outcome,
                 &evidence,
+                rule_suppression.as_ref(),
                 floor.expected_policy_version,
                 now,
             )?;
@@ -717,7 +742,7 @@ fn heartbeat_watch(
         db.execute("UPDATE watch_state SET outcome_json=?4 WHERE host_id=?1 AND watch_id=?2 AND spec_version=?3",
             params![spec.host_id,spec.id,spec.version,serde_json::to_string(&outcome)?])?;
         if matches!(outcome, PredicateOutcome::Triggered { .. }) {
-            trigger(db, spec, &outcome, &[], policy_version, now)?;
+            trigger(db, spec, &outcome, &[], None, policy_version, now)?;
         }
     }
     Ok(())
@@ -728,6 +753,7 @@ fn trigger(
     spec: &WatchSpec,
     outcome: &PredicateOutcome,
     evidence: &[Option<i64>],
+    rule_suppression: Option<&RuleSuppression>,
     policy_version: u32,
     now: DateTime<Utc>,
 ) -> Result<()> {
@@ -748,8 +774,10 @@ fn trigger(
         params![spec.host_id,spec.id,fingerprint,stamp(now-Duration::minutes(10))], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     let (event, incident) = if let Some((event, incident)) = prior {
         db.execute(
-            "UPDATE trigger_events SET updated_at=?2 WHERE event_id=?1",
-            params![event, stamp(now)],
+            "UPDATE trigger_events SET updated_at=?2,
+                 outcome_json=json_set(outcome_json, '$.rule_suppression', json(?3))
+             WHERE event_id=?1",
+            params![event, stamp(now), serde_json::to_string(&rule_suppression)?],
         )?;
         (event, incident)
     } else {
@@ -829,7 +857,7 @@ fn trigger(
         };
         db.execute("INSERT INTO trigger_events (incident_id,host_id,watch_id,spec_version,fingerprint,created_at,updated_at,status,outcome_json)
             VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8)", params![incident,spec.host_id,spec.id,spec.version,fingerprint,stamp(now),
-                if suppressed.is_some() {"suppressed"} else {"pending"},json!({"predicate":outcome,"suppression":suppressed,"reason":reason}).to_string()])?;
+                if suppressed.is_some() {"suppressed"} else {"pending"},json!({"predicate":outcome,"suppression":suppressed,"reason":reason,"rule_suppression":rule_suppression}).to_string()])?;
         let event = db.last_insert_rowid();
         if suppressed.is_none() {
             db.execute(

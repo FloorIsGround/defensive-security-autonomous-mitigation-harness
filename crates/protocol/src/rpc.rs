@@ -14,7 +14,7 @@ use crate::action::{
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
 use crate::profile::HostProfileSummary;
-use crate::rules::ExpectationRuleSpec;
+use crate::rules::{ExpectationRuleSpec, RuleSuppression};
 use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
@@ -183,6 +183,8 @@ pub enum InvestigationRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ProposeEphemeralWatch {
         run_id: String,
@@ -424,6 +426,8 @@ pub enum InvestigationResponse {
         active_watches: Vec<WatchSpec>,
         recent_observations: Vec<ObservationSlice>,
         findings: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_suppression: Option<RuleSuppression>,
     },
     Observations {
         observations: Vec<ObservationSlice>,
@@ -470,6 +474,8 @@ pub enum InvestigationResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     ProposalEvaluated {
         decision: PolicyDecision,
@@ -546,6 +552,8 @@ pub enum AdminRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ApplyBaselineWatch {
         spec: WatchSpec,
@@ -628,6 +636,8 @@ pub enum AdminResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     WatchApplied {
         watch_id: String,
@@ -687,6 +697,8 @@ pub enum AdminResponse {
     Error {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<PolicyDecision>,
     },
 }
 

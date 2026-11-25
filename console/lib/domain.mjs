@@ -719,7 +719,7 @@ export function parseRuleRevoke(body) {
   return { reason: requireText(body.reason, 'reason', 1024), actor: requireText(body.actor, 'actor', 128) };
 }
 
-export function parseRulesQuery({ status = null, host_id = null, limit = null } = {}) {
+export function parseRulesQuery({ status = null, host_id = null, limit = null, before = null } = {}) {
   const statuses = status
     ? [...new Set(String(status).split(',').map((s) => s.trim()).filter(Boolean))].map((s) => requireEnum(s, RULE_STATUSES, 'status'))
     : null;
@@ -727,6 +727,17 @@ export function parseRulesQuery({ status = null, host_id = null, limit = null } 
     statuses,
     host_id: host_id ? requireIdent(host_id, 'host_id') : null,
     limit: int(limit, 'limit', { min: 1, max: 100, optional: true }) ?? 100,
+    before: before === null ? null : requireText(before, 'before', 256),
+  };
+}
+
+export function publicRuleSuppression(suppression) {
+  if (!Array.isArray(suppression?.rules) || !suppression.rules.length) return null;
+  return {
+    total: suppression.total,
+    rules: suppression.rules.map(({ rule_id, rationale, suppressed_keys, count }) => ({
+      rule_id, rationale, suppressed_keys: suppressed_keys.slice(0, 20), count,
+    })),
   };
 }
 
@@ -764,5 +775,5 @@ export function publicRuleRecord(r) {
   };
 }
 
-/** control-d answers a denied admin rule op with `Error { code: "rule-gate/…", message: reason }`. */
+/** Identify legacy and current admin rule gate errors. */
 export const isRuleGateCode = (code) => typeof code === 'string' && code.startsWith('rule-gate/');

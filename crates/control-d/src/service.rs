@@ -336,7 +336,11 @@ impl ControlService {
             }
             Err(error) => {
                 let (code, message) = error.response_parts();
-                AdminResponse::Error { code, message }
+                AdminResponse::Error {
+                    code,
+                    message,
+                    decision: None,
+                }
             }
         }
     }
@@ -368,10 +372,16 @@ impl ControlService {
                 host_id,
                 statuses,
                 limit,
+                before,
             } => {
-                let response = AdminResponse::ExpectationRules {
-                    rules: rule_store.list(host_id.as_deref(), None, statuses.as_deref(), limit)?,
-                };
+                let (rules, next_before) = rule_store.list(
+                    host_id.as_deref(),
+                    None,
+                    statuses.as_deref(),
+                    limit,
+                    before.as_deref(),
+                )?;
+                let response = AdminResponse::ExpectationRules { rules, next_before };
                 if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
                     return Err(ControlError::invalid(
                         "rule list exceeds the frame limit; lower the limit or filter by host or status",
@@ -473,6 +483,7 @@ impl ControlService {
                     return Ok(AdminResponse::Error {
                         code: decision.rule_id,
                         message: decision.reason,
+                        decision: None,
                     });
                 }
                 insert_watch(db, &spec, &actor, now)?;

@@ -132,6 +132,10 @@ enum Command {
         host_id: Option<String>,
         #[arg(long = "status")]
         statuses: Vec<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        before: Option<String>,
     },
     CreateRule {
         rule_json_file: PathBuf,
@@ -255,10 +259,16 @@ impl Command {
                 return Err("command requires local operator key handling".into());
             }
             Self::Pki(_) => return Err("PKI commands operate on local files".into()),
-            Self::ListRules { host_id, statuses } => AdminRequest::ListExpectationRules {
+            Self::ListRules {
+                host_id,
+                statuses,
+                limit,
+                before,
+            } => AdminRequest::ListExpectationRules {
                 host_id,
                 statuses: (!statuses.is_empty()).then_some(statuses),
-                limit: None,
+                limit,
+                before,
             },
             Self::CreateRule {
                 rule_json_file,
@@ -547,6 +557,7 @@ mod tests {
                 host_id: Some("edge".into()),
                 statuses: Some(vec!["proposed".into(), "active".into()]),
                 limit: None,
+                before: None,
             }
         );
     }
