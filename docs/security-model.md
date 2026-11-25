@@ -16,15 +16,25 @@ An investigator token needs an explicit run-spawn grant. The control daemon
 scopes each delegated child to one open incident and its host, copies the
 parent's collector scope, caps the lifetime, and enforces four active children
 per parent principal. The child cannot delegate or manage trigger leases.
-Cancellation by the run token or by an in-scope investigator acting as the
-parent principal revokes the run token. The ledger keeps token hashes for
+Cancellation by the run token or by an unbound, in-scope investigator token
+with the run-spawn grant and matching principal revokes the run token. The ledger keeps token hashes for
 credential lookup, and the run-start audit records the delegation metadata
 without the child token.
 
 The operator MCP adapter uses its base token for fleet reads and selects each
 child token by explicit run ID for run-scoped tools. The adapter keeps child
-credentials in memory. The control and edge policy gates govern temporary
-watches, expectation rules require operator approval, and actions proposed
+credentials in memory. Run IDs become unknown to the adapter after TTL or
+restart, and the run rows remain queryable through authorized reads. The
+adapter handles calls serially, so a slow control daemon RPC can stall the
+session for the default 15-second timeout.
+
+A transport cut can leave a recorded `tool_call` without a `tool_result`.
+The operation may have applied. Check the timeline and current state before
+retrying. Watch and action proposals replay safely with the same idempotency
+key. Findings and notes have no idempotency key.
+
+The control and edge policy gates govern temporary watches. Expectation rules
+require operator approval, and actions proposed
 from a delegated run require an independent operator signature. Codex shell
 tools have their own security boundary. Run Codex under a dedicated OS user
 with a read-only sandbox and empty working directory. Keep admin and signing
