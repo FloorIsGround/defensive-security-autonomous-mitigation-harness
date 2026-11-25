@@ -265,7 +265,7 @@ impl RuleStore<'_> {
             "SELECT rule_id, effective_status, origin, proposed_by, run_id, incident_id, spec_json,
                     backtest_json, created_at, decided_by, decided_at, decision_note, hit_count, last_matched_at
              FROM (
-                 SELECT *, CASE WHEN expires_at<=?4 THEN 'expired' ELSE status END AS effective_status
+                 SELECT *, CASE WHEN status IN ('proposed','active') AND expires_at<=?4 THEN 'expired' ELSE status END AS effective_status
                  FROM expectation_rules WHERE (?1 IS NULL OR host_id=?1)
                    AND (?2 IS NULL OR host_id IN (SELECT value FROM json_each(?2)))
              )

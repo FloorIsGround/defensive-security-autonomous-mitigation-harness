@@ -458,6 +458,31 @@ fn rules_change_only_new_observations_and_record_hits_lifecycle_and_audit() {
     assert_eq!(expired[0].rule_id, live_expiry);
     assert_eq!(expired[0].hit_count, 0);
 
+    // Expiry is an overlay for rules still in force; terminal decisions keep their status.
+    for rule_id in [&rejected, &proposal_id] {
+        f.db()
+            .execute(
+                "UPDATE expectation_rules SET expires_at=?2 WHERE rule_id=?1",
+                params![rule_id, "2000-01-01T00:00:00.000000000Z"],
+            )
+            .unwrap();
+    }
+    let rejected_rules = f.list(Some(vec!["rejected".into()]));
+    assert_eq!(rejected_rules.len(), 1);
+    assert_eq!(rejected_rules[0].rule_id, rejected);
+    let revoked_rules = f.list(Some(vec!["revoked".into()]));
+    assert_eq!(revoked_rules.len(), 1);
+    assert_eq!(revoked_rules[0].rule_id, proposal_id);
+    assert_eq!(f.list(Some(vec!["expired".into()])).len(), 1);
+    assert!(matches!(
+        f.admin(AdminRequest::RevokeExpectationRule {
+            rule_id: rejected.clone(),
+            actor: "operator".into(),
+            reason: "not active".into(),
+        }),
+        AdminResponse::Error { .. }
+    ));
+
     let required: ExpectationRuleSpec = serde_json::from_value(json!({
         "scope":{"host_id":"edge","collector":"sockets.listening"},
         "matches":[{"op":"eq","field":"local_port","value":22},
