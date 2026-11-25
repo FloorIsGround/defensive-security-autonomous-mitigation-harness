@@ -481,6 +481,19 @@ mod tests {
     }
 
     #[test]
+    fn item_matching_two_rules_suppressed_once_and_both_matched() {
+        let reference = sample(&[]);
+        let current = sample(&[("k", "unit", 1)]);
+        let r1 = rule("a", RuleEffect::AllowOptional, json!([{"op":"eq","field":"systemd_unit","value":"unit"}]));
+        let r2 = rule("b", RuleEffect::AllowOptional, json!([{"op":"eq","field":"systemd_unit","value":"unit"}]));
+        let eval = apply(&current, &reference, &[r1.clone(), r2.clone()]);
+        assert_eq!(eval.matched_rule_ids, ["a", "b"]);
+        assert_eq!(eval, apply(&current, &reference, &[r2, r1]));
+        assert_eq!(eval.outcome, PredicateOutcome::NotTriggered);
+        assert_eq!(eval.suppressed["a"], vec!["k".to_string()]);
+    }
+
+    #[test]
     fn ignores_other_predicates_and_invalid_samples() {
         let current = sample(&[]);
         let rules = [rule(
