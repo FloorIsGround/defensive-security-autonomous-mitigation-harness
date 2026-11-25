@@ -317,6 +317,19 @@ class TestWorkerFailurePaths(WorkerTestBase):
         ops = [req["op"] for req in self.server.requests]
         self.assertLess(ops.index("finish_investigation_run"), ops.index("fail_trigger_lease"))
 
+    def test_unexpected_exception_fails_run_and_requeues(self) -> None:
+        def broken_step(_messages: list, _tools: list) -> dict:
+            raise KeyError("tool_calls")
+
+        worker = self.make_worker([broken_step])
+        outcome = worker.run_once()
+        self.assertEqual(outcome.status, "requeued")
+        self.assertIn("internal error: KeyError", outcome.summary)
+        self.assertEqual(self.server.triggers[0]["status"], "pending")
+        self.assertEqual(self.server.runs[0]["outcome"]["status"], "failed")
+        ops = [req["op"] for req in self.server.requests]
+        self.assertLess(ops.index("finish_investigation_run"), ops.index("fail_trigger_lease"))
+
     def test_nonretryable_provider_failure_dead_letters(self) -> None:
         script = [ProviderError("401 unauthorized", retryable=False)]
         worker = self.make_worker(script)
