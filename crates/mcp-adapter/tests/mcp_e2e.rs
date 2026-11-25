@@ -267,6 +267,7 @@ fn seed_sockets_incident(service: &ControlService) {
         active_bundle_version: 0,
         active_bundle_digest: None,
         sent_at: Utc::now(),
+        host_profile: None,
     });
     assert!(matches!(
         replies.first(),

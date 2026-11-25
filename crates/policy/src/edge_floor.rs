@@ -157,6 +157,52 @@ pub fn validate_bundle(
     cfg: &EdgeSafetyConfig,
     now: DateTime<Utc>,
 ) -> Result<BundleValidationOutcome, EdgeFloorError> {
+    validate_bundle_header(bundle, local_host_id, cfg, now)?;
+    if bundle.expires_at + Duration::seconds(cfg.max_clock_skew_seconds) < now {
+        return Err(EdgeFloorError::BundleExpired);
+    }
+    let outcome = if let Some(mark) = hwm {
+        if bundle.bundle_version < mark.bundle_version {
+            return Err(EdgeFloorError::StaleBundleVersion {
+                incoming: bundle.bundle_version,
+                current: mark.bundle_version,
+            });
+        }
+        if bundle.bundle_version == mark.bundle_version {
+            if payload_digest != mark.payload_digest {
+                return Err(EdgeFloorError::ConflictingBundleDigest {
+                    version: bundle.bundle_version,
+                });
+            }
+            BundleValidationOutcome::IdenticalRetransmission
+        } else {
+            BundleValidationOutcome::AcceptNew
+        }
+    } else {
+        BundleValidationOutcome::AcceptNew
+    };
+    validate_bundle_watches(bundle, cfg, now)?;
+    Ok(outcome)
+}
+
+/// Revalidate the cached bundle against the current floor. An expired
+/// bundle may still supply baseline watches during disconnected operation.
+pub fn validate_cached_bundle(
+    bundle: &WatchBundlePayload,
+    local_host_id: &str,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
+    validate_bundle_header(bundle, local_host_id, cfg, now)?;
+    validate_bundle_watches(bundle, cfg, now)
+}
+
+fn validate_bundle_header(
+    bundle: &WatchBundlePayload,
+    local_host_id: &str,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
     if bundle.schema_version != WATCH_BUNDLE_SCHEMA_VERSION {
         return Err(EdgeFloorError::UnsupportedSchemaVersion(
             bundle.schema_version,
@@ -182,27 +228,15 @@ pub fn validate_bundle(
     if bundle.issued_at > now + skew {
         return Err(EdgeFloorError::IssuedInFuture);
     }
-    if bundle.expires_at + skew < now {
-        return Err(EdgeFloorError::BundleExpired);
-    }
+    Ok(())
+}
 
-    if let Some(mark) = hwm {
-        if bundle.bundle_version < mark.bundle_version {
-            return Err(EdgeFloorError::StaleBundleVersion {
-                incoming: bundle.bundle_version,
-                current: mark.bundle_version,
-            });
-        }
-        if bundle.bundle_version == mark.bundle_version {
-            if payload_digest == mark.payload_digest {
-                return Ok(BundleValidationOutcome::IdenticalRetransmission);
-            }
-            return Err(EdgeFloorError::ConflictingBundleDigest {
-                version: bundle.bundle_version,
-            });
-        }
-    }
-
+fn validate_bundle_watches(
+    bundle: &WatchBundlePayload,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
+    let local_host_id = &bundle.target_host_id;
     if bundle.watches.len() > cfg.max_watches_total {
         return Err(EdgeFloorError::TooManyWatches {
             count: bundle.watches.len(),
@@ -217,7 +251,7 @@ pub fn validate_bundle(
         if !seen_ids.insert(watch.id.as_str()) {
             return Err(EdgeFloorError::DuplicateWatchId(watch.id.clone()));
         }
-        if watch.host_id != local_host_id {
+        if &watch.host_id != local_host_id {
             return Err(EdgeFloorError::InvalidWatch {
                 watch_id: watch.id.clone(),
                 reason: format!(
@@ -239,7 +273,7 @@ pub fn validate_bundle(
         });
     }
 
-    Ok(BundleValidationOutcome::AcceptNew)
+    Ok(())
 }
 
 /// Validate a single `WatchSpec` against local safety limits.
@@ -657,6 +691,27 @@ mod tests {
             policy_version: 1,
             watches,
         }
+    }
+
+    #[test]
+    fn identical_retransmission_revalidates_effective_watch_floor() {
+        let now = Utc::now();
+        let watch = sample_watch("w1", "edge-01", WatchClass::Baseline, now);
+        let collector = watch.collector.collector_type();
+        let bundle = sample_bundle("edge-01", 5, vec![watch], now);
+        let hwm = BundleHighWaterMark {
+            bundle_version: 5,
+            payload_digest: "digest-a".into(),
+        };
+        let tightened = EdgeSafetyConfig {
+            allowed_collectors: BTreeSet::new(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_bundle(&bundle, "digest-a", "edge-01", Some(&hwm), &tightened, now),
+            Err(EdgeFloorError::InvalidWatch { watch_id, reason })
+                if watch_id == "w1" && reason.contains(collector.as_str())
+        ));
     }
 
     #[test]

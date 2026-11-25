@@ -544,6 +544,7 @@ fn ingest(
                 &spec.trigger,
                 o.collector_type,
                 outcome,
+                o.status,
                 sample,
                 reference,
                 &rules,

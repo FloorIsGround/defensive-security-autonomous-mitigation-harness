@@ -16,11 +16,26 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use defsec_protocol::observation::ObservationRecord;
+use defsec_protocol::canonical::canonical_sha256_hex;
+use defsec_protocol::observation::{ObservationPayload, ObservationRecord, ObservationStatus};
+use defsec_protocol::wire::MAX_FRAME_BYTES;
 use serde::{Deserialize, Serialize};
 
 /// Per-segment target size before rolling to a new segment file.
 const SEGMENT_ROLL_BYTES: usize = 1024 * 1024;
+
+// A compact serialized ObservationRecord is spliced unchanged into this envelope.
+const OBSERVATION_FRAME_OVERHEAD: usize =
+    r#"{"msg":"push_observation_delta","observation":"#.len() + "}".len();
+
+fn fits_frame(record_bytes: usize) -> bool {
+    record_bytes <= MAX_FRAME_BYTES - OBSERVATION_FRAME_OVERHEAD
+}
+
+fn encode_record(record: &ObservationRecord) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(record)
+        .map_err(|e| std::io::Error::other(format!("serialization failed: {e}")))
+}
 
 /// Durability profile for the outbound observation buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +168,7 @@ impl ObservationSpool {
         }
         segment_ids.sort_unstable();
 
+        let mut repaired_oversized = false;
         for id in segment_ids {
             let path = self.dir.join(format!("seg-{id:08}.ndjson"));
             let text = match std::fs::read_to_string(&path) {
@@ -164,12 +180,38 @@ impl ObservationSpool {
                 if line.is_empty() {
                     continue;
                 }
-                let Ok(record) = serde_json::from_str::<ObservationRecord>(line) else {
+                let Ok(mut record) = serde_json::from_str::<ObservationRecord>(line) else {
                     // Lost/unreadable record: count it honestly.
                     self.dropped_events_total += 1;
                     continue;
                 };
-                let encoded_len = line.len();
+                let mut encoded_len = line.len();
+                if !fits_frame(encoded_len) {
+                    self.dropped_events_total += 1;
+                    repaired_oversized = true;
+                    tracing::warn!(
+                        seq_no = record.seq_no,
+                        encoded_len,
+                        "discarding oversized spooled observation payload"
+                    );
+                    // Preserve the sequence number so later records can still be acknowledged.
+                    record.status = ObservationStatus::Error;
+                    record.payload = ObservationPayload::ErrorDetail {
+                        code: "observation_frame_too_large".into(),
+                        message:
+                            "discarded a spooled observation that exceeded the wire frame limit"
+                                .into(),
+                    };
+                    record.state_hash =
+                        canonical_sha256_hex(&record.payload).map_err(std::io::Error::other)?;
+                    record.sustained_count = None;
+                    record.sustained_active = None;
+                    record.partial_reasons.clear();
+                    encoded_len = encode_record(&record)?.len();
+                    if !fits_frame(encoded_len) {
+                        continue;
+                    }
+                }
                 self.bytes_used += encoded_len;
                 self.records.push_back(SpooledRecord {
                     seq_no: record.seq_no,
@@ -182,6 +224,9 @@ impl ObservationSpool {
             }
             self.next_segment_id = self.next_segment_id.max(id + 1);
         }
+        if repaired_oversized {
+            self.compact_disk()?;
+        }
         // Enforce the cap on reload (crash may have left an over-full spool).
         self.evict_to_fit()?;
         Ok(())
@@ -189,9 +234,18 @@ impl ObservationSpool {
 
     /// Push a new observation record. For Durable, the record is appended and
     /// fsynced to the active segment before returning (durability guarantee).
-    pub fn push(&mut self, record: ObservationRecord) -> std::io::Result<()> {
-        let line = serde_json::to_vec(&record)
-            .map_err(|e| std::io::Error::other(format!("serialization failed: {e}")))?;
+    /// A record too large for the wire frame is discarded and returns `Ok(false)`.
+    pub fn push(&mut self, record: ObservationRecord) -> std::io::Result<bool> {
+        let line = encode_record(&record)?;
+        if !fits_frame(line.len()) {
+            self.dropped_events_total += 1;
+            tracing::warn!(
+                seq_no = record.seq_no,
+                encoded_len = line.len(),
+                "refusing oversized observation"
+            );
+            return Ok(false);
+        }
         let spooled = SpooledRecord {
             seq_no: record.seq_no,
             session_id: record.session_id.clone(),
@@ -214,7 +268,7 @@ impl ObservationSpool {
         }
 
         self.evict_to_fit()?;
-        Ok(())
+        Ok(true)
     }
 
     fn append_segment(&mut self, line: &[u8]) -> std::io::Result<()> {
@@ -282,8 +336,7 @@ impl ObservationSpool {
                 .mode(0o600)
                 .open(&tmp)?;
             for record in &self.records {
-                let line = serde_json::to_vec(&record.record)
-                    .map_err(|e| std::io::Error::other(format!("serialization failed: {e}")))?;
+                let line = encode_record(&record.record)?;
                 f.write_all(&line)?;
                 f.write_all(b"\n")?;
                 self.current_segment_bytes += line.len() + 1;
@@ -371,6 +424,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn spool_rejects_oversized_frames_and_repairs_legacy_queue() {
+        use defsec_protocol::wire::AgentToControl;
+
+        let dir = crate::collectors::files::temp_root("spool-oversized");
+        let profile = DurabilityProfile::Durable {
+            max_disk_bytes: 2 * MAX_FRAME_BYTES,
+        };
+        let mut spool = ObservationSpool::new(profile, &dir).unwrap();
+        let mut oversized = record(1, "session", ObservationStatus::Ok, false);
+        let small = encode_record(&oversized).unwrap().len();
+        oversized.payload = ObservationPayload::Snapshot {
+            data: serde_json::json!({"seq": "x".repeat(MAX_FRAME_BYTES - small - 2)}),
+        };
+        let encoded = encode_record(&oversized).unwrap();
+        assert!(encoded.len() < MAX_FRAME_BYTES);
+        let frame = serde_json::to_vec(&AgentToControl::PushObservationDelta {
+            observation: oversized.clone(),
+        })
+        .unwrap();
+        assert_eq!(frame.len(), encoded.len() + OBSERVATION_FRAME_OVERHEAD);
+        assert!(frame.len() > MAX_FRAME_BYTES);
+        assert!(!spool.push(oversized).unwrap());
+        assert_eq!(spool.dropped_events_total(), 1);
+        assert!(spool.pending().is_empty());
+
+        // Recreate a segment written by an older agent before the frame check existed.
+        let next = record(2, "session", ObservationStatus::Ok, false);
+        let mut segment = encoded;
+        segment.push(b'\n');
+        segment.extend(encode_record(&next).unwrap());
+        segment.push(b'\n');
+        atomic_write(&dir.join("spool/seg-00000001.ndjson"), &segment).unwrap();
+        let repaired = ObservationSpool::new(profile, &dir).unwrap();
+        assert_eq!(repaired.dropped_events_total(), 1);
+        let pending = repaired.pending();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].seq_no, 1);
+        assert!(
+            matches!(&pending[0].payload, ObservationPayload::ErrorDetail { code, .. }
+            if code == "observation_frame_too_large")
+        );
+        assert_eq!(pending[1], next);
+        let reloaded = ObservationSpool::new(profile, &dir).unwrap();
+        assert_eq!(reloaded.dropped_events_total(), 0);
+        assert_eq!(reloaded.pending(), pending);
     }
 
     #[test]

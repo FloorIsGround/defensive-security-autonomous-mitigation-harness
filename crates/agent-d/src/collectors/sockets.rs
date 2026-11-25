@@ -79,36 +79,37 @@ pub fn table_paths(include_tcp: bool, include_udp: bool, include_ipv6: bool) -> 
     tables
 }
 
-/// Decode a little-endian hex IPv4 word (e.g. `0100007F`) into dotted quad.
-pub fn decode_ipv4_hex(hex_str: &str) -> Option<String> {
-    if hex_str.len() != 8 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+/// The kernel prints address words as native-endian integers.
+fn proc_address_word(hex: &str, little_endian: bool) -> Option<[u8; 4]> {
+    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let word = u32::from_str_radix(hex_str, 16).ok()?;
-    let net = word.swap_bytes();
-    Some(format!(
-        "{}.{}.{}.{}",
-        (net >> 24) & 0xff,
-        (net >> 16) & 0xff,
-        (net >> 8) & 0xff,
-        net & 0xff
-    ))
+    let printed = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+    let network = if little_endian {
+        u32::from_le_bytes(printed)
+    } else {
+        u32::from_be_bytes(printed)
+    };
+    Some(network.to_be_bytes())
 }
 
-/// Decode a `/proc/net/tcp6` style hex IPv6 address into canonical text.
-///
-/// The kernel prints each 32-bit word of the address in host (little-endian)
-/// byte order, so each 4-byte group must be reversed.
-pub fn decode_ipv6_hex(hex_str: &str) -> Option<String> {
-    if hex_str.len() != 32 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+/// Decode a native-endian /proc IPv4 word into dotted quad.
+pub fn decode_ipv4_hex(hex: &str) -> Option<String> {
+    let bytes = proc_address_word(hex, cfg!(target_endian = "little"))?;
+    Some(std::net::Ipv4Addr::from(bytes).to_string())
+}
+
+/// Decode four native-endian /proc IPv6 words into a canonical address.
+pub fn decode_ipv6_hex(hex: &str) -> Option<String> {
+    if hex.len() != 32 || !hex.is_ascii() {
         return None;
     }
     let mut bytes = [0u8; 16];
-    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-        bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    for group in bytes.chunks_mut(4) {
-        group.reverse();
+    for (i, word) in bytes.chunks_exact_mut(4).enumerate() {
+        word.copy_from_slice(&proc_address_word(
+            &hex[i * 8..i * 8 + 8],
+            cfg!(target_endian = "little"),
+        )?);
     }
     Some(std::net::Ipv6Addr::from(bytes).to_string())
 }
@@ -124,49 +125,39 @@ pub fn decode_port_hex(hex_str: &str) -> Option<u16> {
 /// Parse one `/proc/net/{tcp,tcp6,udp,udp6}` table into raw rows.
 /// The header line is skipped; malformed lines are skipped.
 pub fn parse_proc_net_table(text: &str, protocol: &str) -> Vec<RawSocketRow> {
-    let mut rows = Vec::new();
-    for line in text.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 {
-            continue;
-        }
-        let expected_len = if protocol.ends_with('6') { 32 } else { 8 };
-        let decode_endpoint = |hex: &str| -> Option<String> {
-            if hex.len() == expected_len {
-                if expected_len == 8 {
-                    decode_ipv4_hex(hex)
-                } else {
-                    decode_ipv6_hex(hex)
-                }
-            } else {
-                None
-            }
+    text.lines()
+        .skip(1)
+        .filter_map(|line| parse_proc_net_row(line, protocol))
+        .collect()
+}
+
+pub(super) fn parse_proc_net_row(line: &str, protocol: &str) -> Option<RawSocketRow> {
+    let mut fields = line.split_whitespace();
+    fields.next()?; // slot
+    let decode_endpoint = |endpoint: &str| {
+        let (addr, port) = endpoint.split_once(':')?;
+        let addr = if protocol.ends_with('6') {
+            decode_ipv6_hex(addr)?
+        } else {
+            decode_ipv4_hex(addr)?
         };
-        let Some((local_hex, local_port_hex)) = fields[1].split_once(':') else {
-            continue;
-        };
-        let Some(local_port) = decode_port_hex(local_port_hex) else { continue };
-        let Some(local_addr) = decode_endpoint(local_hex) else { continue };
-        let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') else {
-            continue;
-        };
-        let Some(remote_port) = decode_port_hex(remote_port_hex) else { continue };
-        let Some(remote_addr) = decode_endpoint(remote_hex) else { continue };
-        let (Ok(uid), Ok(inode)) = (fields[7].parse::<u32>(), fields[9].parse::<u64>()) else {
-            continue;
-        };
-        rows.push(RawSocketRow {
-            protocol: protocol.to_string(),
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-            uid,
-            inode,
-            state_hex: fields[3].to_ascii_uppercase(),
-        });
-    }
-    rows
+        Some((addr, decode_port_hex(port)?))
+    };
+    let (local_addr, local_port) = decode_endpoint(fields.next()?)?;
+    let (remote_addr, remote_port) = decode_endpoint(fields.next()?)?;
+    let state_hex = fields.next()?.to_ascii_uppercase();
+    let uid = fields.nth(3)?.parse().ok()?;
+    let inode = fields.nth(1)?.parse().ok()?;
+    Some(RawSocketRow {
+        protocol: protocol.into(),
+        local_addr,
+        local_port,
+        remote_addr,
+        remote_port,
+        uid,
+        inode,
+        state_hex,
+    })
 }
 
 /// Stable identity key, e.g. `tcp6:[::]:22:uid=0`.
@@ -200,7 +191,9 @@ pub fn parse_proc_stat_comm(stat: &str) -> Option<String> {
 
 /// Best-effort scan of `/proc` to attribute socket inodes to processes.
 /// No privilege escalation: unreadable entries set `permission_denied`.
-pub fn scan_proc_processes() -> ProcessAttribution {
+pub async fn scan_proc_processes(
+    inodes: Option<&std::collections::HashSet<u64>>,
+) -> ProcessAttribution {
     let mut by_inode = BTreeMap::new();
     let mut permission_denied = false;
     let mut scanned_pids = 0usize;
@@ -222,6 +215,9 @@ pub fn scan_proc_processes() -> ProcessAttribution {
             continue;
         };
         scanned_pids += 1;
+        if scanned_pids.is_multiple_of(64) {
+            tokio::task::yield_now().await;
+        }
 
         let stat_text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(t) => t,
@@ -240,7 +236,10 @@ pub fn scan_proc_processes() -> ProcessAttribution {
             }
             Err(_) => continue,
         };
-        for fd in fds.flatten() {
+        for (index, fd) in fds.flatten().enumerate() {
+            if index.is_multiple_of(256) {
+                tokio::task::yield_now().await;
+            }
             // Neither readlink(2) arguments nor its result come from untrusted
             // input beyond the fixed /proc path; best-effort only.
             let Ok(target) = fd.path().read_link() else {
@@ -250,8 +249,12 @@ pub fn scan_proc_processes() -> ProcessAttribution {
             let Some(rest) = name.strip_prefix("socket:[") else {
                 continue;
             };
-            let Some(inode_str) = rest.strip_suffix(']') else { continue };
-            if let Ok(inode) = inode_str.parse::<u64>() {
+            let Some(inode_str) = rest.strip_suffix(']') else {
+                continue;
+            };
+            if let Ok(inode) = inode_str.parse::<u64>()
+                && inodes.is_none_or(|wanted| wanted.contains(&inode))
+            {
                 by_inode.entry(inode).or_insert_with(|| ProcessInfo {
                     pid,
                     pid_start_time_ticks: start_ticks.unwrap_or(0),
@@ -370,7 +373,7 @@ pub async fn collect_sockets(params: &SocketsListeningParams, _cfg: &EdgeSafetyC
     }
 
     let attribution = if params.resolve_process {
-        Some(scan_proc_processes())
+        Some(scan_proc_processes(None).await)
     } else {
         None
     };
@@ -468,6 +471,20 @@ mod tests {
             include_ipv6: true,
             resolve_process: false,
         }
+    }
+
+    #[test]
+    fn proc_address_words_decode_both_kernel_byte_orders() {
+        assert_eq!(proc_address_word("0100007F", true), Some([127, 0, 0, 1]));
+        assert_eq!(proc_address_word("7F000001", false), Some([127, 0, 0, 1]));
+        assert_eq!(
+            proc_address_word("B80D0120", true),
+            Some([0x20, 1, 0x0d, 0xb8])
+        );
+        assert_eq!(
+            proc_address_word("20010DB8", false),
+            Some([0x20, 1, 0x0d, 0xb8])
+        );
     }
 
     #[test]

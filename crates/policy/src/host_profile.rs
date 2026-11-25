@@ -4,7 +4,7 @@
 //! Safety invariant: a profile can only TIGHTEN the built-in edge floor.
 //! Caps take `min(builtin, profile)`; `enabled_collectors` intersects the
 //! built-in allowlist. `approved_file_roots` is the single additive field,
-//! and roots beneath a denied prefix (or the filesystem root) are rejected
+//! and noncanonical, overly broad, or denied roots are rejected
 //! at apply time — the hard denylist itself always stays in force at
 //! collection time.
 
@@ -142,10 +142,11 @@ fn validate_profile_metadata(host_tags: &[String], expected_services: &[String])
     Ok(())
 }
 
-/// Lexically validate one profile-supplied approved file root: absolute,
-/// normalized (no `.`/`..` traversal components), a real directory-style
-/// path (not the filesystem root), and not inside any denied prefix.
-fn validate_profile_file_root(raw: &str, cfg: &EdgeSafetyConfig) -> Result<std::path::PathBuf, String> {
+/// Require an existing, canonical directory that does not overlap a denied prefix.
+fn validate_profile_file_root(
+    raw: &str,
+    cfg: &EdgeSafetyConfig,
+) -> Result<std::path::PathBuf, String> {
     if raw.is_empty() || raw.len() > 512 {
         return Err("approved file root length must be 1..=512 bytes".into());
     }
@@ -155,9 +156,6 @@ fn validate_profile_file_root(raw: &str, cfg: &EdgeSafetyConfig) -> Result<std::
     let path = Path::new(raw);
     if !path.is_absolute() {
         return Err(format!("approved file root '{raw}' must be absolute"));
-    }
-    if path == Path::new("/") {
-        return Err("approved file root '/' is forbidden".into());
     }
     for comp in path.components() {
         match comp {
@@ -169,14 +167,33 @@ fn validate_profile_file_root(raw: &str, cfg: &EdgeSafetyConfig) -> Result<std::
             }
         }
     }
-    for denied in &cfg.denied_path_prefixes {
-        if path.starts_with(denied) {
-            return Err(format!(
-                "approved file root '{raw}' is beneath the local sensitive path denylist entry {denied:?}"
-            ));
-        }
+    if path.components().count() < 3 {
+        return Err(format!("approved file root '{raw}' is too broad"));
     }
-    Ok(path.to_path_buf())
+    let check_denylist = |path: &Path| {
+        for denied in &cfg.denied_path_prefixes {
+            if path.starts_with(denied) || denied.starts_with(path) {
+                return Err(format!(
+                    "approved file root '{raw}' overlaps local sensitive path denylist entry {denied:?}"
+                ));
+            }
+        }
+        Ok(())
+    };
+    check_denylist(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve approved file root '{raw}': {e}"))?;
+    check_denylist(&canonical)?;
+    if canonical.as_os_str() != path.as_os_str() {
+        return Err(format!(
+            "approved file root '{raw}' must be canonical and contain no symlinks"
+        ));
+    }
+    if !canonical.is_dir() {
+        return Err(format!("approved file root '{raw}' is not a directory"));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -195,7 +212,6 @@ mod tests {
                 "schema_version": 1,
                 "host_tags": ["prod", "dc:eu-west-1"],
                 "expected_services": ["sshd.service", "nginx.service"],
-                "approved_file_roots": ["/etc/app"],
                 "enabled_collectors": ["sockets.listening", "connections.outbound", "journal.unit_events"],
                 "collector_caps": { "max_outbound_flows": 128, "max_file_hash_bytes": 1048576 }
             }"#,
@@ -208,11 +224,11 @@ mod tests {
         assert_eq!(effective.max_packages, cfg.max_packages);
         assert_eq!(effective.max_journal_batch_events, cfg.max_journal_batch_events);
 
-        // Additive file root.
-        assert!(effective.approved_file_roots.contains(&std::path::PathBuf::from("/etc/app")));
-        assert!(effective
-            .approved_file_roots
-            .contains(&std::path::PathBuf::from("/etc/systemd/system")));
+        assert!(
+            effective
+                .approved_file_roots
+                .contains(&std::path::PathBuf::from("/etc/systemd/system"))
+        );
 
         // Intersected collectors: profile listed 3, all in the built-in set;
         // the summary carries them in BTreeSet (declaration) order.
@@ -268,6 +284,50 @@ mod tests {
             let err = apply_host_profile(&cfg, &profile).unwrap_err();
             assert!(err.contains(bad), "expected rejection of {bad}, got: {err}");
         }
+    }
+
+    #[test]
+    fn roots_must_be_canonical_narrow_and_outside_the_denylist() {
+        let parent = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("defsec-profile-roots-{}", std::process::id()));
+        let real = parent.join("real");
+        let link = parent.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut cfg = EdgeSafetyConfig {
+            denied_path_prefixes: vec![real.join("private")],
+            ..Default::default()
+        };
+        let mut profile = profile_json(r#"{"schema_version":1}"#);
+        for bad in [
+            real.as_path(),
+            link.as_path(),
+            Path::new("/usr"),
+            Path::new("/var"),
+            Path::new("/etc"),
+            Path::new("/home"),
+        ] {
+            profile.approved_file_roots = vec![bad.to_str().unwrap().into()];
+            assert!(apply_host_profile(&cfg, &profile).is_err(), "{bad:?}");
+        }
+        cfg.denied_path_prefixes.clear();
+        profile.approved_file_roots = vec![link.to_str().unwrap().into()];
+        assert!(
+            apply_host_profile(&cfg, &profile)
+                .unwrap_err()
+                .contains("symlinks")
+        );
+        profile.approved_file_roots = vec![real.to_str().unwrap().into()];
+        assert!(
+            apply_host_profile(&cfg, &profile)
+                .unwrap()
+                .0
+                .approved_file_roots
+                .contains(&real)
+        );
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
