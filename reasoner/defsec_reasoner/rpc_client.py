@@ -56,6 +56,8 @@ _KNOWN_RESULTS = frozenset(
         "runs",
         "run_events",
         "trigger_queue",
+        "rule_proposal_evaluated",
+        "expectation_rules",
         "proposal_evaluated",
         "finding_recorded",
         "trigger_leased",
@@ -355,6 +357,27 @@ class ControlRpcClient:
                 "idempotency_key": idempotency_key,
                 "spec": spec,
                 "rationale": rationale,
+            }
+        )
+
+    def propose_expectation_rule(
+        self, run_id: str, idempotency_key: str, rule: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Submit one typed expectation-rule proposal (``propose_expectation_rule``).
+
+        ``rule`` is an ``ExpectationRuleSpec`` object (closed schema,
+        ``deny_unknown_fields`` in control-d); it is passed through verbatim
+        for server-side validation. Returns the ``rule_proposal_evaluated``
+        payload: deterministic gate ``decision`` plus, when allowed, the
+        stored ``rule_id`` and a ``backtest``. The proposal stays inert until
+        an operator approves it on the admin interface.
+        """
+        return self.call(
+            {
+                "op": "propose_expectation_rule",
+                "run_id": str(run_id),
+                "idempotency_key": str(idempotency_key),
+                "rule": rule,
             }
         )
 

@@ -214,6 +214,7 @@ def build_system_prompt(
     """
     tools = ", ".join(sorted(tool_names))
     max_actions = int(getattr(budgets, "max_action_proposals_per_run", 1))
+    max_rules = int(getattr(budgets, "max_rule_proposals_per_run", 3))
     if enable_action_proposals:
         action_section = f"""
 TYPED MITIGATION ACTIONS (closed catalog; no shell, ever)
@@ -276,9 +277,20 @@ SCOPED PROPOSALS
   capability catalog you were given. A central deterministic policy validates
   every proposal; a rejection is final — do not retry rejected proposals.
 - {remediation_line}
+EXPECTATION RULES (proposals are inert until an operator approves them)
+- propose_expectation_rule exists for one purpose: benign recurring set-diff
+  noise from a known service, such as a unit that legitimately opens and
+  closes its own bounded listener ports. Anchor every rule to a clear service
+  identity (systemd_unit, comm, or uid) and bound its ports; investigator
+  rules must set expires_at within 30 days.
+- NEVER propose a rule to silence suspicious, unexpected, or unexplained
+  activity, and never instead of investigating a finding.
+- Proposing silences nothing by itself: an operator must review and approve
+  the rule on the admin interface before it applies.
 {action_section}
 BUDGETS (hard limits enforced outside the model)
 - At most {budgets.max_turns} tool turns, {budgets.max_proposals_per_run} watch proposals,{budget_actions}
+  {max_rules} expectation rule proposals,
   {budgets.max_total_tokens} total tokens, and ${budgets.max_cost_usd:.2f} of spend for this run.
   When you are done, stop calling tools and produce a final summary.
 """

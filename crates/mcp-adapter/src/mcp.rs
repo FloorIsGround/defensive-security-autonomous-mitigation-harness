@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, sync::Mutex, time::Duration};
 
 use clap::ValueEnum;
 use defsec_protocol::{
@@ -30,6 +30,9 @@ pub struct McpServer {
     socket: PathBuf,
     token: String,
     timeout: Duration,
+    /// The investigation run this adapter started; run-scoped proposal tools
+    /// bind to it instead of trusting a caller-supplied run_id.
+    run: Mutex<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +55,14 @@ fn empty_object() -> Value {
 type RpcError = (i32, &'static str);
 const INVALID_PARAMS: RpcError = (-32602, "Invalid params");
 const INTERNAL_ERROR: RpcError = (-32603, "Internal server error");
+const RUN_BOUND_BY_ADAPTER: RpcError = (
+    -32602,
+    "run_id is bound to the adapter's current investigation run",
+);
+const NO_ACTIVE_RUN: RpcError = (
+    -32602,
+    "No investigation run is active; call start_investigation_run first",
+);
 
 impl McpServer {
     pub fn new(mode: Mode, socket: PathBuf, token: String, timeout: Duration) -> Self {
@@ -60,6 +71,7 @@ impl McpServer {
             socket,
             token,
             timeout,
+            run: Mutex::new(None),
         }
     }
 
@@ -146,17 +158,38 @@ impl McpServer {
         let Value::Object(mut arguments) = call.arguments else {
             return Err(INVALID_PARAMS);
         };
+        if tool.name == "propose_expectation_rule" {
+            if arguments.remove("run_id").is_some() {
+                return Err(RUN_BOUND_BY_ADAPTER);
+            }
+            let run_id = self.current_run().ok_or(NO_ACTIVE_RUN)?;
+            arguments.insert("run_id".into(), json!(run_id));
+        }
         if arguments.insert("op".into(), json!(tool.name)).is_some() {
             return Err(INVALID_PARAMS);
         }
         let request =
             serde_json::from_value(Value::Object(arguments)).map_err(|_| INVALID_PARAMS)?;
         let response = self.investigate(request).await?;
+        if let InvestigationResponse::RunStarted { run_id, .. } = &response {
+            self.bind_run(run_id.clone());
+        }
         let is_error = matches!(response, InvestigationResponse::Error { .. });
         let mut payload = serde_json::to_value(response).map_err(|_| INTERNAL_ERROR)?;
         self.redact(&mut payload);
         let text = serde_json::to_string_pretty(&payload).map_err(|_| INTERNAL_ERROR)?;
         Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+    }
+
+    fn current_run(&self) -> Option<String> {
+        // A poisoned lock fails closed: no proposal leaves the adapter.
+        self.run.lock().ok().and_then(|run| run.clone())
+    }
+
+    fn bind_run(&self, run_id: String) {
+        if let Ok(mut run) = self.run.lock() {
+            *run = Some(run_id);
+        }
     }
 
     async fn investigate(
@@ -326,5 +359,40 @@ mod tests {
                 "message":["bad request [redacted]", {"detail":"[redacted]"}]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn rule_proposals_require_the_adapters_current_run() {
+        let mut server = server("fixture-secret");
+        server.mode = Mode::Investigator;
+        let reply = server
+            .handle_line(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .await
+            .unwrap();
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"propose_expectation_rule"));
+
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"propose_expectation_rule","arguments":{}}}"#;
+        // No run has been started yet: the call is refused before any RPC.
+        let reply = server.handle_line(call.as_bytes()).await.unwrap();
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["message"], NO_ACTIVE_RUN.1);
+        // The caller cannot pick the run; the adapter binds it.
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"propose_expectation_rule","arguments":{"run_id":"run-1","idempotency_key":"k","rule":{}}}}"#;
+        let reply = server.handle_line(call.as_bytes()).await.unwrap();
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["message"], RUN_BOUND_BY_ADAPTER.1);
+    }
+
+    #[tokio::test]
+    async fn run_state_is_bound_once_a_run_starts() {
+        let server = server("fixture-secret");
+        server.bind_run("run-42".into());
+        assert_eq!(server.current_run().as_deref(), Some("run-42"));
     }
 }
