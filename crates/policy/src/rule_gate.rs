@@ -176,6 +176,25 @@ fn validate_with_registry(
         );
     }
 
+    // A suppressing package rule without a name anchor (e.g. `arch = x86_64`)
+    // would hide every package change on the host, including a trojaned update.
+    if spec.effect != RuleEffect::RequirePresent
+        && matches!(entry.constraints, CollectorConstraints::Packages)
+        && !clauses.iter().any(|clause| {
+            clause.field() == "name"
+                && match clause {
+                    MatchClause::Eq { .. } | MatchClause::In { .. } => true,
+                    MatchClause::Prefix { value, .. } => value.chars().count() >= 3,
+                    MatchClause::Range { .. } => false,
+                }
+        })
+    {
+        return deny(
+            "package-name",
+            "package rule requires a name eq, in, or prefix of at least 3 characters",
+        );
+    }
+
     if spec.effect == RuleEffect::AllowOptional {
         match entry.constraints {
             CollectorConstraints::Sockets => {
@@ -231,21 +250,7 @@ fn validate_with_registry(
                     );
                 }
             }
-            CollectorConstraints::Packages => {
-                if !clauses.iter().any(|clause| {
-                    clause.field() == "name"
-                        && match clause {
-                            MatchClause::Eq { .. } | MatchClause::In { .. } => true,
-                            MatchClause::Prefix { value, .. } => value.chars().count() >= 3,
-                            MatchClause::Range { .. } => false,
-                        }
-                }) {
-                    return deny(
-                        "package-name",
-                        "package rule requires a name eq, in, or prefix of at least 3 characters",
-                    );
-                }
-            }
+            CollectorConstraints::Packages => {}
         }
     }
 
@@ -544,32 +549,34 @@ mod tests {
     }
 
     #[test]
-    fn package_allow_optional_pins_name() {
-        for (clause, expected) in [
-            (
-                json!({"op":"eq","field":"arch","value":"x86_64"}),
-                "package-name",
-            ),
-            (
-                json!({"op":"prefix","field":"name","value":"py"}),
-                "package-name",
-            ),
-            (
-                json!({"op":"prefix","field":"name","value":"pyt"}),
-                "accepted",
-            ),
-            (json!({"op":"eq","field":"name","value":"sh"}), "accepted"),
-        ] {
-            let spec = rule(RuleEffect::AllowOptional, json!([clause]));
-            let decision = validate_with_registry(
-                &spec,
-                RuleOrigin::Operator,
-                Utc::now(),
-                &RuleGateConfig::default(),
-                registry_entry("packages.inventory"),
-            );
-            assert_eq!(decision.rule_id, format!("rule-gate/{expected}"));
-            assert_eq!(decision.allowed, expected == "accepted");
+    fn suppressing_package_rules_pin_name() {
+        for effect in [RuleEffect::AllowOptional, RuleEffect::IgnoreModified] {
+            for (clause, expected) in [
+                (
+                    json!({"op":"eq","field":"arch","value":"x86_64"}),
+                    "package-name",
+                ),
+                (
+                    json!({"op":"prefix","field":"name","value":"py"}),
+                    "package-name",
+                ),
+                (
+                    json!({"op":"prefix","field":"name","value":"pyt"}),
+                    "accepted",
+                ),
+                (json!({"op":"eq","field":"name","value":"sh"}), "accepted"),
+            ] {
+                let spec = rule(effect, json!([clause]));
+                let decision = validate_with_registry(
+                    &spec,
+                    RuleOrigin::Operator,
+                    Utc::now(),
+                    &RuleGateConfig::default(),
+                    registry_entry("packages.inventory"),
+                );
+                assert_eq!(decision.rule_id, format!("rule-gate/{expected}"));
+                assert_eq!(decision.allowed, expected == "accepted");
+            }
         }
     }
 

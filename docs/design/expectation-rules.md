@@ -118,7 +118,7 @@ pub fn apply_expectation_rules(
 4. **Port bounds.** An `AllowOptional` sockets rule must constrain `local_port` (an `Eq`, `In`, or `Range` of width ≤ 1024). The exception is a rule that also pins `bind_scope = loopback`, which may use a range up to the full ephemeral span 1024–65535.
 5. **Wildcard binds.** A sockets `AllowOptional` rule that can match `bind_scope = any` (no `bind_scope` clause, or one allowing `any`) must have `systemd_unit` `Eq` and `local_port` `Eq` or `In` (≤ 8 ports).
 6. **Connections.** An `AllowOptional` rule that can match `remote_scope = public` must constrain `remote_addr` or `remote_port`.
-7. **Packages.** An `AllowOptional` rule must pin `name` with `Eq`, `In`, or a `Prefix` of at least 3 characters.
+7. **Packages.** An `AllowOptional` or `IgnoreModified` rule must pin `name` with `Eq`, `In`, or a `Prefix` of at least 3 characters.
 8. **Investigator origin.** `expires_at` is required and must be at most 30 days in the future. At most 3 rule proposals per run, and at most 20 pending proposals per host.
 9. `expires_at` in the past.
 
