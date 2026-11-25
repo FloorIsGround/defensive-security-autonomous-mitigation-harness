@@ -20,6 +20,30 @@ pub mod packages;
 pub mod sockets;
 pub mod systemd;
 
+// Reserve 512 KiB below the 2 MiB frame limit for the observation envelope.
+pub(super) const SNAPSHOT_BYTES: usize = 1536 * 1024;
+
+/// Account exactly for entries and separators, leaving space for snapshot metadata.
+pub(super) fn bounded_snapshot_entries<T: serde::Serialize>(
+    entries: impl IntoIterator<Item = T>,
+    cap: u32,
+    metadata_bytes: usize,
+) -> Vec<T> {
+    let mut retained = Vec::new();
+    let mut used = metadata_bytes;
+    for entry in entries.into_iter().take(cap as usize) {
+        let Ok(bytes) = defsec_protocol::canonical::to_canonical_json_bytes(&entry) else {
+            break;
+        };
+        used += bytes.len() + usize::from(!retained.is_empty());
+        if used > SNAPSHOT_BYTES {
+            break;
+        }
+        retained.push(entry);
+    }
+    retained
+}
+
 /// Normalized output of one collector run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectorOutput {
@@ -180,6 +204,7 @@ impl Default for FakeHostState {
                 // digest for the empty fake host.
                 status_file_sha256: sha256_hex(&[]),
                 malformed_stanzas: 0,
+                duplicate_stanzas: 0,
                 truncated: None,
                 omitted_packages: None,
             },
@@ -434,6 +459,7 @@ mod tests {
                 total_packages: 1,
                 status_file_sha256: sha256_hex(&[]),
                 malformed_stanzas: 0,
+                duplicate_stanzas: 0,
                 truncated: None,
                 omitted_packages: None,
             },

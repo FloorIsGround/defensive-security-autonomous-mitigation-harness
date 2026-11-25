@@ -10,17 +10,19 @@
 //! - Over-cap package counts produce an explicit `Partial` sample carrying
 //!   `truncated: true` and the omitted count.
 
-use std::io::Read;
+use std::collections::{BTreeMap, btree_map::Entry};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use defsec_policy::edge_floor::EdgeSafetyConfig;
-use defsec_protocol::canonical::{canonical_sha256_hex, sha256_hex};
+use defsec_protocol::canonical::{canonical_sha256_hex, to_canonical_json_bytes};
 use defsec_protocol::observation::{
     ObservationPayload, ObservationStatus, PackageInventoryEntry, PackagesInventorySnapshot,
 };
 use defsec_protocol::watch::{PackagesInventoryParams, PACKAGES_INVENTORY_DEFAULT, PACKAGES_INVENTORY_HARD_MAX};
+use sha2::{Digest, Sha256};
 
-use super::CollectorOutput;
+use super::{CollectorOutput, SNAPSHOT_BYTES, bounded_snapshot_entries};
 
 /// Default dpkg status database path.
 pub const DPKG_STATUS_PATH: &str = "/var/lib/dpkg/status";
@@ -39,151 +41,164 @@ pub fn effective_package_cap(params: &PackagesInventoryParams, cfg: &EdgeSafetyC
         .max(1)
 }
 
-/// Parse result of one dpkg status database.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedDpkgStatus {
-    /// Installed packages, sorted by `package_key` then `version`.
-    pub installed: Vec<PackageInventoryEntry>,
-    /// Number of stanzas that failed to parse and were skipped.
-    pub malformed_stanzas: u32,
-    /// Number of stanzas read in total.
-    pub total_stanzas: u32,
+/// Retain only identity and version for each installed key.
+#[derive(Debug, Default)]
+struct ParsedDpkgStatus {
+    installed: BTreeMap<String, String>,
+    malformed_stanzas: u32,
+    duplicate_stanzas: u32,
+    total_stanzas: u32,
 }
 
-/// True when a dpkg `Status:` value selects an installed package
-/// (`... installed`; `half-installed` and friends do not match).
-pub fn is_installed_status(status_value: &str) -> bool {
-    status_value.ends_with(" installed")
+pub fn is_installed_status(status: &str) -> bool {
+    status.ends_with(" installed")
 }
 
-/// One parsed stanza: ordered fields plus a malformed marker set when any
-/// line violated the debcontrol syntax.
+fn is_lower_alphanumeric(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+fn valid_package_name(name: &str) -> bool {
+    name.len() >= 2
+        && is_lower_alphanumeric(name.as_bytes()[0])
+        && name
+            .bytes()
+            .all(|b| is_lower_alphanumeric(b) || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn valid_architecture(arch: &str) -> bool {
+    arch.as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+#[derive(Default)]
 struct Stanza {
-    fields: Vec<(String, String)>,
+    package: Option<String>,
+    status: Option<String>,
+    architecture: Option<String>,
+    version: Option<String>,
+    has_lines: bool,
+    previous_field: bool,
+    previous_scalar: bool,
     malformed: bool,
 }
 
 impl Stanza {
-    fn get(&self, name: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|(field, _)| field == name)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-/// Parse a dpkg status database (debcontrol/RFC822-style stanzas separated
-/// by blank lines; continuation lines start with a space or tab).
-///
-/// A stanza is malformed — counted and skipped — when any line violates the
-/// field-line syntax, when it lacks a `Package` or `Status` field, or when
-/// an installed stanza lacks a `Version`. A missing `Architecture` is
-/// tolerated as `"unknown"` (pre-multi-arch databases).
-pub fn parse_dpkg_status(text: &str) -> ParsedDpkgStatus {
-    let mut stanzas: Vec<Stanza> = Vec::new();
-    let mut current = Stanza {
-        fields: Vec::new(),
-        malformed: false,
-    };
-    let mut opened = false;
-
-    for line in text.lines() {
+    fn read_line(&mut self, line: &str, parsed: &mut ParsedDpkgStatus) {
         if line.trim().is_empty() {
-            if opened {
-                stanzas.push(Stanza {
-                    fields: std::mem::take(&mut current.fields),
-                    malformed: current.malformed,
-                });
-                current.malformed = false;
-                opened = false;
-            }
-            continue;
+            std::mem::take(self).finish(parsed);
+            return;
         }
-        opened = true;
-        if line.starts_with(' ') || line.starts_with('\t') {
-            // Continuation of the previous field — or malformed if it opens
-            // a stanza.
-            match current.fields.last_mut() {
-                Some((_, value)) => {
-                    let stripped = line.trim_start_matches([' ', '\t']);
-                    value.push('\n');
-                    value.push_str(stripped);
-                }
-                None => current.malformed = true,
-            }
-            continue;
+        self.has_lines = true;
+        if line.starts_with([' ', '\t']) {
+            self.malformed |= !self.previous_field || self.previous_scalar;
+            return;
         }
         let Some((name, value)) = line.split_once(':') else {
-            current.malformed = true;
-            continue;
+            self.malformed = true;
+            return;
         };
-        if name.is_empty() || name.contains(' ') {
-            current.malformed = true;
-            continue;
+        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+            self.malformed = true;
+            return;
         }
-        current
-            .fields
-            .push((name.to_string(), value.trim().to_string()));
-    }
-    if opened {
-        stanzas.push(current);
+        self.previous_field = true;
+        let field = match name {
+            "Package" => Some(&mut self.package),
+            "Status" => Some(&mut self.status),
+            "Architecture" => Some(&mut self.architecture),
+            "Version" => Some(&mut self.version),
+            _ => None,
+        };
+        self.previous_scalar = field.is_some();
+        if let Some(field) = field {
+            if field.is_some() {
+                self.malformed = true;
+            } else {
+                *field = Some(value.trim().to_string());
+            }
+        }
     }
 
-    let mut installed: Vec<PackageInventoryEntry> = Vec::new();
-    let mut malformed_stanzas = 0u32;
-    for stanza in &stanzas {
-        let installed_selected = stanza
-            .get("Status")
-            .is_some_and(is_installed_status);
-        let valid = !stanza.malformed
-            && stanza.get("Package").is_some()
-            && stanza.get("Status").is_some()
-            && (!installed_selected || stanza.get("Version").is_some());
-        if !valid {
-            malformed_stanzas += 1;
-            continue;
+    fn finish(self, parsed: &mut ParsedDpkgStatus) {
+        if !self.has_lines {
+            return;
         }
-        if !installed_selected {
-            continue;
+        parsed.total_stanzas += 1;
+        let name = self.package.as_deref().unwrap_or_default();
+        let arch = self.architecture.as_deref().unwrap_or("unknown");
+        let installed = self.status.as_deref().is_some_and(is_installed_status);
+        if self.malformed
+            || !valid_package_name(name)
+            || !valid_architecture(arch)
+            || self.status.as_deref().is_none_or(str::is_empty)
+            || (installed && self.version.as_deref().is_none_or(str::is_empty))
+        {
+            parsed.malformed_stanzas += 1;
+            return;
         }
-        let name = stanza.get("Package").unwrap_or_default();
-        let arch = stanza.get("Architecture").unwrap_or("unknown");
-        installed.push(PackageInventoryEntry {
-            package_key: format!("{name}:{arch}"),
-            name: name.to_string(),
-            arch: arch.to_string(),
-            version: stanza.get("Version").unwrap_or_default().to_string(),
-        });
-    }
-    installed.sort();
+        if !installed {
+            return;
+        }
 
-    ParsedDpkgStatus {
-        installed,
-        malformed_stanzas,
-        total_stanzas: stanzas.len() as u32,
+        let version = self.version.expect("installed stanza has a version");
+        match parsed.installed.entry(format!("{name}:{arch}")) {
+            Entry::Vacant(slot) => {
+                slot.insert(version);
+            }
+            Entry::Occupied(mut slot) => {
+                parsed.duplicate_stanzas += 1;
+                if &version < slot.get() {
+                    slot.insert(version);
+                }
+            }
+        }
     }
 }
 
-/// Build the normalized snapshot from parsed entries, applying the
-/// deterministic retention rule (sorted by `package_key`, keep the first
-/// `max_packages`).
-pub fn build_packages_snapshot(
+/// Keep the sorted prefix that fits both the package count and byte budgets.
+fn build_packages_snapshot(
     parsed: &ParsedDpkgStatus,
     status_file_sha256: String,
     max_packages: u32,
 ) -> PackagesInventorySnapshot {
     let total_packages = parsed.installed.len() as u32;
-    let kept = &parsed.installed[..(max_packages as usize).min(parsed.installed.len())];
-    let omitted_packages = total_packages.saturating_sub(kept.len() as u32);
-    let truncated = omitted_packages > 0;
-    PackagesInventorySnapshot {
-        packages: kept.to_vec(),
+    let mut snapshot = PackagesInventorySnapshot {
+        packages: Vec::new(),
         total_packages,
         status_file_sha256,
         malformed_stanzas: parsed.malformed_stanzas,
-        truncated: truncated.then_some(true),
-        omitted_packages: truncated.then_some(omitted_packages),
-    }
+        duplicate_stanzas: parsed.duplicate_stanzas,
+        truncated: Some(true),
+        omitted_packages: Some(total_packages),
+    };
+    // Reserve space for the largest possible omission count before filling the array.
+    let metadata_bytes = to_canonical_json_bytes(&snapshot)
+        .expect("serializable snapshot")
+        .len();
+    let entries = parsed
+        .installed
+        .iter()
+        // Raw strings provide a cheap lower bound before cloning very large entries.
+        .take_while(|(key, version)| {
+            2 * key.len() - 1 + version.len() <= SNAPSHOT_BYTES - metadata_bytes
+        })
+        .map(|(key, version)| {
+            let (name, arch) = key.split_once(':').expect("validated package key");
+            PackageInventoryEntry {
+                package_key: key.clone(),
+                name: name.into(),
+                arch: arch.into(),
+                version: version.clone(),
+            }
+        });
+    snapshot.packages = bounded_snapshot_entries(entries, max_packages, metadata_bytes);
+    let omitted = total_packages - snapshot.packages.len() as u32;
+    snapshot.truncated = (omitted > 0).then_some(true);
+    snapshot.omitted_packages = (omitted > 0).then_some(omitted);
+    snapshot
 }
 
 fn error_output(code: &str, message: String, status: ObservationStatus) -> CollectorOutput {
@@ -233,35 +248,46 @@ pub async fn collect_packages_from(
         }
     };
 
-    // Enforce the hard read cap on the bytes actually read (no TOCTOU with
-    // a pre-stat): read at most cap+1 bytes and reject over-cap results.
-    let mut bytes = Vec::new();
-    let mut limited = file.take((MAX_STATUS_FILE_BYTES + 1) as u64);
-    if let Err(e) = limited.read_to_end(&mut bytes) {
-        return error_output(
-            "status_file_read_failed",
-            format!("failed reading {}: {e}", path.display()),
-            ObservationStatus::Error,
-        );
+    let mut reader = BufReader::new(file.take((MAX_STATUS_FILE_BYTES + 1) as u64));
+    let mut parsed = ParsedDpkgStatus::default();
+    let mut stanza = Stanza::default();
+    let mut hash = Sha256::new();
+    let mut line = Vec::new();
+    let mut bytes_read = 0;
+    let mut lines = 0usize;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(n) => bytes_read += n,
+            Err(e) => {
+                return error_output(
+                    "status_file_read_failed",
+                    format!("failed reading {}: {e}", path.display()),
+                    ObservationStatus::Error,
+                );
+            }
+        }
+        if bytes_read > MAX_STATUS_FILE_BYTES {
+            return error_output(
+                "status_file_too_large",
+                format!(
+                    "dpkg status file {} exceeds the hard read cap of {MAX_STATUS_FILE_BYTES} bytes",
+                    path.display(),
+                ),
+                ObservationStatus::Error,
+            );
+        }
+        hash.update(&line);
+        let text = String::from_utf8_lossy(&line);
+        stanza.read_line(text.trim_end_matches(['\r', '\n']), &mut parsed);
+        lines += 1;
+        if lines.is_multiple_of(256) {
+            tokio::task::yield_now().await;
+        }
     }
-    if bytes.len() > MAX_STATUS_FILE_BYTES {
-        return error_output(
-            "status_file_too_large",
-            format!(
-                "dpkg status file {} exceeds the hard read cap of {} bytes; refusing a partial parse",
-                path.display(),
-                MAX_STATUS_FILE_BYTES
-            ),
-            ObservationStatus::Error,
-        );
-    }
-
-    let status_file_sha256 = sha256_hex(&bytes);
-    let text = match String::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
-    let parsed = parse_dpkg_status(&text);
+    stanza.finish(&mut parsed);
+    let status_file_sha256 = hex::encode(hash.finalize());
 
     let max_packages = effective_package_cap(params, cfg);
     let snapshot = build_packages_snapshot(&parsed, status_file_sha256, max_packages);
@@ -273,8 +299,9 @@ pub async fn collect_packages_from(
     {
         status = ObservationStatus::Partial;
         partial_reasons.push(format!(
-            "installed package inventory of {} entries exceeds cap {max_packages}: retained the first {max_packages} by package key and omitted {omitted}",
-            snapshot.total_packages
+            "installed package inventory of {} entries exceeds cap ({max_packages} entries or {SNAPSHOT_BYTES} snapshot bytes): retained {} by package key and omitted {omitted}",
+            snapshot.total_packages,
+            snapshot.packages.len()
         ));
     }
     if snapshot.malformed_stanzas > 0 {
@@ -283,6 +310,15 @@ pub async fn collect_packages_from(
             "{} of {} stanzas in {} were malformed and skipped",
             snapshot.malformed_stanzas,
             parsed.total_stanzas,
+            path.display()
+        ));
+    }
+
+    if snapshot.duplicate_stanzas > 0 {
+        status = ObservationStatus::Partial;
+        partial_reasons.push(format!(
+            "{} duplicate installed stanzas in {} were skipped",
+            snapshot.duplicate_stanzas,
             path.display()
         ));
     }
@@ -312,6 +348,7 @@ pub async fn collect_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use defsec_protocol::canonical::sha256_hex;
     use defsec_protocol::watch::CollectorType;
 
     const STATUS_FIXTURE: &str = "\
@@ -349,6 +386,16 @@ Description: retrieves files from the web
  break the stanza parse.
 ";
 
+    fn parse_dpkg_status(text: &str) -> ParsedDpkgStatus {
+        let mut parsed = ParsedDpkgStatus::default();
+        let mut stanza = Stanza::default();
+        for line in text.lines() {
+            stanza.read_line(line, &mut parsed);
+        }
+        stanza.finish(&mut parsed);
+        parsed
+    }
+
     fn params() -> PackagesInventoryParams {
         PackagesInventoryParams { max_packages: None }
     }
@@ -364,17 +411,12 @@ Description: retrieves files from the web
         assert_eq!(parsed.malformed_stanzas, 0);
         // deinstall/config-files and half-installed are excluded; the two
         // libc6 architectures are both installed (multi-arch).
-        let names: Vec<&str> = parsed.installed.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["bash", "libc6", "libc6", "wget"]);
-        let keys: Vec<&str> = parsed
-            .installed
-            .iter()
-            .map(|p| p.package_key.as_str())
-            .collect();
-        assert_eq!(keys, vec!["bash:amd64", "libc6:amd64", "libc6:i386", "wget:all"]);
-        assert_eq!(parsed.installed[0].version, "5.2.15-2ubuntu3");
-        assert!(parsed.installed.iter().all(|p| p.name != "old-config"));
-        assert!(parsed.installed.iter().all(|p| p.name != "half-installed-pkg"));
+        let keys: Vec<_> = parsed.installed.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["bash:amd64", "libc6:amd64", "libc6:i386", "wget:all"]
+        );
+        assert_eq!(parsed.installed["bash:amd64"], "5.2.15-2ubuntu3");
         // The multi-line Description continuation was part of wget's stanza.
         assert_eq!(parsed.total_stanzas - parsed.installed.len() as u32, 2);
     }
@@ -420,9 +462,7 @@ Version: 9.9
         assert_eq!(parsed.malformed_stanzas, 5, "no-colon, empty Package field name, missing Status, installed without Version, orphan continuation");
         assert_eq!(parsed.installed.len(), 2, "good and empty-arch survive");
         // A missing Architecture is tolerated as 'unknown' (pre-multi-arch).
-        let empty_arch = parsed.installed.iter().find(|p| p.name == "empty-arch").unwrap();
-        assert_eq!(empty_arch.arch, "unknown");
-        assert_eq!(empty_arch.package_key, "empty-arch:unknown");
+        assert_eq!(parsed.installed["empty-arch:unknown"], "9.9");
     }
 
     #[test]
@@ -507,6 +547,63 @@ Version: 9.9
         assert_eq!(snap.malformed_stanzas, 1);
         assert_eq!(snap.total_packages, 1);
         assert!(out.partial_reasons.iter().any(|r| r.contains("malformed")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_byte_budget_truncates_dense_status_file_in_key_order() {
+        let version = "1".repeat(530);
+        let text: String = (0..4096).rev().map(|i| format!(
+            "Package: package-{i:04}\nStatus: install ok installed\nArchitecture: amd64\nVersion: {version}\n\n"
+        )).collect();
+        let unbounded = parse_dpkg_status(&text);
+        let unbounded_entries: Vec<_> = unbounded.installed.iter().map(|(key, version)| {
+            let (name, arch) = key.split_once(':').unwrap();
+            serde_json::json!({"package_key": key, "name": name, "arch": arch, "version": version})
+        }).collect();
+        assert!(
+            to_canonical_json_bytes(&unbounded_entries).unwrap().len()
+                > defsec_protocol::wire::MAX_FRAME_BYTES
+        );
+        let path = temp_status_file("budget", text.as_bytes());
+        let out = collect_packages_from(&params(), &cfg(), &path).await;
+        assert_eq!(out.status, ObservationStatus::Partial);
+        let ObservationPayload::Snapshot { data } = out.payload else {
+            panic!("expected snapshot")
+        };
+        assert!(to_canonical_json_bytes(&data).unwrap().len() <= SNAPSHOT_BYTES);
+        let snapshot: PackagesInventorySnapshot = serde_json::from_value(data).unwrap();
+        assert_eq!(snapshot.total_packages, 4096);
+        assert_eq!(snapshot.truncated, Some(true));
+        assert_eq!(
+            snapshot.omitted_packages,
+            Some(4096 - snapshot.packages.len() as u32)
+        );
+        assert!(snapshot.omitted_packages.unwrap() > 0);
+        for (i, entry) in snapshot.packages.iter().enumerate() {
+            assert_eq!(entry.package_key, format!("package-{i:04}:amd64"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_identities_and_deduplicates_independently_of_stanza_order() {
+        let status = |name, arch, version| {
+            format!(
+                "Package: {name}\nStatus: install ok installed\nArchitecture: {arch}\nVersion: {version}\n\n"
+            )
+        };
+        let stanzas = [
+            status("a:b", "amd64", "1"),
+            status("valid", "arch:extra", "3"),
+            status("valid", "amd64", "2"),
+            status("valid", "amd64", "1"),
+        ];
+        for input in [stanzas.concat(), stanzas.iter().rev().cloned().collect()] {
+            let parsed = parse_dpkg_status(&input);
+            assert_eq!(parsed.malformed_stanzas, 2);
+            assert_eq!(parsed.duplicate_stanzas, 1);
+            assert_eq!(parsed.installed.len(), 1);
+            assert_eq!(parsed.installed["valid:amd64"], "1");
+        }
     }
 
     #[tokio::test]

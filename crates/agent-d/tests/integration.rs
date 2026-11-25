@@ -895,6 +895,7 @@ fn scripted_new_collector_host() -> FakeHostState {
             total_packages: 1,
             status_file_sha256: sha256_hex(&[]),
             malformed_stanzas: 0,
+            duplicate_stanzas: 0,
             truncated: None,
             omitted_packages: None,
         },

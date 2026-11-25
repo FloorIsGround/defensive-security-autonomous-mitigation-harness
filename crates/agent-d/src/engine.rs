@@ -667,9 +667,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     out.extend(msgs);
                 }
                 Err(e) => {
-                    // Persistence failure: keep monitoring; the spool holds
-                    // the record for later retransmission.
-                    tracing::warn!(watch = id, error = %e, "tick persistence failure");
+                    tracing::warn!(watch = id, error = %e, "watch observation could not be spooled");
                     state_changed = true;
                 }
             }
@@ -804,11 +802,6 @@ impl<C: CollectorBackend> AgentEngine<C> {
             }
         };
 
-        // Update journal cursors whenever the collector advances them.
-        if let Some(next_cursor) = &output.next_cursor {
-            self.cursors.insert(watch_id.to_string(), next_cursor.clone());
-        }
-
         let valid_sample = output.status.is_valid_sample();
 
         // Sustained counters advance on every completed sample, even when the
@@ -918,11 +911,13 @@ impl<C: CollectorBackend> AgentEngine<C> {
         }
 
         if !emit {
+            if let Some(next_cursor) = output.next_cursor {
+                self.cursors.insert(watch_id.to_string(), next_cursor);
+            }
             return Ok(Vec::new());
         }
 
         let seq_no = self.next_seq_no;
-        self.next_seq_no += 1;
         let record = ObservationRecord {
             host_id: self.host_id.clone(),
             session_id: self.session_id.clone(),
@@ -943,7 +938,16 @@ impl<C: CollectorBackend> AgentEngine<C> {
         // The spool push satisfies the durability guarantee (Durable syncs
         // the segment); only then may cursors be checkpointed.
         let to_send = record.clone();
-        self.spool.push(record)?;
+        // Consume the sequence on an I/O error, where a write could have partially
+        // succeeded. Only a definite pre-write rejection can reuse it.
+        self.next_seq_no += 1;
+        if !self.spool.push(record)? {
+            self.next_seq_no -= 1;
+            return Ok(Vec::new());
+        }
+        if let Some(next_cursor) = output.next_cursor {
+            self.cursors.insert(watch_id.to_string(), next_cursor);
+        }
         let _ = self.persist_cursors();
 
         Ok(vec![AgentToControl::PushObservationDelta {

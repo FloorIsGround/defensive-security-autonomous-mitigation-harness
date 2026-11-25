@@ -135,7 +135,8 @@ pub enum FlowAttribution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundFlowEntry {
-    /// Stable identity: `<proto>:<remote_addr>:<remote_port>:<uid>:<comm or '?'>`
+    /// Stable identity: protocol, IPv6-bracketed remote address, port, uid,
+    /// and percent-encoded comm separated by colons. A bare '?' means absent.
     pub flow_key: String,
     /// `tcp` | `tcp6` | `udp` | `udp6`
     pub protocol: String,
@@ -161,7 +162,7 @@ pub struct ConnectionsOutboundSnapshot {
     /// Total flow groups found after filtering, including any omitted groups.
     pub total_flows: u32,
     pub attribution_partial: bool,
-    /// Present only when flow groups beyond the cap were omitted.
+    /// Present when the row, group, or serialized-size limit was reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,11 +192,18 @@ pub struct PackagesInventorySnapshot {
     /// Stanzas that failed to parse and were skipped.
     #[serde(default)]
     pub malformed_stanzas: u32,
+    /// Duplicate installed stanzas for an already observed package key.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub duplicate_stanzas: u32,
     /// Present only when packages beyond the cap were omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omitted_packages: Option<u32>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Bounded, redacted journal record emitted by `journal.unit_events`.
