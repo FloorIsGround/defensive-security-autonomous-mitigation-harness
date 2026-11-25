@@ -38,23 +38,34 @@ reasoner/
   disabled by default**; when enabled, the grammar is the closed catalog
   `nft_block_ip` / `systemd_stop_unit` / `host_isolate` only, with per-run caps,
   mandatory verified `observation_id` evidence, and a mandatory rollback plan.
-* All monitored host data (observations, journal lines, socket fields,
-  baselines, trigger outcomes) is wrapped in explicit
+* Observation payloads, journal lines, baselines, and trigger outcomes are wrapped in explicit
   `<untrusted_telemetry source="…" host_id="…" observation_id="…" state_hash="…">`
   envelopes with strict byte clipping; injected `</untrusted_telemetry>`
   close tags are neutralized. The trusted system prompt instructs the model
   to treat envelope content as data, cite exact `observation_id`s, and
-  distinguish observed fact vs. hypothesis vs. verified finding.
+  distinguish observed fact vs. hypothesis vs. verified finding. The small
+  `trigger_diff` in the run header also contains untrusted identities.
 * Even a fully hijacked model hits the **central deterministic policy gate**
   in `control-d`: baseline watches are untouchable, sensitive paths
   (`/etc/shadow`, host keys) are denied, sub-floor polling intervals are
   rejected, and every decision is durably audited.
-* Runs are bounded by `RunBudgets` (default: 6 turns, 45 s wall, 16 000
-  tokens, $0.25, 3 proposals, 32 KiB context, 120 s lease). Typed mitigation
-  actions are off by default; when enabled they are separately capped at
+* Runs default to 6 turns, 45 seconds, 48,000 tokens, $0.25, 3 watch proposals,
+  a 24 KiB initial context, a 32 KiB conversation context, and a 120-second
+  lease. Use `--max-turns` and `--max-total-tokens` to override the turn and
+  token budgets. Pass `--enable-action-proposals` to enable typed mitigation
+  proposals. When enabled, they are separately capped at
   `max_action_proposals_per_run=1` with local rejection of any excess.
-  Provider failure requeues with bounded backoff (5 attempts → dead-letter);
-  expired leases are fenced so stale workers can never commit results.
+  Retryable provider failures requeue with bounded backoff and dead-letter
+  after five attempts. Lease completion checks the fencing token and expiry.
+
+* The initial context includes the newest observation per watch and the
+  trigger's cited evidence from the incident context. Set payloads are bounded
+  and prioritize changed identities. Pass `focus_keys` to the
+  `query_observations` model tool to inspect other identities.
+* Run progress is best-effort. Inspect runs, event pages, and queue state with
+  `list_investigation_runs`, `get_run_events`, and `list_trigger_queue`.
+  The worker records the terminal summary and counters after saving evidence
+  and before completing the trigger lease.
 
 ## Quick start
 

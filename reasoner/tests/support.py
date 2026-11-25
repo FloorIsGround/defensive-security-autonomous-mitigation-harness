@@ -106,6 +106,7 @@ class FakeControlServer:
         self.proposals: list[dict[str, Any]] = []
         self.action_proposals: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
+        self.progress_error: str | None = None
         self.requests: list[dict[str, Any]] = []
         self.completed_events: list[int] = []
         self.last_envelope: dict[str, Any] | None = None
@@ -246,6 +247,16 @@ class FakeControlServer:
         run = {"run_id": str(uuid.uuid4()), "incident_id": "inc-1", "expires_at": "2026-11-24T13:00:00Z"}
         self.runs.append(run)
         return {"result": "run_started", **run}
+
+    def _op_report_run_progress(self, req: dict[str, Any]) -> dict[str, Any]:
+        if self.progress_error is not None:
+            return self._error(self.progress_error, "simulated progress failure")
+        return {"result": "run_progress_recorded", "run_id": req["run_id"], "event_seq": len(self.requests)}
+
+    def _op_finish_investigation_run(self, req: dict[str, Any]) -> dict[str, Any]:
+        run = next(run for run in self.runs if run["run_id"] == req["run_id"])
+        run["outcome"] = req["outcome"]
+        return {"result": "run_finished", "run_id": run["run_id"], "status": req["outcome"]["status"]}
 
     def _op_propose_ephemeral_watch(self, req: dict[str, Any]) -> dict[str, Any]:
         spec = req["spec"]
