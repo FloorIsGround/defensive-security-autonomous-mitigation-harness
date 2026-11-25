@@ -25,6 +25,7 @@ if str(TESTS_ROOT) not in sys.path:
 import unittest  # noqa: E402
 
 from defsec_reasoner.models import ScriptedMockAdapter  # noqa: E402
+from defsec_reasoner.canonical import canonical_json, sha256_hex  # noqa: E402
 from defsec_reasoner.provenance import build_system_prompt, envelope_contents  # noqa: E402
 from defsec_reasoner.rpc_client import ControlRpcClient  # noqa: E402
 from defsec_reasoner.worker import (  # noqa: E402
@@ -347,6 +348,38 @@ class TestActionProposalsEnabled(ActionTestBase):
         self.assertEqual(results[1]["error"], "budget")
         self.assertIn("exhausted", results[1]["detail"])
         self.assertEqual(self.server.completed_events, [1])
+
+    def test_action_auto_idempotency_key_is_deterministic(self) -> None:
+        args = action_arguments(nft_verb())
+        worker = self.make_worker(
+            [
+                {"tool_calls": [
+                    {"name": "propose_action", "arguments": args},
+                    {"name": "propose_action", "arguments": dict(args)},
+                ]},
+                {"final_text": "done"},
+            ],
+            budgets=self.enabled_budgets(max_action_proposals_per_run=2),
+        )
+        outcome = worker.run_once()
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.action_proposals_submitted, 2)
+        requests = [r for r in self.server.requests if r["op"] == "propose_action"]
+        self.assertEqual(len(requests), 2)
+        # Identical verb + evidence + effect/blast/rollback derive the same
+        # key (control-d replays the receipt); distinct proposals differ.
+        self.assertEqual(requests[0]["idempotency_key"], requests[1]["idempotency_key"])
+        material = canonical_json(outcome.run_id) + canonical_json({
+            "verb": nft_verb(),
+            "evidence_observation_ids": [11],
+            "expected_effect": args["expected_effect"],
+            "blast_radius": args["blast_radius"],
+            "rollback_plan": args["rollback_plan"],
+        })
+        self.assertEqual(
+            requests[0]["idempotency_key"], "auto-" + sha256_hex(material.encode("utf-8"))[:32]
+        )
 
     def test_dual_signed_host_isolate_stays_pending_approval(self) -> None:
         worker = self.make_worker(

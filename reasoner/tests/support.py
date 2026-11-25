@@ -22,6 +22,7 @@ if str(REASONER_ROOT) not in sys.path:
     sys.path.insert(0, str(REASONER_ROOT))
 
 from defsec_reasoner.wire import MAX_FRAME_BYTES, read_frame, send_frame  # noqa: E402
+from defsec_reasoner.canonical import canonical_json  # noqa: E402
 
 CAPABILITIES = [
     {
@@ -47,6 +48,14 @@ CAPABILITIES = [
 MAX_RETRIES = 5
 
 
+class DropConnection(Exception):
+    """Raised by a handler after durably committing: the reply is never sent.
+
+    Simulates control-d dying between commit and response so the worker's
+    lost-response retry path is testable.
+    """
+
+
 class FakeControlServer:
     """Threaded AF_UNIX server speaking the Investigation RPC contract."""
 
@@ -62,6 +71,7 @@ class FakeControlServer:
         action_policy: Callable[[dict[str, Any]], tuple[bool, str, str]] | None = None,
         action_auth_modes: dict[str, str] | None = None,
         triggers: list[dict[str, Any]] | None = None,
+        fixed_run_id: str | None = None,
     ) -> None:
         self.socket_path = str(socket_path)
         self.lease_seconds = lease_seconds
@@ -73,6 +83,11 @@ class FakeControlServer:
         #: Optional hard error for propose_expectation_rule (mirrors control-d
         #: refusing the call itself, e.g. a run-scope violation).
         self.rule_error: dict[str, str] | None = None
+        #: When set, the next committed rule proposal stores its receipt and
+        #: then drops the connection without replying (lost response).
+        self.drop_rule_reply = False
+        #: Pinned run_id for start_investigation_run (key-stability tests).
+        self.fixed_run_id = fixed_run_id
         self.action_policy = action_policy or (lambda verb: (True, "policy.action_ok", "ok"))
         #: Per-verb authorization tier, mirroring Phase 8's policy engine.
         self.action_auth_modes = dict(
@@ -111,6 +126,9 @@ class FakeControlServer:
         self.findings: list[dict[str, Any]] = []
         self.proposals: list[dict[str, Any]] = []
         self.rule_proposals: list[dict[str, Any]] = []
+        #: (run_id, idempotency_key) -> (canonical spec, stored response):
+        #: control-d's expectation_rule_proposal_receipts stand-in.
+        self.rule_receipts: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
         self.action_proposals: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
         self.progress_error: str | None = None
@@ -187,7 +205,10 @@ class FakeControlServer:
                 self.last_envelope = envelope
                 request = envelope.get("request") or {}
                 self.requests.append(request)
-                reply = self.dispatch(request)
+                try:
+                    reply = self.dispatch(request)
+                except DropConnection:
+                    break
                 try:
                     send_frame(conn, reply, MAX_FRAME_BYTES)
                 except Exception:
@@ -251,7 +272,7 @@ class FakeControlServer:
         return {"result": "baseline_summary", "host_id": req["host_id"], "baselines": []}
 
     def _op_start_investigation_run(self, _req: dict[str, Any]) -> dict[str, Any]:
-        run = {"run_id": str(uuid.uuid4()), "incident_id": "inc-1", "expires_at": "2026-11-24T13:00:00Z"}
+        run = {"run_id": self.fixed_run_id or str(uuid.uuid4()), "incident_id": "inc-1", "expires_at": "2026-11-24T13:00:00Z"}
         self.runs.append(run)
         return {"result": "run_started", **run}
 
@@ -287,12 +308,23 @@ class FakeControlServer:
         if self.rule_error is not None:
             return self._error(self.rule_error["code"], self.rule_error["message"])
         rule = req["rule"]
+        key = req["idempotency_key"]
+        # Mirrors control-d's expectation_rule_proposal_receipts
+        # (crates/control-d/src/expectation_rules.rs): the same
+        # (run_id, idempotency_key) with the same canonical spec replays the
+        # original response; the same key with a different spec conflicts.
+        spec = canonical_json(rule)
+        prior = self.rule_receipts.get((req["run_id"], key))
+        if prior is not None:
+            if prior[0] != spec:
+                return self._error("conflict", "idempotency key was reused with a different rule")
+            return prior[1]
         allowed, gate_rule_id, reason = self.rule_policy(rule)
         self.rule_proposals.append(
-            {"rule": rule, "allowed": allowed, "rule_id": gate_rule_id, "key": req["idempotency_key"]}
+            {"rule": rule, "allowed": allowed, "rule_id": gate_rule_id, "key": key}
         )
         if not allowed:
-            return {
+            response = {
                 "result": "rule_proposal_evaluated",
                 "decision": {
                     "allowed": False,
@@ -303,24 +335,31 @@ class FakeControlServer:
                 "rule_id": None,
                 "backtest": None,
             }
-        return {
-            "result": "rule_proposal_evaluated",
-            "decision": {
-                "allowed": True,
-                "rule_id": gate_rule_id,
-                "reason": "expectation rule satisfies policy",
-                "policy_version": 1,
-            },
-            "rule_id": f"rule-{len(self.rule_proposals)}",
-            "backtest": {
-                "observations_scanned": 2,
-                "triggered_before": 1,
-                "triggered_after": 0,
-                "items_matched": 1,
-                "sample_keys": ["tcp:127.0.0.5:4002"],
-                "currently_matching": 1,
-            },
-        }
+        else:
+            response = {
+                "result": "rule_proposal_evaluated",
+                "decision": {
+                    "allowed": True,
+                    "rule_id": gate_rule_id,
+                    "reason": "expectation rule satisfies policy",
+                    "policy_version": 1,
+                },
+                "rule_id": f"rule-{len(self.rule_proposals)}",
+                "backtest": {
+                    "observations_scanned": 2,
+                    "triggered_before": 1,
+                    "triggered_after": 0,
+                    "items_matched": 1,
+                    "sample_keys": ["tcp:127.0.0.5:4002"],
+                    "currently_matching": 1,
+                },
+            }
+        self.rule_receipts[(req["run_id"], key)] = (spec, response)
+        if self.drop_rule_reply:
+            # The proposal committed; the connection dies before the reply.
+            self.drop_rule_reply = False
+            raise DropConnection()
+        return response
 
     def _op_record_hypothesis_or_finding(self, req: dict[str, Any]) -> dict[str, Any]:
         known = {o["observation_id"] for o in self.observations}
