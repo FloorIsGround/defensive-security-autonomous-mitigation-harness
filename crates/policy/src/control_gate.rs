@@ -418,4 +418,77 @@ mod tests {
             WakeDecision::Allow
         );
     }
+
+    #[test]
+    fn new_collectors_are_admissible_for_ephemeral_proposals_within_bounds() {
+        use defsec_protocol::watch::{ConnectionsOutboundParams, PackagesInventoryParams};
+
+        let now = Utc::now();
+        let mut cfg = ControlPolicyConfig::default();
+        let mut cap = make_cap(PrincipalRole::Investigator, now);
+        cap.allowed_collectors = vec![
+            CollectorType::ConnectionsOutbound,
+            CollectorType::PackagesInventory,
+        ];
+
+        let mut outbound = make_spec("e-out", WatchClass::Ephemeral, "edge-07", "sshd.service", now);
+        outbound.collector = CollectorSpec::ConnectionsOutbound(ConnectionsOutboundParams {
+            include_tcp: true,
+            include_udp: false,
+            include_ipv6: true,
+            resolve_process: true,
+            exclude_loopback: true,
+            max_flows: Some(256),
+        });
+        let d = evaluate_watch_proposal(&cap, &outbound, &ProposalContext::default(), &cfg, now);
+        assert!(d.allowed, "valid outbound proposal must pass: {}", d.reason);
+
+        // Out of local bounds: rejected through the shared safety floor.
+        let mut over = outbound.clone();
+        over.id = "e-out2".into();
+        if let CollectorSpec::ConnectionsOutbound(p) = &mut over.collector {
+            p.max_flows = Some(600);
+        }
+        let d = evaluate_watch_proposal(&cap, &over, &ProposalContext::default(), &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "spec.safety_floor");
+        assert!(d.reason.contains("max_flows 600"));
+
+        let mut packages = make_spec("e-pkg", WatchClass::Ephemeral, "edge-07", "sshd.service", now);
+        packages.collector = CollectorSpec::PackagesInventory(PackagesInventoryParams {
+            max_packages: Some(1024),
+        });
+        let d = evaluate_watch_proposal(&cap, &packages, &ProposalContext::default(), &cfg, now);
+        assert!(d.allowed, "valid packages proposal must pass: {}", d.reason);
+
+        let mut over_pkg = packages.clone();
+        over_pkg.id = "e-pkg2".into();
+        if let CollectorSpec::PackagesInventory(p) = &mut over_pkg.collector {
+            p.max_packages = Some(0);
+        }
+        let d = evaluate_watch_proposal(&cap, &over_pkg, &ProposalContext::default(), &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "spec.safety_floor");
+        assert!(d.reason.contains("max_packages 0"));
+
+        // A capability scoped to other collectors denies both new types.
+        let mut narrow_cap = cap.clone();
+        narrow_cap.allowed_collectors = vec![CollectorType::SystemdUnitState];
+        let d = evaluate_watch_proposal(&narrow_cap, &outbound, &ProposalContext::default(), &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "scope.collector_denied");
+
+        // A host profile tightened floor is honored centrally as well: the
+        // control gate mirrors the same bounds because it applies the edge
+        // floor verbatim.
+        cfg.edge_floor.max_outbound_flows = 32;
+        let mut beyond = outbound.clone();
+        beyond.id = "e-out3".into();
+        if let CollectorSpec::ConnectionsOutbound(p) = &mut beyond.collector {
+            p.max_flows = Some(33);
+        }
+        let d = evaluate_watch_proposal(&cap, &beyond, &ProposalContext::default(), &cfg, now);
+        assert!(!d.allowed);
+        assert_eq!(d.rule_id, "spec.safety_floor");
+    }
 }

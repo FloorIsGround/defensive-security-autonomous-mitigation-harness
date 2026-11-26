@@ -143,7 +143,7 @@ To revoke a compromised host certificate immediately for new connections:
 admin-cli pki revoke <SERIAL_HEX> --revoked-file ./pki/revoked_serials.json --reason "host decommissioned"
 ```
 
-A baseline watch file has this shape. Collector parameters are a closed schema; replace the `collector` object with one of the four examples below and use a unique `id` per watch. Check local policy floors and choose paths and units appropriate to the host.
+A baseline watch file has this shape. Collector parameters are a closed schema; replace the `collector` object with one of the examples below and use a unique `id` per watch. Check local policy floors and choose paths and units appropriate to the host.
 
 ```json
 {
@@ -170,6 +170,14 @@ Other collector objects:
 {"type":"journal.unit_events","parameters":{"unit":"sshd.service","min_priority":6,"max_events_per_batch":100,"max_message_bytes":512}}
 ```
 
+```json
+{"type":"connections.outbound","parameters":{"include_tcp":true,"include_udp":true,"include_ipv6":true,"resolve_process":true,"exclude_loopback":true,"max_flows":256}}
+```
+
+```json
+{"type":"packages.inventory","parameters":{"max_packages":4096}}
+```
+
 Apply and manage with the admin socket; use IDs returned by the system:
 
 ```sh
@@ -181,6 +189,60 @@ admin-cli --admin-sock ./run-data/admin.sock close-incident INCIDENT_ID --actor 
 ```
 
 Store tokens securely; token output is sensitive. Scope hosts, collectors and incident as narrowly as needed. Use `list-hosts` and `list-incidents` for discovery. Audit verification checks the stored chain; retain an external checkpoint if you need to detect ledger replacement or truncation.
+
+## Host profiles and additional collectors
+
+Two zero-root snapshot collectors extend the baseline view on Ubuntu/Debian hosts:
+
+- `connections.outbound` groups sockets from `/proc/net/{tcp,tcp6,udp,udp6}` by protocol, remote endpoint, UID, and process name. Flow keys bracket IPv6 addresses and percent-encode process names, for example `tcp6:[2001:db8::1]:443:1000:worker%3A1`. A bare `?` denotes missing attribution, while a process named `?` is encoded as `%3F`. TCP listeners, established connections on local listening ports in the same table, TCP `TIME_WAIT` and `CLOSE`, and unconnected remotes are excluded. The default loopback filter includes IPv4-mapped loopback. Each table is limited to 65,536 rows. When a TCP table exceeds the row cap, its established rows are omitted because later rows may contain listeners. Incomplete table reads and process attribution produce explicit health reasons. The flow group cap defaults to 256 with a hard max of 1,024 and a local ceiling of 512.
+- `packages.inventory` scans installed stanzas from `/var/lib/dpkg/status` and reports `<name>:<arch>` entries with the file's SHA-256. The hard 32 MiB read cap produces an error if exceeded. Invalid package names and architectures count as malformed stanzas. Duplicate installed stanzas are counted separately and the lexicographically smallest version string is kept for each key. The package cap defaults to 4,096 with a hard max and local ceiling of 16,384. [Debian package name rules](https://www.debian.org/doc/debian-policy/ch-controlfields.html#source)
+
+Both collectors are part of the default allowlist and honor the same interval, timeout, and ephemeral bounds as the original four. They retain the key-sorted prefix that fits both the item cap and a 1.5 MiB canonical snapshot budget. Count or byte truncation produces `partial`, `truncated: true`, and a known omitted count. Row truncation can leave the total unknown and reports the capped table in the partial reasons. The spool enforces the full 2 MiB wire frame limit, including the observation envelope. On restart, older oversized spool entries are replaced by bounded error observations at the same sequence number so later entries can still be acknowledged.
+
+`agent-d --profile <PATH>` optionally applies an admin-owned host profile at startup. The profile is local configuration and can only tighten built-in caps and the collector allowlist. The one additive field, `approved_file_roots`, accepts existing directories whose configured paths exactly match their canonical paths. This excludes symlinks anywhere in the path. The filesystem root, all top-level directories, and paths at, below, or containing a denied path are rejected. File collection also checks the path of the opened descriptor against the approved roots and denylist before reading. A bundle that fails the effective floor is rejected through normal bundle acknowledgment, including cached bundles on startup and identical retransmissions.
+
+Example profile:
+
+```json
+{
+  "schema_version": 1,
+  "host_tags": ["prod", "dc:eu-west-1"],
+  "expected_services": ["sshd.service", "nginx.service"],
+  "approved_file_roots": ["/etc/myapp"],
+  "enabled_collectors": ["sockets.listening", "connections.outbound", "packages.inventory"],
+  "collector_caps": { "max_outbound_flows": 128, "max_packages": 2048, "max_file_hash_bytes": 1048576 }
+}
+```
+
+`host_tags` must match `^[a-z0-9][a-z0-9:._-]{0,63}$` (at most 16); `expected_services` are validated systemd unit names (at most 64); `approved_file_roots` holds at most 32 normalized absolute paths. The agent opens the profile once and accepts only regular, valid UTF-8 files owned by root or the agent user, with a 64 KiB read limit. The file must be writable only by its owner. Every ancestor through `/` must be a real directory owned by root or the agent user. Group or world write access is permitted only on root-owned ancestors with the sticky bit set. The applied summary (tags, expected services, effective collectors) is reported to the control plane on registration; the control plane treats it as informational.
+
+### Onboard a host with a role template
+
+Generate the profile on the operator side and install the JSON at the agent's `--profile` path. Restart or start the agent so it registers the effective profile. Preview the role watches before applying them to the enrolled host.
+
+```sh
+admin-cli profile-template --role server --tag prod --tag region:west \
+  --expected-service ssh.service > edge-01.profile.json
+admin-cli apply-profile --host edge-01 --role server --dry-run
+admin-cli apply-profile --host edge-01 --role server --actor alice
+admin-cli list-hosts --tag region:west
+```
+
+| Role | Baseline watches |
+| --- | --- |
+| `desktop` | Listening sockets every 30 seconds, package inventory every 15 minutes, and outbound connections every 5 minutes |
+| `server` | Desktop collectors with outbound connections every minute, plus the hash and metadata of `/etc/ssh/sshd_config` every 5 minutes |
+| `bastion` | Server watches plus a redacted `ssh.service` journal batch every 30 seconds |
+
+The generated profile enables the role's listed collectors. Check the host's existing watches when installing a profile because the agent rejects bundles containing a disabled collector. The file collector's sensitive-path denylist includes `/etc/sudoers`. The bastion journal watch targets Debian/Ubuntu's `ssh.service` and requires journal read access. Its set diff compares successive emitted batches by cursor. Expected services appear in the host summary as inventory metadata.
+
+`apply-profile` uses the existing baseline watch and signed bundle path. It uses stable watch IDs per collector and updates their versions on repeat application. Each watch is applied separately. A rejection stops the command, and earlier successful watches stay applied. The command prints the responses it received and exits with a failure code on rejection. Omit `--actor` to record the actor as `operator`.
+
+### Discover tags and review profile drift
+
+The host listing exposes the last valid reported profile. The admin and investigation `list_hosts` operations and the MCP tool accept an exact `tag` filter. Investigation listings continue to respect capability host scope. An agent registers its summary on each connection. A missing summary clears the last report, and a summary that fails profile validation is cleared and logged while registration continues.
+
+The audit chain records `host_profile_changed` with the previous and current summaries, including collector disablement and clearing. Summaries are compared order-insensitively, so reordering tags or collectors is not drift. It records `host_profile_rejected` with the validation failure, once per distinct failure, so an agent resending the same malformed profile cannot flood the chain. The reported summary is advisory and never blocks baseline watch admission: a compromised host must not be able to veto detection by claiming its collectors are disabled. Admission always uses the central policy, and an honest agent enforces its local profile when it receives the signed bundle, rejecting a disabled collector with an explicit bundle acknowledgment reason. Treat an unexpected `host_profile_changed` that disables collectors as a security event.
 
 ## Interactive clients and reasoner
 

@@ -29,7 +29,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::expectation_rules::RuleStore;
-use crate::ledger::{self, audit, json_column, rows};
+use crate::ledger::{self, audit, json_column, optional_json, rows};
 use crate::server::Registry;
 
 #[path = "actions.rs"]
@@ -448,6 +448,10 @@ impl ControlService {
                     allowed_collectors: vec![],
                     expires_at: now + Duration::seconds(1),
                 };
+                // The reported profile is advisory: a compromised agent must not be
+                // able to veto detection by claiming collectors are disabled. Drift is
+                // audited at registration, and an honest edge rejects disabled
+                // collectors itself with an explicit BundleAck reason.
                 let decision = evaluate_watch_proposal(
                     &capability,
                     &spec,
@@ -616,9 +620,17 @@ impl ControlService {
                     retired_ephemeral_watches: retired,
                 })
             }
-            AdminRequest::ListHosts => Ok(AdminResponse::Hosts {
-                hosts: list_hosts(db)?,
-            }),
+            AdminRequest::ListHosts { tag } => {
+                let response = AdminResponse::Hosts {
+                    hosts: list_hosts(db, tag.as_deref())?,
+                };
+                if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
+                    return Err(ControlError::invalid(
+                        "host list exceeds the frame limit; filter by tag",
+                    ));
+                }
+                Ok(response)
+            }
             AdminRequest::ListIncidents => Ok(AdminResponse::Incidents {
                 incidents: list_incidents(db)?,
             }),
@@ -805,11 +817,16 @@ pub(crate) fn insert_watch(
     Ok(())
 }
 
-pub(crate) fn list_hosts(db: &Connection) -> Result<Vec<HostSummary>> {
+pub(crate) fn list_hosts(db: &Connection, tag: Option<&str>) -> Result<Vec<HostSummary>> {
     rows(
         db,
-        "SELECT host_id,agent_version,liveness_status,active_bundle_version,last_heartbeat_at FROM hosts ORDER BY host_id",
-        [],
+        "SELECT host_id,agent_version,liveness_status,active_bundle_version,last_heartbeat_at,profile_json
+         FROM hosts
+         WHERE ?1 IS NULL OR EXISTS (
+             SELECT 1 FROM json_each(hosts.profile_json, '$.host_tags') WHERE value=?1
+         )
+         ORDER BY host_id",
+        [tag],
         |r| {
             Ok(HostSummary {
                 host_id: r.get(0)?,
@@ -820,6 +837,7 @@ pub(crate) fn list_hosts(db: &Connection) -> Result<Vec<HostSummary>> {
                     .get::<_, Option<String>>(4)?
                     .map(|value| parse_stamp(&value, 4))
                     .transpose()?,
+                host_profile: optional_json(r, 5)?,
             })
         },
     )

@@ -12,6 +12,8 @@ Containment is disabled by default. Autonomous containment requires opt-in at bo
 
 ## Limitations and verification
 
+File observations report the hard link count. The collector refuses to read regular files with multiple links under roots added by a host profile. Built-in roots rely on administrative control and the host's hard link protections. With `fs.protected_hardlinks=1`, the default on Ubuntu and Debian, an unprivileged user cannot link to a sensitive file owned by someone else when the user lacks read or write access. Linux allows links to otherwise eligible ordinary files the user can both read and write. [Ubuntu file handling](https://documentation.ubuntu.com/security/security-features/process-memory/file-handling/) · [Debian kernel default](https://sources.debian.org/src/linux/7.0.4-1/fs/namei.c) · [Linux hard link rules](https://sources.debian.org/src/manpages/6.9.1-1/man/man5/proc_sys_fs.5)
+
 Polling can miss short-lived events and is not syscall-level eBPF monitoring. Unprivileged socket ownership and journal visibility can be incomplete. Unix sockets and peer credentials are local; fleet mTLS, PKI, remote transport and external telemetry adapters are planned. A hash chain detects changes within the verified sequence but needs an independently retained checkpoint to make replacement or truncation evident.
 
 Run the workspace tests, including adversarial integration coverage, and the synthetic benchmark:

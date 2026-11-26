@@ -29,9 +29,15 @@ pub struct EdgeSafetyConfig {
     pub max_file_hash_bytes: u64,
     pub max_journal_batch_events: u32,
     pub max_journal_message_bytes: usize,
+    /// Local ceiling for `connections.outbound` retained flow groups.
+    pub max_outbound_flows: u32,
+    /// Local ceiling for `packages.inventory` retained package entries.
+    pub max_packages: u32,
     pub max_clock_skew_seconds: i64,
     pub allowed_collectors: BTreeSet<CollectorType>,
     pub approved_file_roots: Vec<PathBuf>,
+    /// Approved roots introduced by a host profile, subject to stricter collection checks.
+    pub profile_file_roots: Vec<PathBuf>,
     pub denied_path_prefixes: Vec<PathBuf>,
     pub denied_filename_suffixes: Vec<String>,
     pub denied_exact_filenames: Vec<String>,
@@ -44,6 +50,8 @@ impl Default for EdgeSafetyConfig {
         allowed_collectors.insert(CollectorType::SystemdUnitState);
         allowed_collectors.insert(CollectorType::FilesMetadata);
         allowed_collectors.insert(CollectorType::JournalUnitEvents);
+        allowed_collectors.insert(CollectorType::ConnectionsOutbound);
+        allowed_collectors.insert(CollectorType::PackagesInventory);
 
         Self {
             expected_policy_version: 1,
@@ -58,6 +66,8 @@ impl Default for EdgeSafetyConfig {
             max_file_hash_bytes: 10 * 1024 * 1024, // 10 MiB
             max_journal_batch_events: 100,
             max_journal_message_bytes: 512,
+            max_outbound_flows: 512,
+            max_packages: 16384,
             max_clock_skew_seconds: 300,
             allowed_collectors,
             approved_file_roots: vec![
@@ -67,6 +77,7 @@ impl Default for EdgeSafetyConfig {
                 PathBuf::from("/etc/cron.d"),
                 PathBuf::from("/usr/lib/systemd/system"),
             ],
+            profile_file_roots: Vec::new(),
             denied_path_prefixes: vec![
                 PathBuf::from("/etc/shadow"),
                 PathBuf::from("/etc/gshadow"),
@@ -149,6 +160,52 @@ pub fn validate_bundle(
     cfg: &EdgeSafetyConfig,
     now: DateTime<Utc>,
 ) -> Result<BundleValidationOutcome, EdgeFloorError> {
+    validate_bundle_header(bundle, local_host_id, cfg, now)?;
+    if bundle.expires_at + Duration::seconds(cfg.max_clock_skew_seconds) < now {
+        return Err(EdgeFloorError::BundleExpired);
+    }
+    let outcome = if let Some(mark) = hwm {
+        if bundle.bundle_version < mark.bundle_version {
+            return Err(EdgeFloorError::StaleBundleVersion {
+                incoming: bundle.bundle_version,
+                current: mark.bundle_version,
+            });
+        }
+        if bundle.bundle_version == mark.bundle_version {
+            if payload_digest != mark.payload_digest {
+                return Err(EdgeFloorError::ConflictingBundleDigest {
+                    version: bundle.bundle_version,
+                });
+            }
+            BundleValidationOutcome::IdenticalRetransmission
+        } else {
+            BundleValidationOutcome::AcceptNew
+        }
+    } else {
+        BundleValidationOutcome::AcceptNew
+    };
+    validate_bundle_watches(bundle, cfg, now)?;
+    Ok(outcome)
+}
+
+/// Revalidate the cached bundle against the current floor. An expired
+/// bundle may still supply baseline watches during disconnected operation.
+pub fn validate_cached_bundle(
+    bundle: &WatchBundlePayload,
+    local_host_id: &str,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
+    validate_bundle_header(bundle, local_host_id, cfg, now)?;
+    validate_bundle_watches(bundle, cfg, now)
+}
+
+fn validate_bundle_header(
+    bundle: &WatchBundlePayload,
+    local_host_id: &str,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
     if bundle.schema_version != WATCH_BUNDLE_SCHEMA_VERSION {
         return Err(EdgeFloorError::UnsupportedSchemaVersion(
             bundle.schema_version,
@@ -174,27 +231,15 @@ pub fn validate_bundle(
     if bundle.issued_at > now + skew {
         return Err(EdgeFloorError::IssuedInFuture);
     }
-    if bundle.expires_at + skew < now {
-        return Err(EdgeFloorError::BundleExpired);
-    }
+    Ok(())
+}
 
-    if let Some(mark) = hwm {
-        if bundle.bundle_version < mark.bundle_version {
-            return Err(EdgeFloorError::StaleBundleVersion {
-                incoming: bundle.bundle_version,
-                current: mark.bundle_version,
-            });
-        }
-        if bundle.bundle_version == mark.bundle_version {
-            if payload_digest == mark.payload_digest {
-                return Ok(BundleValidationOutcome::IdenticalRetransmission);
-            }
-            return Err(EdgeFloorError::ConflictingBundleDigest {
-                version: bundle.bundle_version,
-            });
-        }
-    }
-
+fn validate_bundle_watches(
+    bundle: &WatchBundlePayload,
+    cfg: &EdgeSafetyConfig,
+    now: DateTime<Utc>,
+) -> Result<(), EdgeFloorError> {
+    let local_host_id = &bundle.target_host_id;
     if bundle.watches.len() > cfg.max_watches_total {
         return Err(EdgeFloorError::TooManyWatches {
             count: bundle.watches.len(),
@@ -209,7 +254,7 @@ pub fn validate_bundle(
         if !seen_ids.insert(watch.id.as_str()) {
             return Err(EdgeFloorError::DuplicateWatchId(watch.id.clone()));
         }
-        if watch.host_id != local_host_id {
+        if &watch.host_id != local_host_id {
             return Err(EdgeFloorError::InvalidWatch {
                 watch_id: watch.id.clone(),
                 reason: format!(
@@ -231,7 +276,7 @@ pub fn validate_bundle(
         });
     }
 
-    Ok(BundleValidationOutcome::AcceptNew)
+    Ok(())
 }
 
 /// Validate a single `WatchSpec` against local safety limits.
@@ -383,6 +428,43 @@ fn validate_collector_params(
                     "max_message_bytes {} must be within 1..={}",
                     max_bytes, cfg.max_journal_message_bytes
                 ));
+            }
+            Ok(())
+        }
+        CollectorSpec::ConnectionsOutbound(p) => {
+            if !p.include_tcp && !p.include_udp {
+                return Err(
+                    "connections.outbound must include at least one of tcp or udp".into(),
+                );
+            }
+            if let Some(max_flows) = p.max_flows {
+                let ceiling = cfg
+                    .max_outbound_flows
+                    .min(defsec_protocol::watch::OUTBOUND_FLOWS_HARD_MAX);
+                if max_flows == 0 || max_flows > ceiling {
+                    return Err(format!(
+                        "max_flows {} must be within 1..={ceiling} (hard max {}, local ceiling {})",
+                        max_flows,
+                        defsec_protocol::watch::OUTBOUND_FLOWS_HARD_MAX,
+                        cfg.max_outbound_flows
+                    ));
+                }
+            }
+            Ok(())
+        }
+        CollectorSpec::PackagesInventory(p) => {
+            if let Some(max_packages) = p.max_packages {
+                let ceiling = cfg
+                    .max_packages
+                    .min(defsec_protocol::watch::PACKAGES_INVENTORY_HARD_MAX);
+                if max_packages == 0 || max_packages > ceiling {
+                    return Err(format!(
+                        "max_packages {} must be within 1..={ceiling} (hard max {}, local ceiling {})",
+                        max_packages,
+                        defsec_protocol::watch::PACKAGES_INVENTORY_HARD_MAX,
+                        cfg.max_packages
+                    ));
+                }
             }
             Ok(())
         }
@@ -615,6 +697,27 @@ mod tests {
     }
 
     #[test]
+    fn identical_retransmission_revalidates_effective_watch_floor() {
+        let now = Utc::now();
+        let watch = sample_watch("w1", "edge-01", WatchClass::Baseline, now);
+        let collector = watch.collector.collector_type();
+        let bundle = sample_bundle("edge-01", 5, vec![watch], now);
+        let hwm = BundleHighWaterMark {
+            bundle_version: 5,
+            payload_digest: "digest-a".into(),
+        };
+        let tightened = EdgeSafetyConfig {
+            allowed_collectors: BTreeSet::new(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_bundle(&bundle, "digest-a", "edge-01", Some(&hwm), &tightened, now),
+            Err(EdgeFloorError::InvalidWatch { watch_id, reason })
+                if watch_id == "w1" && reason.contains(collector.as_str())
+        ));
+    }
+
+    #[test]
     fn accepts_valid_bundle_and_identical_retransmission_but_rejects_replay_or_wrong_host() {
         let now = Utc::now();
         let cfg = EdgeSafetyConfig::default();
@@ -692,5 +795,78 @@ mod tests {
             max_file_bytes: Some(1024),
         });
         assert!(validate_watch_spec(&bad_files, &cfg, now).is_err());
+    }
+
+    #[test]
+    fn new_collectors_are_allowed_and_bounds_enforced() {
+        use defsec_protocol::watch::{
+            ConnectionsOutboundParams, PackagesInventoryParams, OUTBOUND_FLOWS_HARD_MAX,
+            PACKAGES_INVENTORY_HARD_MAX,
+        };
+
+        let now = Utc::now();
+        let cfg = EdgeSafetyConfig::default();
+        assert!(cfg.allowed_collectors.contains(&CollectorType::ConnectionsOutbound));
+        assert!(cfg.allowed_collectors.contains(&CollectorType::PackagesInventory));
+        assert_eq!(cfg.max_outbound_flows, 512);
+        assert_eq!(cfg.max_packages, 16384);
+
+        let outbound_watch = |max_flows: Option<u32>| {
+            let mut w = sample_watch("w-out", "edge-01", WatchClass::Ephemeral, now);
+            w.collector = CollectorSpec::ConnectionsOutbound(ConnectionsOutboundParams {
+                include_tcp: true,
+                include_udp: true,
+                include_ipv6: true,
+                resolve_process: false,
+                exclude_loopback: true,
+                max_flows,
+            });
+            w
+        };
+        assert!(validate_watch_spec(&outbound_watch(None), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&outbound_watch(Some(256)), &cfg, now).is_ok());
+        let zero = validate_watch_spec(&outbound_watch(Some(0)), &cfg, now).unwrap_err();
+        assert!(zero.to_string().contains("max_flows 0"));
+        let over_local = validate_watch_spec(&outbound_watch(Some(513)), &cfg, now).unwrap_err();
+        assert!(over_local.to_string().contains("1..=512"));
+        let over_hard = validate_watch_spec(&outbound_watch(Some(10_000)), &cfg, now).unwrap_err();
+        assert!(over_hard.to_string().contains("hard max"));
+
+        // A tightened local ceiling tightens the acceptance range.
+        let mut tight = cfg.clone();
+        tight.max_outbound_flows = 64;
+        assert!(validate_watch_spec(&outbound_watch(Some(64)), &tight, now).is_ok());
+        let over = validate_watch_spec(&outbound_watch(Some(65)), &tight, now).unwrap_err();
+        assert!(over.to_string().contains("1..=64"));
+
+        // Both protocols disabled is rejected.
+        let mut none = outbound_watch(None);
+        if let CollectorSpec::ConnectionsOutbound(p) = &mut none.collector {
+            p.include_tcp = false;
+            p.include_udp = false;
+        }
+        assert!(validate_watch_spec(&none, &cfg, now).is_err());
+
+        let packages_watch = |max_packages: Option<u32>| {
+            let mut w = sample_watch("w-pkg", "edge-01", WatchClass::Ephemeral, now);
+            w.collector = CollectorSpec::PackagesInventory(PackagesInventoryParams {
+                max_packages,
+            });
+            w
+        };
+        assert!(validate_watch_spec(&packages_watch(None), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&packages_watch(Some(4096)), &cfg, now).is_ok());
+        assert!(validate_watch_spec(&packages_watch(Some(0)), &cfg, now).is_err());
+        let over = validate_watch_spec(&packages_watch(Some(20_000)), &cfg, now).unwrap_err();
+        assert!(over.to_string().contains("1..=16384"));
+        assert_eq!(PACKAGES_INVENTORY_HARD_MAX, 16384);
+        assert_eq!(OUTBOUND_FLOWS_HARD_MAX, 1024);
+
+        // A collector disabled by a tightened allowlist is rejected.
+        let mut restricted = cfg.clone();
+        restricted.allowed_collectors.remove(&CollectorType::PackagesInventory);
+        let err = validate_watch_spec(&packages_watch(None), &restricted, now).unwrap_err();
+        assert!(err.to_string().contains("packages.inventory"));
+        assert!(err.to_string().contains("not allowed"));
     }
 }

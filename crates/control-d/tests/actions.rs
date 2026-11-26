@@ -217,7 +217,7 @@ fn migrates_v1_without_rewriting_existing_records() {
         let version: i32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let agent: String = db
             .query_row(
                 "SELECT agent_version FROM hosts WHERE host_id='legacy'",

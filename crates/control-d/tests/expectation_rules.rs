@@ -89,6 +89,7 @@ impl Fixture {
                 active_bundle_version: 0,
                 active_bundle_digest: None,
                 sent_at: Utc::now(),
+                host_profile: None,
             });
         assert!(matches!(
             replies.first(),
@@ -123,6 +124,10 @@ impl Fixture {
     }
 
     fn put_snapshot(&self, seq_no: u64, data: Value) -> i64 {
+        self.put_snapshot_with_status(seq_no, data, ObservationStatus::Ok)
+    }
+
+    fn put_snapshot_with_status(&self, seq_no: u64, data: Value, status: ObservationStatus) -> i64 {
         let observation = ObservationRecord {
             host_id: "edge".into(),
             session_id: "session".into(),
@@ -131,7 +136,7 @@ impl Fixture {
             spec_version: 1,
             collector_type: CollectorType::SocketsListening,
             observed_at: Utc::now(),
-            status: ObservationStatus::Ok,
+            status,
             state_hash: canonical_sha256_hex(&data).unwrap(),
             payload: ObservationPayload::Snapshot { data },
             is_reconciliation: false,
@@ -651,6 +656,97 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
 }
 
 #[test]
+fn incomplete_snapshots_preserve_additions_without_removals_or_missing_rules() {
+    let f = Fixture::new(CompareTarget::AcceptedBaseline);
+    let baseline = f.put(1, vec![socket("sshd.service", 22)]);
+    f.promote(baseline);
+    let required: ExpectationRuleSpec = serde_json::from_value(json!({
+        "scope":{"host_id":"edge","collector":"sockets.listening"},
+        "matches":[{"op":"eq","field":"local_port","value":22},
+                   {"op":"eq","field":"systemd_unit","value":"sshd.service"}],
+        "effect":"require_present","rationale":"SSH listener must be available"
+    }))
+    .unwrap();
+    let rule_id = f.create(required);
+    for (seq, status, truncated) in [
+        (2, ObservationStatus::Partial, false),
+        (3, ObservationStatus::Ok, true),
+    ] {
+        let id = f.put_snapshot_with_status(
+            seq,
+            json!({
+                "truncated": truncated, "sockets":[socket("new.service", 21)],
+            }),
+            status,
+        );
+        assert!(f.saw_trigger(id));
+        let outcome = f.outcome();
+        assert_eq!(outcome["details"]["added"], json!(["tcp:127.0.0.5:21"]));
+        assert_eq!(outcome["details"]["removed"], json!([]));
+        assert!(outcome["details"].get("missing_required").is_none());
+    }
+    let incomplete =
+        f.put_snapshot_with_status(4, json!({"sockets":[]}), ObservationStatus::Partial);
+    assert!(!f.saw_trigger(incomplete));
+    assert_eq!(f.outcome(), json!({"outcome":"not_triggered"}));
+    let complete = f.put(5, vec![]);
+    assert!(f.saw_trigger(complete));
+    let outcome = f.outcome();
+    assert_eq!(outcome["details"]["removed"], json!(["tcp:127.0.0.5:22"]));
+    assert_eq!(outcome["details"]["missing_required"], json!([rule_id]));
+}
+
+#[test]
+fn truncation_opens_incident_despite_allow_rule_and_replays_consistently() {
+    for compare_against in [CompareTarget::LastObserved, CompareTarget::AcceptedBaseline] {
+        let f = Fixture::new(compare_against);
+        let baseline = f.put(1, vec![]);
+        if compare_against == CompareTarget::AcceptedBaseline {
+            f.promote(baseline);
+        }
+        let allow_rule = allow("expected.service");
+        let rule_id = f.create(allow_rule.clone());
+        let retained = socket("expected.service", 4002);
+        let truncated = json!({"truncated": true, "sockets": [retained.clone()]});
+        let first = f.put_snapshot_with_status(2, truncated.clone(), ObservationStatus::Partial);
+        assert!(f.saw_trigger(first));
+
+        let outcome = f.outcome();
+        assert_eq!(outcome["details"]["added"], json!([]));
+        assert_eq!(outcome["details"]["truncation_began"], json!({}));
+        assert_eq!(
+            outcome["details"]["suppressed_by_rules"][rule_id],
+            json!(["tcp:127.0.0.5:4002"])
+        );
+        let (summary, trigger_reason): (String, String) = f.db().query_row(
+            "SELECT i.summary, json_extract(t.outcome_json,'$.reason')
+             FROM incidents i JOIN trigger_events t USING (incident_id)
+             JOIN trigger_evidence e USING (event_id) WHERE e.observation_id=?1 AND i.status='open'",
+            [first],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(summary.contains("truncation_began"));
+        assert_eq!(trigger_reason, summary);
+        assert_eq!(outcome["reason"], summary);
+
+        let mut continued = truncated.clone();
+        continued["count"] = json!(1);
+        let second = f.put_snapshot_with_status(3, continued, ObservationStatus::Partial);
+        assert!(!f.saw_trigger(second));
+        assert_eq!(f.outcome(), json!({"outcome":"not_triggered"}));
+        let recovery = f.put(4, vec![retained]);
+        assert!(!f.saw_trigger(recovery));
+        let renewed = f.put_snapshot_with_status(5, truncated, ObservationStatus::Partial);
+        assert!(f.saw_trigger(renewed));
+        let backtest = f.backtest(allow_rule);
+        assert_eq!(
+            (backtest.observations_scanned, backtest.triggered_before, backtest.triggered_after),
+            (5, 2, 2)
+        );
+    }
+}
+
+#[test]
 fn backtest_uses_then_accepted_baseline_and_bounds_the_observation_window() {
     let f = Fixture::new(CompareTarget::AcceptedBaseline);
     let empty = f.put(1, vec![]);
@@ -714,7 +810,7 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             db.query_row("SELECT host_id FROM hosts", [], |r| r.get::<_, String>(0))

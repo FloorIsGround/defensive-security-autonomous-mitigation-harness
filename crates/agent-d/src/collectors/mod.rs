@@ -5,18 +5,44 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use defsec_policy::edge_floor::EdgeSafetyConfig;
-use defsec_protocol::canonical::canonical_sha256_hex;
+use defsec_protocol::canonical::{canonical_sha256_hex, sha256_hex};
 use defsec_protocol::observation::{
-    FileMetadataEntry, ObservationPayload, ObservationStatus, SocketsListeningSnapshot,
-    SystemdUnitSnapshot,
+    ConnectionsOutboundSnapshot, FileMetadataEntry, ObservationPayload, ObservationStatus,
+    PackagesInventorySnapshot, SocketsListeningSnapshot, SystemdUnitSnapshot,
 };
-use defsec_protocol::watch::{CollectorSpec, CollectorType, FilesMetadataParams, JournalUnitEventsParams, SocketsListeningParams, SystemdUnitStateParams};
+use defsec_protocol::watch::{CollectorSpec, CollectorType, ConnectionsOutboundParams, FilesMetadataParams, JournalUnitEventsParams, PackagesInventoryParams, SocketsListeningParams, SystemdUnitStateParams};
 use tokio::sync::OnceCell;
 
 pub mod files;
 pub mod journal;
+pub mod outbound;
+pub mod packages;
 pub mod sockets;
 pub mod systemd;
+
+// Reserve 512 KiB below the 2 MiB frame limit for the observation envelope.
+pub(super) const SNAPSHOT_BYTES: usize = 1536 * 1024;
+
+/// Account exactly for entries and separators, leaving space for snapshot metadata.
+pub(super) fn bounded_snapshot_entries<T: serde::Serialize>(
+    entries: impl IntoIterator<Item = T>,
+    cap: u32,
+    metadata_bytes: usize,
+) -> Vec<T> {
+    let mut retained = Vec::new();
+    let mut used = metadata_bytes;
+    for entry in entries.into_iter().take(cap as usize) {
+        let Ok(bytes) = defsec_protocol::canonical::to_canonical_json_bytes(&entry) else {
+            break;
+        };
+        used += bytes.len() + usize::from(!retained.is_empty());
+        if used > SNAPSHOT_BYTES {
+            break;
+        }
+        retained.push(entry);
+    }
+    retained
+}
 
 /// Normalized output of one collector run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +70,7 @@ pub fn error_output(code: &str, message: &str) -> CollectorOutput {
     }
 }
 
-/// Async collector backend. One method routes all four MVP collector types.
+/// Async collector backend. One method routes every built-in collector type.
 ///
 /// Native `async fn` in trait (Rust 1.75+) used generically by the engine;
 /// not dyn-compatible — collect through the generic `AgentEngine<C>`.
@@ -110,6 +136,8 @@ impl CollectorBackend for RealLinuxCollectors {
                 let source = journal::JournalctlSource::new();
                 journal::collect_journal(p, cfg, cursor, &source).await
             }
+            CollectorSpec::ConnectionsOutbound(p) => outbound::collect_outbound(p, cfg).await,
+            CollectorSpec::PackagesInventory(p) => packages::collect_packages(p, cfg).await,
         }
     }
 }
@@ -133,6 +161,12 @@ pub struct FakeHostState {
     pub systemd: BTreeMap<String, SystemdUnitSnapshot>,
     pub systemd_status: BTreeMap<String, ObservationStatus>,
     pub files: BTreeMap<String, FileMetadataEntry>,
+    pub outbound: ConnectionsOutboundSnapshot,
+    pub outbound_status: Option<ObservationStatus>,
+    pub outbound_partial_reasons: Vec<String>,
+    pub packages: PackagesInventorySnapshot,
+    pub packages_status: Option<ObservationStatus>,
+    pub packages_partial_reasons: Vec<String>,
     /// FIFO of scripted journal batches; when empty, `journal_default` is used.
     pub journal_batches: VecDeque<journal::JournalFetchOutcome>,
     pub journal_default: journal::JournalFetchOutcome,
@@ -154,6 +188,28 @@ impl Default for FakeHostState {
             systemd: BTreeMap::new(),
             systemd_status: BTreeMap::new(),
             files: BTreeMap::new(),
+            outbound: ConnectionsOutboundSnapshot {
+                flows: Vec::new(),
+                total_flows: 0,
+                attribution_partial: false,
+                truncated: None,
+                omitted_flows: None,
+            },
+            outbound_status: None,
+            outbound_partial_reasons: Vec::new(),
+            packages: PackagesInventorySnapshot {
+                packages: Vec::new(),
+                total_packages: 0,
+                // SHA-256 of the empty string: a deterministic, well-formed
+                // digest for the empty fake host.
+                status_file_sha256: sha256_hex(&[]),
+                malformed_stanzas: 0,
+                duplicate_stanzas: 0,
+                truncated: None,
+                omitted_packages: None,
+            },
+            packages_status: None,
+            packages_partial_reasons: Vec::new(),
             journal_batches: VecDeque::new(),
             journal_default: journal::JournalFetchOutcome::default(),
             calls: Vec::new(),
@@ -211,6 +267,8 @@ impl CollectorBackend for FakeHostCollectors {
                 CollectorSpec::SocketsListening(p) => fake_sockets(&state, p),
                 CollectorSpec::SystemdUnitState(p) => fake_systemd(&state, p),
                 CollectorSpec::FilesMetadata(p) => fake_files(&state, p),
+                CollectorSpec::ConnectionsOutbound(p) => fake_outbound(&state, p),
+                CollectorSpec::PackagesInventory(p) => fake_packages(&state, p),
                 CollectorSpec::JournalUnitEvents(p) => fake_journal(&mut state, p, cursor),
             }
         };
@@ -256,6 +314,20 @@ fn fake_sockets(state: &FakeHostState, _p: &SocketsListeningParams) -> Collector
     out
 }
 
+fn fake_outbound(state: &FakeHostState, _p: &ConnectionsOutboundParams) -> CollectorOutput {
+    let status = state.outbound_status.unwrap_or(ObservationStatus::Ok);
+    let mut out = snapshot_output(status, &state.outbound);
+    out.partial_reasons = state.outbound_partial_reasons.clone();
+    out
+}
+
+fn fake_packages(state: &FakeHostState, _p: &PackagesInventoryParams) -> CollectorOutput {
+    let status = state.packages_status.unwrap_or(ObservationStatus::Ok);
+    let mut out = snapshot_output(status, &state.packages);
+    out.partial_reasons = state.packages_partial_reasons.clone();
+    out
+}
+
 fn fake_systemd(state: &FakeHostState, p: &SystemdUnitStateParams) -> CollectorOutput {
     if let Some(status) = state.systemd_status.get(&p.unit) {
         return snapshot_output(*status, &serde_json::json!({ "unit": p.unit }));
@@ -289,6 +361,7 @@ fn fake_files(state: &FakeHostState, p: &FilesMetadataParams) -> CollectorOutput
                 mode_octal: None,
                 uid: None,
                 gid: None,
+                nlink: None,
                 size_bytes: None,
                 sha256: None,
                 mtime_unix: None,
@@ -339,7 +412,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fake_host_routes_all_four_collectors_and_records_calls() {
+    async fn fake_host_routes_all_collectors_and_records_calls() {
         let mut state = FakeHostState {
             sockets: SocketsListeningSnapshot {
                 count: 1,
@@ -359,6 +432,38 @@ mod tests {
             },
             sockets_status: Some(ObservationStatus::Partial),
             sockets_partial_reasons: vec!["hidepid".into()],
+            outbound: defsec_protocol::observation::ConnectionsOutboundSnapshot {
+                flows: vec![defsec_protocol::observation::OutboundFlowEntry {
+                    flow_key: "tcp:192.0.2.1:443:1000:curl".into(),
+                    protocol: "tcp".into(),
+                    remote_addr: "192.0.2.1".into(),
+                    remote_port: 443,
+                    uid: 1000,
+                    states: vec!["ESTABLISHED".into()],
+                    count: 2,
+                    comm: Some("curl".into()),
+                    systemd_unit: None,
+                    attribution: defsec_protocol::observation::FlowAttribution::Full,
+                }],
+                total_flows: 1,
+                attribution_partial: false,
+                truncated: None,
+                omitted_flows: None,
+            },
+            packages: defsec_protocol::observation::PackagesInventorySnapshot {
+                packages: vec![defsec_protocol::observation::PackageInventoryEntry {
+                    package_key: "bash:amd64".into(),
+                    name: "bash".into(),
+                    arch: "amd64".into(),
+                    version: "5.2".into(),
+                }],
+                total_packages: 1,
+                status_file_sha256: sha256_hex(&[]),
+                malformed_stanzas: 0,
+                duplicate_stanzas: 0,
+                truncated: None,
+                omitted_packages: None,
+            },
             ..FakeHostState::default()
         };
         state.systemd.insert(
@@ -383,6 +488,7 @@ mod tests {
                 mode_octal: Some("0600".into()),
                 uid: Some(0),
                 gid: Some(0),
+                nlink: Some(1),
                 size_bytes: Some(42),
                 sha256: Some("a".repeat(64)),
                 mtime_unix: Some(1),
@@ -478,12 +584,61 @@ mod tests {
             .await;
         assert_eq!(out.next_cursor.as_deref(), Some("c1"));
 
+        // The two snapshot collectors serve their scripted state verbatim.
+        let out = host
+            .collect(
+                &CollectorSpec::ConnectionsOutbound(ConnectionsOutboundParams {
+                    include_tcp: true,
+                    include_udp: false,
+                    include_ipv6: true,
+                    resolve_process: true,
+                    exclude_loopback: true,
+                    max_flows: None,
+                }),
+                &cfg,
+                None,
+            )
+            .await;
+        assert_eq!(out.status, ObservationStatus::Ok);
+        match &out.payload {
+            ObservationPayload::Snapshot { data } => {
+                let snap: defsec_protocol::observation::ConnectionsOutboundSnapshot =
+                    serde_json::from_value(data.clone()).unwrap();
+                assert_eq!(snap.total_flows, 1);
+                assert_eq!(snap.flows[0].count, 2);
+                assert_eq!(snap.flows[0].flow_key, "tcp:192.0.2.1:443:1000:curl");
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let out = host
+            .collect(
+                &CollectorSpec::PackagesInventory(PackagesInventoryParams {
+                    max_packages: Some(64),
+                }),
+                &cfg,
+                None,
+            )
+            .await;
+        assert_eq!(out.status, ObservationStatus::Ok);
+        match &out.payload {
+            ObservationPayload::Snapshot { data } => {
+                let snap: defsec_protocol::observation::PackagesInventorySnapshot =
+                    serde_json::from_value(data.clone()).unwrap();
+                assert_eq!(snap.packages[0].package_key, "bash:amd64");
+                assert_eq!(snap.status_file_sha256, sha256_hex(&[]));
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
         let handle = host.state_handle();
         let guard = handle.lock().unwrap();
-        assert_eq!(guard.calls.len(), 5);
+        assert_eq!(guard.calls.len(), 7);
         assert_eq!(guard.calls[0].collector, CollectorType::SocketsListening);
         assert_eq!(guard.calls[4].collector, CollectorType::JournalUnitEvents);
         assert_eq!(guard.calls[4].cursor.as_deref(), Some("c0"));
+        assert_eq!(guard.calls[5].collector, CollectorType::ConnectionsOutbound);
+        assert_eq!(guard.calls[6].collector, CollectorType::PackagesInventory);
     }
 
     #[tokio::test]

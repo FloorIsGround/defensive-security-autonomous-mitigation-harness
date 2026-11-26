@@ -491,7 +491,7 @@ fn migrates_existing_v3_ledger_with_run_in_place() {
     let version: u32 =
         f.db.pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let observer = f.mint(PrincipalRole::Observer, &["edge"], None);
     let runs = f.runs(&observer);
     assert_eq!(runs.len(), 1);

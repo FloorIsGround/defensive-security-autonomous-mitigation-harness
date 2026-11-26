@@ -132,8 +132,8 @@ impl ControlService {
                     )?,
                 }
             }
-            InvestigationRequest::ListHosts { limit } => InvestigationResponse::Hosts {
-                hosts: list_hosts(db)?
+            InvestigationRequest::ListHosts { limit, tag } => InvestigationResponse::Hosts {
+                hosts: list_hosts(db, tag.as_deref())?
                     .into_iter()
                     .filter(|h| capability.allowed_hosts.contains(&h.host_id))
                     .take(bounded(limit))
@@ -999,6 +999,14 @@ fn collector_capability(
         CollectorType::JournalUnitEvents => (
             DataClassification::BoundedRedactedText,
             "Bounded, redacted systemd journal events",
+        ),
+        CollectorType::ConnectionsOutbound => (
+            DataClassification::MetadataSensitive,
+            "Outbound connection flows grouped by remote endpoint",
+        ),
+        CollectorType::PackagesInventory => (
+            DataClassification::MetadataLow,
+            "Installed dpkg package inventory",
         ),
     };
     CollectorCapability {

@@ -75,7 +75,7 @@ impl Fixture {
 
     fn status(&self, host_id: &str) -> HostSummary {
         let AdminResponse::Hosts { hosts } =
-            self.control.handle_admin_request(AdminRequest::ListHosts)
+            self.control.handle_admin_request(AdminRequest::ListHosts { tag: None })
         else {
             panic!("host lookup failed");
         };

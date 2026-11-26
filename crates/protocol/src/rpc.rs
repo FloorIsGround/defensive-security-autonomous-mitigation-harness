@@ -13,6 +13,7 @@ use crate::action::{
 };
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
+use crate::profile::HostProfileSummary;
 use crate::rules::ExpectationRuleSpec;
 use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
@@ -85,6 +86,8 @@ pub enum InvestigationRequest {
     ListHosts {
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
     },
     ListActiveIncidents {
         #[serde(default)]
@@ -341,6 +344,8 @@ pub struct HostSummary {
     pub active_bundle_version: u64,
     #[serde(default)]
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_profile: Option<HostProfileSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,7 +550,10 @@ pub enum AdminRequest {
         actor: String,
         resolution: String,
     },
-    ListHosts,
+    ListHosts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+    },
     ListIncidents,
     VerifyAuditChain,
     ListAuditEntries {

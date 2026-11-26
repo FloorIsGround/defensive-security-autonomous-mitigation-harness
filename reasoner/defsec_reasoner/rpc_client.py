@@ -249,10 +249,12 @@ class ControlRpcClient:
 
     # ------------------------------------------------------- discovery tools
 
-    def list_hosts(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_hosts(self, limit: int | None = None, *, tag: str | None = None) -> list[dict[str, Any]]:
         request: dict[str, Any] = {"op": "list_hosts"}
         if limit is not None:
             request["limit"] = int(limit)
+        if tag is not None:
+            request["tag"] = tag
         return self.call(request)["hosts"]
 
     def list_active_incidents(

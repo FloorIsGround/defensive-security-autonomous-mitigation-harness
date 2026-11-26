@@ -12,6 +12,8 @@ pub const GENESIS_PREV_HASH: &str =
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
     HostEnrolled,
+    HostProfileChanged,
+    HostProfileRejected,
     BundleIssued,
     BundleAcked,
     WatchProposed,

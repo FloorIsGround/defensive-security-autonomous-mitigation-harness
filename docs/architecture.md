@@ -26,11 +26,13 @@ Signed payloads use RFC 8785 canonical JSON and Ed25519 with distinct domains: `
 
 ## Collection and state
 
-The closed collector catalog consists of `sockets.listening`, `systemd.unit_state`, `files.metadata`, and `journal.unit_events`. Socket collection can report partial process attribution when an unprivileged agent cannot inspect other processes. Systemd state uses D-Bus. File collection confines resolution with `openat2` and `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_XDEV`; kernel and filesystem support matter. Journal collection is bounded and requires appropriate read access.
+The closed collector catalog consists of `sockets.listening`, `systemd.unit_state`, `files.metadata`, `journal.unit_events`, `connections.outbound`, and `packages.inventory`. The two network collectors can report partial process attribution when an unprivileged agent cannot inspect other processes. `connections.outbound` snapshots grouped remote endpoints and `packages.inventory` snapshots installed packages from the local dpkg status database. Systemd state uses D-Bus. File collection confines resolution with `openat2` and `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_XDEV`. Journal collection is bounded and requires appropriate read access.
 
 A watch has a schedule, typed collector, deterministic trigger, wake policy and lifecycle. The control baseline engine distinguishes accepted baseline, last observed, and current observed state; promotion is an attributable operator operation, not an automatic consequence of drift. SQLite uses WAL and `synchronous=FULL`; the schema includes hosts, watches, observations, baseline revisions, incidents, trigger events and evidence, capability tokens, runs, policy decisions, findings, and audit outbox. Schema v2 adds action proposals, intents and receipts.
 
 Trigger events are leased for bounded worker runs. Lease fencing prevents an expired worker from committing as the current owner; retries and dead-letter handling limit provider failures. The reasoner wraps telemetry as untrusted data, proposes through typed RPC, and remains subject to deterministic policy decisions.
+
+Schema v6 stores the last registered host profile summary and its receipt time. Control exposes the summary through admin and scoped investigation host listings, audits changes to it, and checks its collector allowlist when admitting operator baseline watches. The agent still independently enforces its local safety floor on signed bundles.
 
 ## Interfaces and containment
 

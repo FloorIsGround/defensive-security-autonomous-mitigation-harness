@@ -11,10 +11,12 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use defsec_policy::edge_floor::{
-    validate_bundle, BundleHighWaterMark, BundleValidationOutcome, EdgeSafetyConfig,
+    BundleHighWaterMark, BundleValidationOutcome, EdgeSafetyConfig, validate_bundle,
+    validate_cached_bundle,
 };
 use defsec_policy::predicate::SustainedCounterState;
 use defsec_protocol::observation::{ObservationPayload, ObservationRecord, ObservationStatus};
+use defsec_protocol::profile::HostProfileSummary;
 use defsec_protocol::signing::{
     SignedEnvelope, VerifyingKeyStore, DOMAIN_WATCH_BUNDLE_V1,
 };
@@ -184,6 +186,7 @@ pub struct AgentEngine<C: CollectorBackend> {
     previous_session_id: Option<String>,
     next_seq_no: u64,
     active_bundle: Option<ActiveBundle>,
+    cached_bundle_rejection: Option<AgentToControl>,
     hwm: Option<BundleHighWaterMark>,
     stale_desired_state: bool,
     boot_id: String,
@@ -193,6 +196,9 @@ pub struct AgentEngine<C: CollectorBackend> {
     reconcile_requested: BTreeSet<String>,
     spool: ObservationSpool,
     semaphore: Arc<Semaphore>,
+    /// Summary of the admin-owned host profile applied at startup (if any);
+    /// reported on Register for the control plane. Informational only.
+    host_profile_summary: Option<HostProfileSummary>,
 }
 
 impl<C: CollectorBackend> AgentEngine<C> {
@@ -221,6 +227,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
         // Cached verified bundle (verified BEFORE trusting it).
         let mut active_bundle: Option<ActiveBundle> = None;
         let mut hwm: Option<BundleHighWaterMark> = None;
+        let mut cached_bundle_rejection = None;
         if let Some(envelope) = load_json::<SignedEnvelope>(&state_dir.join(BUNDLE_FILE))
             && let Ok((payload, digest)) = self_verify(&store, &envelope)
         {
@@ -235,10 +242,26 @@ impl<C: CollectorBackend> AgentEngine<C> {
                         payload_digest: digest.clone(),
                     })
                 });
-            active_bundle = Some(ActiveBundle {
-                payload,
-                payload_digest: digest,
-            });
+            match validate_cached_bundle(&payload, &host_id, &cfg, now) {
+                Ok(()) => {
+                    active_bundle = Some(ActiveBundle {
+                        payload,
+                        payload_digest: digest,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, bundle_version = payload.bundle_version, "cached bundle rejected");
+                    cached_bundle_rejection = Some(AgentToControl::BundleAck {
+                        host_id: host_id.clone(),
+                        bundle_id: payload.bundle_id,
+                        bundle_version: payload.bundle_version,
+                        payload_digest: digest,
+                        status: BundleAckStatus::Rejected,
+                        reason: Some(format!("cached bundle rejected: {error}")),
+                        acked_at: now,
+                    });
+                }
+            }
         }
 
         // Journal cursors: durable profile only — cursors are checkpointed
@@ -275,7 +298,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
 
         // Preserve baseline monitoring while disconnected, but retire
         // ephemeral watches conservatively once the bundle itself expired.
-        let mut stale_desired_state = false;
+        let mut stale_desired_state = cached_bundle_rejection.is_some();
         if let Some(bundle) = &active_bundle {
             let skew = cfg.max_clock_skew_seconds;
             if bundle.payload.expires_at + Duration::seconds(skew) < now {
@@ -300,6 +323,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
             previous_session_id,
             next_seq_no: 1,
             active_bundle,
+            cached_bundle_rejection,
             hwm,
             stale_desired_state,
             boot_id,
@@ -308,7 +332,19 @@ impl<C: CollectorBackend> AgentEngine<C> {
             last_reconciliation: BTreeMap::new(),
             reconcile_requested: BTreeSet::new(),
             spool,
+            host_profile_summary: None,
         })
+    }
+
+    /// Attach the summary of an applied admin-owned host profile. Reported on
+    /// Register; the control plane may ignore it.
+    pub fn set_host_profile_summary(&mut self, summary: Option<HostProfileSummary>) {
+        self.host_profile_summary = summary;
+    }
+
+    /// The applied host profile summary, if any (for tests and callers).
+    pub fn host_profile_summary(&self) -> Option<&HostProfileSummary> {
+        self.host_profile_summary.as_ref()
     }
 
     // ------------------------------------------------------------------
@@ -367,6 +403,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
             active_bundle_version: self.active_bundle_version(),
             active_bundle_digest: self.active_bundle_digest().map(str::to_string),
             sent_at: now,
+            host_profile: self.host_profile_summary.clone(),
         }
     }
 
@@ -424,15 +461,20 @@ impl<C: CollectorBackend> AgentEngine<C> {
     ) -> Vec<AgentToControl> {
         match msg {
             ControlToAgent::RegisterAck {
-                last_acked_seq_no, ..
+                accepted: true,
+                last_acked_seq_no,
+                ..
             } => {
                 // The control plane durably committed up to this sequence
                 // number of the PREVIOUS session; prune its spooled records.
                 if let Some(prev) = self.previous_session_id.clone() {
                     let _ = self.spool.prune_acked(&prev, last_acked_seq_no);
                 }
-                Vec::new()
+                self.cached_bundle_rejection.iter().cloned().collect()
             }
+            ControlToAgent::RegisterAck {
+                accepted: false, ..
+            } => Vec::new(),
             ControlToAgent::ObservationAck {
                 session_id,
                 acked_seq_no,
@@ -489,7 +531,9 @@ impl<C: CollectorBackend> AgentEngine<C> {
             &self.cfg,
             now,
         ) {
-            Ok(BundleValidationOutcome::IdenticalRetransmission) => {
+            Ok(BundleValidationOutcome::IdenticalRetransmission)
+                if self.active_bundle_digest() == Some(digest.as_str()) =>
+            {
                 AgentToControl::BundleAck {
                     host_id: self.host_id.clone(),
                     bundle_id: payload.bundle_id.clone(),
@@ -500,7 +544,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     acked_at: now,
                 }
             }
-            Ok(BundleValidationOutcome::AcceptNew) => {
+            Ok(_) => {
                 let bundle_id = payload.bundle_id.clone();
                 let bundle_version = payload.bundle_version;
 
@@ -560,6 +604,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     payload_digest: digest.clone(),
                 });
                 self.stale_desired_state = false;
+                self.cached_bundle_rejection = None;
                 self.reconcile_requested.clear();
                 let _ = self.persist_agent_state();
                 let _ = self.persist_cursors();
@@ -622,9 +667,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     out.extend(msgs);
                 }
                 Err(e) => {
-                    // Persistence failure: keep monitoring; the spool holds
-                    // the record for later retransmission.
-                    tracing::warn!(watch = id, error = %e, "tick persistence failure");
+                    tracing::warn!(watch = id, error = %e, "watch observation could not be spooled");
                     state_changed = true;
                 }
             }
@@ -759,11 +802,6 @@ impl<C: CollectorBackend> AgentEngine<C> {
             }
         };
 
-        // Update journal cursors whenever the collector advances them.
-        if let Some(next_cursor) = &output.next_cursor {
-            self.cursors.insert(watch_id.to_string(), next_cursor.clone());
-        }
-
         let valid_sample = output.status.is_valid_sample();
 
         // Sustained counters advance on every completed sample, even when the
@@ -873,11 +911,13 @@ impl<C: CollectorBackend> AgentEngine<C> {
         }
 
         if !emit {
+            if let Some(next_cursor) = output.next_cursor {
+                self.cursors.insert(watch_id.to_string(), next_cursor);
+            }
             return Ok(Vec::new());
         }
 
         let seq_no = self.next_seq_no;
-        self.next_seq_no += 1;
         let record = ObservationRecord {
             host_id: self.host_id.clone(),
             session_id: self.session_id.clone(),
@@ -898,7 +938,16 @@ impl<C: CollectorBackend> AgentEngine<C> {
         // The spool push satisfies the durability guarantee (Durable syncs
         // the segment); only then may cursors be checkpointed.
         let to_send = record.clone();
-        self.spool.push(record)?;
+        // Consume the sequence on an I/O error, where a write could have partially
+        // succeeded. Only a definite pre-write rejection can reuse it.
+        self.next_seq_no += 1;
+        if !self.spool.push(record)? {
+            self.next_seq_no -= 1;
+            return Ok(Vec::new());
+        }
+        if let Some(next_cursor) = output.next_cursor {
+            self.cursors.insert(watch_id.to_string(), next_cursor);
+        }
         let _ = self.persist_cursors();
 
         Ok(vec![AgentToControl::PushObservationDelta {

@@ -6,6 +6,7 @@ use std::{
 };
 
 use defsec_protocol::{
+    observation::ObservationStatus,
     rules::{ExpectationRuleSpec, MatchClause, RuleEffect, RuleValue},
     watch::{CollectorType, TriggerPredicate},
 };
@@ -14,7 +15,9 @@ use serde_json::{Value, json};
 pub use defsec_protocol::rules::ActiveRule;
 
 use crate::{
-    predicate::{PredicateOutcome, extract_keyed_set},
+    predicate::{
+        PredicateOutcome, append_truncation_reason, extract_keyed_set, snapshot_has_absence_evidence,
+    },
     rule_gate::rule_field_registry,
 };
 
@@ -30,6 +33,7 @@ pub fn apply_expectation_rules(
     predicate: &TriggerPredicate,
     collector: CollectorType,
     raw: PredicateOutcome,
+    status: ObservationStatus,
     current: Option<&Value>,
     reference: Option<&Value>,
     rules: &[ActiveRule],
@@ -51,9 +55,11 @@ pub fn apply_expectation_rules(
     let Some((set_field, identity_key)) = rule_set(predicate, collector) else {
         return result;
     };
-    let Some(current) =
-        current.and_then(|sample| extract_keyed_set(sample, set_field, identity_key))
-    else {
+    let Some(sample) = current else {
+        return result;
+    };
+    let absence_evidence = snapshot_has_absence_evidence(status, sample);
+    let Some(current) = extract_keyed_set(sample, set_field, identity_key) else {
         return result;
     };
     let reference = match reference {
@@ -79,6 +85,10 @@ pub fn apply_expectation_rules(
         PredicateOutcome::NotTriggered => Default::default(),
         _ => return result,
     };
+    let truncation = match &result.outcome {
+        PredicateOutcome::Triggered { details, .. } => details.get("truncation_began").cloned(),
+        _ => None,
+    };
     let original_removed = removed.clone();
     let mut sorted = rules.iter().collect::<Vec<_>>();
     sorted.sort_unstable_by(|a, b| a.rule_id.cmp(&b.rule_id));
@@ -102,7 +112,7 @@ pub fn apply_expectation_rules(
             result.matched_rule_ids.push(rule.rule_id.clone());
         }
         if rule.spec.effect == RuleEffect::RequirePresent {
-            if matching_current.is_empty() {
+            if absence_evidence && matching_current.is_empty() {
                 result.missing_required.push(rule.rule_id.clone());
             }
             continue;
@@ -137,6 +147,7 @@ pub fn apply_expectation_rules(
         && removed.is_empty()
         && modified.is_empty()
         && result.missing_required.is_empty()
+        && truncation.is_none()
     {
         result.outcome = PredicateOutcome::NotTriggered;
         return result;
@@ -151,6 +162,10 @@ pub fn apply_expectation_rules(
         modified.len()
     );
     let mut details = json!({"added": added, "removed": removed, "modified": modified});
+    if let Some(counts) = truncation {
+        append_truncation_reason(&mut reason, &counts);
+        details["truncation_began"] = counts;
+    }
     if suppressed_count != 0 {
         reason.push_str(&format!(" ({suppressed_count} suppressed by rules)"));
         details["suppressed_by_rules"] = json!(result.suppressed);
@@ -246,6 +261,7 @@ fn bind_scope(addr: IpAddr) -> &'static str {
 }
 
 fn remote_scope(addr: IpAddr) -> &'static str {
+    let addr = addr.to_canonical();
     if addr.is_loopback() {
         return "loopback";
     }
@@ -263,7 +279,7 @@ fn remote_scope(addr: IpAddr) -> &'static str {
 mod tests {
     use super::*;
     use crate::predicate::evaluate_predicate;
-    use defsec_protocol::{observation::ObservationStatus, watch::CompareTarget};
+    use defsec_protocol::watch::CompareTarget;
 
     fn predicate() -> TriggerPredicate {
         TriggerPredicate::SetDiff {
@@ -313,10 +329,68 @@ mod tests {
             &predicate,
             CollectorType::SocketsListening,
             raw,
+            ObservationStatus::Ok,
             Some(current),
             Some(reference),
             rules,
         )
+    }
+
+    #[test]
+    fn required_rules_only_infer_absence_from_complete_samples() {
+        let rule = rule(
+            "required",
+            RuleEffect::RequirePresent,
+            json!([{"op":"eq","field":"systemd_unit","value":"required.service"}]),
+        );
+        let rules = [rule];
+        let mut current = sample(&[]);
+        assert_eq!(
+            apply(&current, &current, &rules).missing_required,
+            ["required"]
+        );
+        current["truncated"] = json!(true);
+        assert_eq!(
+            apply(&current, &current, &rules).outcome,
+            PredicateOutcome::NotTriggered
+        );
+        assert!(
+            apply(&current, &current, &rules)
+                .missing_required
+                .is_empty()
+        );
+        assert_eq!(
+            remote_scope("::ffff:127.0.0.42".parse().unwrap()),
+            "loopback"
+        );
+        assert_eq!(remote_scope("::ffff:10.0.0.42".parse().unwrap()), "private");
+        assert_eq!(
+            remote_scope("::ffff:100.64.0.42".parse().unwrap()),
+            "private"
+        );
+        assert_eq!(remote_scope("::ffff:8.8.8.8".parse().unwrap()), "public");
+    }
+
+    #[test]
+    fn allow_rule_filters_all_item_changes_but_preserves_truncation() {
+        let reference = sample(&[]);
+        let mut current = sample(&[("allowed", "unit", 4000)]);
+        current["truncated"] = json!(true);
+        let rules = [rule(
+            "allow",
+            RuleEffect::AllowOptional,
+            json!([{"op":"eq","field":"systemd_unit","value":"unit"}]),
+        )];
+        let eval = apply(&current, &reference, &rules);
+        assert_eq!(eval.matched_rule_ids, ["allow"]);
+        assert_eq!(
+            eval.outcome,
+            PredicateOutcome::Triggered {
+                reason: "set 'sockets' diff: +0 -0 ~0 truncation_began (omitted count unknown) (1 suppressed by rules)".into(),
+                details: json!({"added": [], "removed": [], "modified": [],
+                    "truncation_began": {}, "suppressed_by_rules": {"allow": ["allowed"]}}),
+            }
+        );
     }
 
     #[test]
@@ -536,6 +610,7 @@ mod tests {
                 &predicate,
                 CollectorType::SocketsListening,
                 raw.clone(),
+                ObservationStatus::Ok,
                 sample,
                 None,
                 &rules,

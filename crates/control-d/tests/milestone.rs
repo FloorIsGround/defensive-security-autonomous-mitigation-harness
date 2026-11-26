@@ -176,6 +176,7 @@ fn register(host: &str) -> AgentToControl {
         active_bundle_version: 0,
         active_bundle_digest: None,
         sent_at: Utc::now(),
+        host_profile: None,
     }
 }
 
@@ -436,7 +437,7 @@ fn investigation_enforces_scope_and_closure_retires_watches() {
     db.execute("UPDATE capability_tokens SET capability_json=json_set(capability_json,'$.expires_at','2000-01-01T00:00:00Z') WHERE token_hash=?1",
         [defsec_protocol::canonical::sha256_hex(expired.as_bytes())]).unwrap();
     assert!(matches!(
-        f.investigate(&expired, ListHosts { limit: None }),
+        f.investigate(&expired, ListHosts { limit: None, tag: None }),
         Error { .. }
     ));
     let observer = f.mint(PrincipalRole::Observer, &incident);

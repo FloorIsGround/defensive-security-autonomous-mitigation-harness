@@ -18,7 +18,9 @@ use defsec_protocol::{
 use tokio::net::UnixStream;
 
 mod pki;
+mod role_profiles;
 use pki::PkiCommand;
+use role_profiles::ProfileRole;
 
 #[derive(Parser)]
 #[command(about = "DefSecAutMit operator CLI")]
@@ -44,6 +46,26 @@ enum Command {
         actor: String,
         #[arg(long)]
         rationale: String,
+    },
+    /// Print a host profile JSON document to install on the agent.
+    ProfileTemplate {
+        #[arg(long, value_enum)]
+        role: ProfileRole,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "expected-service")]
+        expected_services: Vec<String>,
+    },
+    /// Apply one baseline watch per collector in a role.
+    ApplyProfile {
+        #[arg(long)]
+        host: String,
+        #[arg(long, value_enum)]
+        role: ProfileRole,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value = "operator")]
+        actor: String,
     },
     PromoteBaseline {
         host_id: String,
@@ -135,7 +157,10 @@ enum Command {
     BacktestRule {
         rule_json_file: PathBuf,
     },
-    ListHosts,
+    ListHosts {
+        #[arg(long)]
+        tag: Option<String>,
+    },
     ListIncidents,
     VerifyAudit,
 }
@@ -262,7 +287,10 @@ impl Command {
             Self::BacktestRule { rule_json_file } => AdminRequest::BacktestExpectationRule {
                 rule: serde_json::from_slice(&fs::read(rule_json_file)?)?,
             },
-            Self::ListHosts => AdminRequest::ListHosts,
+            Self::ListHosts { tag } => AdminRequest::ListHosts { tag },
+            Self::ProfileTemplate { .. } | Self::ApplyProfile { .. } => {
+                return Err("profile commands require local template handling".into());
+            }
             Self::ListIncidents => AdminRequest::ListIncidents,
             Self::VerifyAudit => AdminRequest::VerifyAuditChain,
         })
@@ -321,6 +349,67 @@ async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
     let response = match args.command {
         Command::Pki(command) => {
             println!("{}", serde_json::to_string_pretty(&command.run()?)?);
+            return Ok(false);
+        }
+        Command::ProfileTemplate {
+            role,
+            tags,
+            expected_services,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&role.profile(tags, expected_services)?)?
+            );
+            return Ok(false);
+        }
+        Command::ApplyProfile {
+            host,
+            role,
+            dry_run,
+            actor,
+        } => {
+            if !is_valid_identifier(&host) {
+                return Err("invalid host ID".into());
+            }
+            let specs = role.specs(&host);
+            if dry_run {
+                println!("{}", serde_json::to_string_pretty(&specs)?);
+                return Ok(false);
+            }
+
+            let mut socket = UnixStream::connect(args.admin_sock).await?;
+            let role_name = role.to_possible_value().expect("named profile role");
+            let rationale = format!("apply {} role profile", role_name.get_name());
+            let mut responses = Vec::with_capacity(specs.len());
+            for spec in specs {
+                let watch_id = spec.id.clone();
+                let response = exchange(
+                    &mut socket,
+                    AdminRequest::ApplyBaselineWatch {
+                        spec,
+                        actor: actor.clone(),
+                        rationale: rationale.clone(),
+                    },
+                )
+                .await;
+                match response {
+                    Ok(response @ AdminResponse::WatchApplied { .. }) => responses.push(response),
+                    Ok(response @ AdminResponse::Error { .. }) => {
+                        responses.push(response);
+                        println!("{}", serde_json::to_string_pretty(&responses)?);
+                        return Ok(true);
+                    }
+                    other => {
+                        println!("{}", serde_json::to_string_pretty(&responses)?);
+                        let detail = match other {
+                            Err(error) => error.to_string(),
+                            Ok(_) => "unexpected response".into(),
+                        };
+                        return Err(format!("{watch_id}: {detail}").into());
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&responses)?);
             return Ok(false);
         }
         Command::GenerateOperatorKey { key_id, out } => {

@@ -267,6 +267,7 @@ fn seed_sockets_incident(service: &ControlService) {
         active_bundle_version: 0,
         active_bundle_digest: None,
         sent_at: Utc::now(),
+        host_profile: None,
     });
     assert!(matches!(
         replies.first(),
@@ -347,6 +348,7 @@ fn seed_incident(service: &ControlService) {
         active_bundle_version: 0,
         active_bundle_digest: None,
         sent_at: Utc::now(),
+        host_profile: None,
     });
     assert!(matches!(
         replies.first(),
@@ -428,6 +430,10 @@ async fn investigator_flow_preserves_controller_decisions() {
 
     let hosts = client.tool("list_hosts", json!({}), false).await;
     assert_eq!(hosts["hosts"][0]["host_id"], HOST);
+    let filtered_hosts = client
+        .tool("list_hosts", json!({"tag":"unreported"}), false)
+        .await;
+    assert_eq!(filtered_hosts["hosts"], json!([]));
     let incidents = client
         .tool("list_active_incidents", json!({"host_id":HOST}), false)
         .await;

@@ -4,28 +4,33 @@
 //! in-process against `FakeHostCollectors`.
 
 use std::collections::VecDeque;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use defsec_policy::edge_floor::EdgeSafetyConfig;
 use defsec_protocol::observation::{
-    JournalEventRecord, ListeningSocketEntry, ObservationPayload, ObservationStatus,
+    ConnectionsOutboundSnapshot, FlowAttribution, JournalEventRecord, ListeningSocketEntry,
+    ObservationPayload, ObservationStatus, PackageInventoryEntry, PackagesInventorySnapshot,
     SocketsListeningSnapshot,
 };
+use defsec_protocol::profile::HostProfileSummary;
 use defsec_protocol::signing::{
     SigningKeyPair, VerifyingKeyStore, DOMAIN_WATCH_BUNDLE_V1, SignedEnvelope,
 };
 use defsec_protocol::watch::{
-    CollectorSpec, DataClassification, JournalUnitEventsParams, SocketsListeningParams,
-    SystemdUnitStateParams, ThresholdOp, TriggerPredicate, WATCH_BUNDLE_SCHEMA_VERSION,
-    WakePolicy, WatchBundlePayload, WatchClass, WatchLifecycle, WatchSchedule, WatchSpec,
+    CollectorSpec, ConnectionsOutboundParams, DataClassification, JournalUnitEventsParams,
+    PackagesInventoryParams, SocketsListeningParams, SystemdUnitStateParams, ThresholdOp,
+    TriggerPredicate, WATCH_BUNDLE_SCHEMA_VERSION, WakePolicy, WatchBundlePayload, WatchClass,
+    WatchLifecycle, WatchSchedule, WatchSpec,
 };
 use defsec_protocol::wire::{AgentToControl, BundleAckStatus, ControlToAgent};
 use uuid::Uuid;
 
 use agent_d::collectors::{FakeHostCollectors, FakeHostState};
 use agent_d::engine::AgentEngine;
+use agent_d::profile::{LoadedProfile, load_profile};
 use agent_d::spool::DurabilityProfile;
 
 const HOST: &str = "edge-01";
@@ -118,6 +123,75 @@ fn journal_watch(id: &str, class: WatchClass) -> WatchSpec {
     }
 }
 
+fn outbound_watch(id: &str) -> WatchSpec {
+    WatchSpec {
+        id: id.into(),
+        version: 1,
+        host_id: HOST.into(),
+        class: WatchClass::Baseline,
+        incident_id: None,
+        collector: CollectorSpec::ConnectionsOutbound(ConnectionsOutboundParams {
+            include_tcp: true,
+            include_udp: true,
+            include_ipv6: true,
+            resolve_process: false,
+            exclude_loopback: true,
+            max_flows: Some(256),
+        }),
+        schedule: WatchSchedule {
+            interval_seconds: 15,
+            timeout_seconds: 5,
+        },
+        trigger: TriggerPredicate::SetDiff {
+            compare_against: defsec_protocol::watch::CompareTarget::LastObserved,
+            set_field: "flows".into(),
+            identity_key: "flow_key".into(),
+            ignore_fields: vec![],
+        },
+        wake_policy: WakePolicy {
+            cooldown_seconds: 60,
+            max_wakeups_per_hour: 4,
+        },
+        lifecycle: WatchLifecycle {
+            enabled: true,
+            expires_at: None,
+            max_runs: None,
+        },
+    }
+}
+
+fn packages_watch(id: &str) -> WatchSpec {
+    WatchSpec {
+        id: id.into(),
+        version: 1,
+        host_id: HOST.into(),
+        class: WatchClass::Baseline,
+        incident_id: None,
+        collector: CollectorSpec::PackagesInventory(PackagesInventoryParams {
+            max_packages: Some(4096),
+        }),
+        schedule: WatchSchedule {
+            interval_seconds: 15,
+            timeout_seconds: 5,
+        },
+        trigger: TriggerPredicate::ThresholdSustained {
+            field: "total_packages".into(),
+            operator: ThresholdOp::Gte,
+            threshold: 1_000_000,
+            consecutive_samples: 2,
+        },
+        wake_policy: WakePolicy {
+            cooldown_seconds: 60,
+            max_wakeups_per_hour: 4,
+        },
+        lifecycle: WatchLifecycle {
+            enabled: true,
+            expires_at: None,
+            max_runs: None,
+        },
+    }
+}
+
 fn signed_bundle(
     kp: &SigningKeyPair,
     target_host: &str,
@@ -170,6 +244,16 @@ fn engine_with(
     host: FakeHostCollectors,
     durable: bool,
 ) -> AgentEngine<FakeHostCollectors> {
+    engine_with_cfg(kp, dir, host, durable, EdgeSafetyConfig::default())
+}
+
+fn engine_with_cfg(
+    kp: &SigningKeyPair,
+    dir: &Path,
+    host: FakeHostCollectors,
+    durable: bool,
+    cfg: EdgeSafetyConfig,
+) -> AgentEngine<FakeHostCollectors> {
     let durability = if durable {
         DurabilityProfile::Durable {
             max_disk_bytes: 1024 * 1024,
@@ -180,7 +264,7 @@ fn engine_with(
         }
     };
     AgentEngine::new(
-        EdgeSafetyConfig::default(),
+        cfg,
         HOST.into(),
         durability,
         dir.to_path_buf(),
@@ -776,5 +860,356 @@ async fn register_and_bundle_reload_from_state_dir() {
             assert!(!session_id.is_empty());
         }
         other => panic!("expected register, got {other:?}"),
+    }
+}
+
+fn scripted_new_collector_host() -> FakeHostState {
+    use defsec_protocol::canonical::sha256_hex;
+    FakeHostState {
+        outbound: ConnectionsOutboundSnapshot {
+            flows: vec![defsec_protocol::observation::OutboundFlowEntry {
+                flow_key: "tcp:192.0.2.10:443:1000:curl".into(),
+                protocol: "tcp".into(),
+                remote_addr: "192.0.2.10".into(),
+                remote_port: 443,
+                uid: 1000,
+                states: vec!["ESTABLISHED".into()],
+                count: 3,
+                comm: Some("curl".into()),
+                systemd_unit: None,
+                attribution: FlowAttribution::Full,
+            }],
+            total_flows: 1,
+            attribution_partial: false,
+            truncated: None,
+            omitted_flows: None,
+        },
+        packages: PackagesInventorySnapshot {
+            packages: vec![PackageInventoryEntry {
+                package_key: "bash:amd64".into(),
+                name: "bash".into(),
+                arch: "amd64".into(),
+                version: "5.2-3".into(),
+            }],
+            total_packages: 1,
+            status_file_sha256: sha256_hex(&[]),
+            malformed_stanzas: 0,
+            duplicate_stanzas: 0,
+            truncated: None,
+            omitted_packages: None,
+        },
+        ..FakeHostState::default()
+    }
+}
+
+#[tokio::test]
+async fn new_snapshot_collectors_produce_valid_observations_through_the_engine() {
+    let kp = key_pair();
+    let dir = state_dir("new-collectors");
+    let host = FakeHostCollectors::from_state(scripted_new_collector_host());
+    let mut engine = engine_with(&kp, &dir, host.clone(), false);
+    let now = Utc::now();
+
+    engine
+        .handle_control(
+            sync_bundle_msg(
+                &kp,
+                HOST,
+                1,
+                vec![outbound_watch("w-out"), packages_watch("w-pkg")],
+            ),
+            now,
+        )
+        .await;
+    assert_eq!(
+        engine.watch_ids(),
+        vec!["w-out".to_string(), "w-pkg".to_string()]
+    );
+
+    let t0 = base_time();
+    let msgs = engine.run_due_watches(t0 + Duration::seconds(1000)).await;
+    let emitted = deltas(&msgs);
+    assert_eq!(emitted.len(), 2, "both snapshot collectors must sample");
+
+    let out_obs = emitted
+        .iter()
+        .find(|o| o.watch_id == "w-out")
+        .expect("outbound observation");
+    assert_eq!(
+        out_obs.collector_type,
+        defsec_protocol::watch::CollectorType::ConnectionsOutbound
+    );
+    assert_eq!(out_obs.status, ObservationStatus::Ok);
+    assert!(out_obs.is_reconciliation, "first sample is a checkpoint");
+    let ObservationPayload::Snapshot { data } = &out_obs.payload else {
+        panic!("expected snapshot payload for connections.outbound");
+    };
+    let snap: ConnectionsOutboundSnapshot = serde_json::from_value(data.clone()).unwrap();
+    assert_eq!(snap.total_flows, 1);
+    assert_eq!(snap.flows[0].count, 3);
+    assert_eq!(snap.flows[0].flow_key, "tcp:192.0.2.10:443:1000:curl");
+    assert_eq!(snap.flows[0].attribution, FlowAttribution::Full);
+    assert_eq!(out_obs.state_hash.len(), 64);
+
+    let pkg_obs = emitted
+        .iter()
+        .find(|o| o.watch_id == "w-pkg")
+        .expect("packages observation");
+    assert_eq!(
+        pkg_obs.collector_type,
+        defsec_protocol::watch::CollectorType::PackagesInventory
+    );
+    assert_eq!(pkg_obs.status, ObservationStatus::Ok);
+    let ObservationPayload::Snapshot { data } = &pkg_obs.payload else {
+        panic!("expected snapshot payload for packages.inventory");
+    };
+    let snap: PackagesInventorySnapshot = serde_json::from_value(data.clone()).unwrap();
+    assert_eq!(snap.packages[0].package_key, "bash:amd64");
+    assert_eq!(snap.status_file_sha256.len(), 64);
+    assert_eq!(snap.malformed_stanzas, 0);
+
+    // Both snapshot collectors follow the standard diffing rules: an
+    // unchanged second sample is suppressed...
+    let msgs = engine.run_due_watches(t0 + Duration::seconds(1016)).await;
+    assert!(deltas(&msgs).is_empty(), "unchanged snapshots are suppressed");
+
+    // ...and reconciliation requests force a full re-observation.
+    engine
+        .handle_control(
+            ControlToAgent::RequestReconciliation {
+                host_id: HOST.into(),
+                watch_ids: vec!["w-out".into(), "w-pkg".into()],
+                reason: "operator requested".into(),
+            },
+            Utc::now(),
+        )
+        .await;
+    let msgs = engine.run_due_watches(t0 + Duration::seconds(1032)).await;
+    let emitted = deltas(&msgs);
+    assert_eq!(emitted.len(), 2);
+    assert!(emitted.iter().all(|o| o.is_reconciliation));
+
+    // Run summaries count both as successful valid samples.
+    let hb = match engine.make_heartbeat(Utc::now()) {
+        AgentToControl::Heartbeat { watch_summaries, .. } => watch_summaries,
+        other => panic!("expected heartbeat, got {other:?}"),
+    };
+    for id in ["w-out", "w-pkg"] {
+        let summary = hb.iter().find(|s| s.watch_id == id).unwrap();
+        assert_eq!(summary.completed_runs, 3);
+        assert_eq!(summary.success_runs, 3);
+        assert_eq!(summary.error_runs, 0);
+    }
+}
+
+#[tokio::test]
+async fn truncated_outbound_snapshot_reports_partial_with_explicit_reason() {
+    let kp = key_pair();
+    let dir = state_dir("outbound-truncated");
+    let mut state = scripted_new_collector_host();
+    state.outbound.truncated = Some(true);
+    state.outbound.omitted_flows = Some(900);
+    state.outbound.total_flows = 901;
+    state.outbound_status = Some(ObservationStatus::Partial);
+    state.outbound_partial_reasons = vec!["outbound flow inventory of 901 groups exceeds cap 1: retained the first 1 by flow key and omitted 900".into()];
+    let host = FakeHostCollectors::from_state(state);
+    let mut engine = engine_with(&kp, &dir, host, false);
+    let now = Utc::now();
+
+    engine
+        .handle_control(
+            sync_bundle_msg(&kp, HOST, 1, vec![outbound_watch("w-out")]),
+            now,
+        )
+        .await;
+
+    let t0 = base_time();
+    let msgs = engine.run_due_watches(t0 + Duration::seconds(1000)).await;
+    let emitted = deltas(&msgs);
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].status, ObservationStatus::Partial);
+    assert!(!emitted[0].partial_reasons.is_empty());
+    assert!(emitted[0].partial_reasons[0].contains("omitted 900"));
+    let ObservationPayload::Snapshot { data } = &emitted[0].payload else {
+        panic!("expected snapshot payload");
+    };
+    let snap: ConnectionsOutboundSnapshot = serde_json::from_value(data.clone()).unwrap();
+    assert_eq!(snap.truncated, Some(true));
+    assert_eq!(snap.omitted_flows, Some(900));
+    assert_eq!(snap.total_flows, 901);
+    // A Partial sample is still a usable (valid) sample for diffing.
+    let hb = match engine.make_heartbeat(Utc::now()) {
+        AgentToControl::Heartbeat { watch_summaries, .. } => watch_summaries,
+        other => panic!("expected heartbeat, got {other:?}"),
+    };
+    assert_eq!(hb[0].success_runs, 1);
+}
+
+fn load_profile_fixture(contents: &str) -> LoadedProfile {
+    let dir = std::env::temp_dir().join(format!("agent-d-profile-{}", Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let path = dir.join("profile.json");
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let result = load_profile(&path, &EdgeSafetyConfig::default());
+    std::fs::remove_dir_all(&dir).unwrap();
+    result.expect("valid profile file loads")
+}
+
+#[tokio::test]
+async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
+    let kp = key_pair();
+    let dir = state_dir("profile-reject");
+    let loaded = load_profile_fixture(
+        r#"{
+            "schema_version": 1,
+            "host_tags": ["prod"],
+            "enabled_collectors": ["sockets.listening"],
+            "collector_caps": { "max_outbound_flows": 32 }
+        }"#,
+    );
+    assert!(!loaded
+        .cfg
+        .allowed_collectors
+        .contains(&defsec_protocol::watch::CollectorType::ConnectionsOutbound));
+
+    let mut engine = engine_with_cfg(&kp, &dir, fake_sockets_host(3), false, loaded.cfg.clone());
+    let now = Utc::now();
+
+    // A bundle containing a watch whose collector is disabled by the profile
+    // is rejected through the existing BundleAck rejection path.
+    let msgs = engine
+        .handle_control(
+            sync_bundle_msg(&kp, HOST, 2, vec![outbound_watch("w-out")]),
+            now,
+        )
+        .await;
+    match &msgs[0] {
+        AgentToControl::BundleAck { status, reason, .. } => {
+            assert_eq!(*status, BundleAckStatus::Rejected);
+            let reason = reason.as_deref().unwrap();
+            assert!(reason.contains("connections.outbound"), "reason: {reason}");
+            assert!(reason.contains("not allowed by local safety floor"), "reason: {reason}");
+        }
+        other => panic!("expected BundleAck, got {other:?}"),
+    }
+    assert!(engine.watch_ids().is_empty());
+
+    let msgs = engine
+        .handle_control(
+            sync_bundle_msg(&kp, HOST, 2, vec![packages_watch("w-pkg")]),
+            now,
+        )
+        .await;
+    match &msgs[0] {
+        AgentToControl::BundleAck { status, reason, .. } => {
+            assert_eq!(*status, BundleAckStatus::Rejected);
+            assert!(reason.as_deref().unwrap().contains("packages.inventory"));
+        }
+        other => panic!("expected BundleAck, got {other:?}"),
+    }
+
+    // A bundle containing only still-enabled collectors is accepted.
+    let msgs = engine
+        .handle_control(
+            sync_bundle_msg(&kp, HOST, 3, vec![sockets_watch("w-sock")]),
+            now,
+        )
+        .await;
+    assert!(matches!(
+        &msgs[0],
+        AgentToControl::BundleAck {
+            status: BundleAckStatus::Accepted,
+            ..
+        }
+    ));
+    assert_eq!(engine.watch_ids(), vec!["w-sock".to_string()]);
+
+    // The profile also tightened the outbound cap centrally mirrored bounds:
+    // even if the collector were enabled, max_flows beyond 32 would fail.
+    assert_eq!(loaded.cfg.max_outbound_flows, 32);
+}
+
+#[tokio::test]
+async fn register_reports_host_profile_summary_when_present() {
+    let kp = key_pair();
+    let dir = state_dir("register-profile");
+
+    // Without a profile the Register message omits the summary entirely.
+    let mut engine = engine_with(&kp, &dir, fake_sockets_host(1), false);
+    match engine.make_register(Utc::now()) {
+        AgentToControl::Register { host_profile, .. } => assert_eq!(host_profile, None),
+        other => panic!("expected register, got {other:?}"),
+    }
+
+    // With a profile applied, the summary rides along on Register.
+    engine.set_host_profile_summary(Some(HostProfileSummary {
+        host_tags: vec!["prod".into(), "dc:eu-west-1".into()],
+        expected_services: vec!["sshd.service".into()],
+        enabled_collectors: vec![
+            defsec_protocol::watch::CollectorType::SocketsListening,
+            defsec_protocol::watch::CollectorType::ConnectionsOutbound,
+        ],
+    }));
+    match engine.make_register(Utc::now()) {
+        AgentToControl::Register { host_profile, .. } => {
+            let summary = host_profile.expect("profile summary on register");
+            assert_eq!(summary.host_tags, vec!["prod".to_string(), "dc:eu-west-1".to_string()]);
+            assert_eq!(summary.expected_services, vec!["sshd.service".to_string()]);
+            assert!(summary
+                .enabled_collectors
+                .contains(&defsec_protocol::watch::CollectorType::ConnectionsOutbound));
+        }
+        other => panic!("expected register, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tighter_profile_rejects_cached_bundle_and_identical_retransmission() {
+    let kp = key_pair();
+    let dir = state_dir("profile-cache-reject");
+    let now = Utc::now();
+    let msg = sync_bundle_msg(&kp, HOST, 2, vec![outbound_watch("w-out")]);
+    let mut original = engine_with(&kp, &dir, fake_sockets_host(0), false);
+    assert!(matches!(
+        original.handle_control(msg.clone(), now).await.as_slice(),
+        [AgentToControl::BundleAck {
+            status: BundleAckStatus::Accepted,
+            ..
+        }]
+    ));
+    drop(original);
+
+    let loaded = load_profile_fixture(
+        r#"{"schema_version":1,"enabled_collectors":["sockets.listening"]}"#,
+    );
+    let mut restarted = engine_with_cfg(&kp, &dir, fake_sockets_host(0), false, loaded.cfg);
+    assert_eq!(restarted.active_bundle_version(), 0);
+    assert!(restarted.watch_ids().is_empty());
+    assert!(restarted.stale_desired_state());
+    assert!(
+        restarted
+            .run_due_watches(now + Duration::seconds(90))
+            .await
+            .is_empty()
+    );
+
+    let registration = ControlToAgent::RegisterAck {
+        protocol_version: defsec_protocol::wire::WIRE_PROTOCOL_VERSION,
+        accepted: true,
+        reason: None,
+        server_time: now,
+        last_acked_seq_no: 0,
+    };
+    for incoming in [registration, msg] {
+        let reply = restarted.handle_control(incoming, now).await;
+        assert!(
+            matches!(
+                reply.as_slice(),
+                [AgentToControl::BundleAck { status: BundleAckStatus::Rejected, reason: Some(reason), .. }]
+                    if reason.contains("w-out") && reason.contains("connections.outbound")
+            ),
+            "{reply:?}"
+        );
     }
 }
