@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v2.sql"),
     include_str!("schema_v3.sql"),
     include_str!("schema_v4.sql"),
+    include_str!("schema_v5.sql"),
 ];
 
 /// Opens the local writer and applies pending migrations atomically.
@@ -48,6 +49,16 @@ pub(crate) fn json_column<T: DeserializeOwned>(
             Box::new(error),
         )
     })
+}
+
+pub(crate) fn optional_json<T: serde::de::DeserializeOwned>(
+    r: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<T>> {
+    r.get::<_, Option<String>>(index)?
+        .as_ref()
+        .map(|_| json_column(r, index))
+        .transpose()
 }
 
 pub(crate) fn rows<T>(

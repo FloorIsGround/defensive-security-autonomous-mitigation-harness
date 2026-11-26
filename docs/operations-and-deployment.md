@@ -65,6 +65,40 @@ For a first local test as the same user, start `control-d --data-dir ./run-data`
 
 Use the returned public key in place of `CONTROL_PUBLIC_KEY_HEX`. Enrollment and peer UID permissions are separate controls. Do not use a production control key or state directory for a disposable test.
 
+## Expectation rules
+
+Use expectation rules to express recurring changes a set-diff watch should accept. This example allows `nxserver.service` to open, close, or change loopback listeners on ports 4000–4100 on `edge-01`. Other services and binds continue to produce normal diffs. Omit `watch_id` to cover the host's socket set-diff watches.
+
+Save this rule as `nxserver-rule.json`.
+
+```json
+{
+  "scope": {"host_id": "edge-01", "collector": "sockets.listening"},
+  "matches": [
+    {"op": "eq", "field": "systemd_unit", "value": "nxserver.service"},
+    {"op": "eq", "field": "bind_scope", "value": "loopback"},
+    {"op": "range", "field": "local_port", "min": 4000, "max": 4100}
+  ],
+  "effect": "allow_optional",
+  "rationale": "Expected loopback ports for the remote desktop service"
+}
+```
+
+```sh
+./target/release/admin-cli --admin-sock ./run-data/admin.sock backtest-rule nxserver-rule.json
+./target/release/admin-cli --admin-sock ./run-data/admin.sock create-rule nxserver-rule.json --actor operator
+./target/release/admin-cli --admin-sock ./run-data/admin.sock list-rules --host edge-01 --status active --status proposed
+```
+
+An operator-created rule takes effect on the next observation. Investigator proposals come with a backtest and require an operator decision.
+
+```sh
+./target/release/admin-cli --admin-sock ./run-data/admin.sock decide-rule RULE_ID --approve --actor operator --note "Reviewed the backtest"
+./target/release/admin-cli --admin-sock ./run-data/admin.sock revoke-rule RULE_ID --actor operator --reason "Service retired"
+```
+
+Use `--reject` on a pending proposal to decline it. Backtests compare the latest 50 available valid samples in scope under the currently active rules, with and without the candidate. They reconstruct comparisons from ledger history. See the [expectation rules design](design/expectation-rules.md).
+
 ## Multi-host mTLS transport and PKI
 
 For remote edge hosts, `agent-d` initiates an outbound TLS 1.3 mTLS connection to `control-d` (zero inbound ports on edge hosts). Each host certificate embeds a `spiffe://defsecautmit/host/<host_id>` URI SAN, and `control-d` rejects any `Register` frame whose `host_id` does not match the peer certificate. TLS session resumption is disabled so serial revocations take effect immediately on the next connection without restarting `control-d`.
@@ -155,6 +189,10 @@ Configure an MCP client to launch `mcp-adapter --investigate-sock ./run-data/inv
 ```sh
 node console/server.mjs --investigate-sock ./run-data/investigate.sock --token-file TOKEN_FILE
 ```
+
+Both MCP modes expose `list_expectation_rules` (filter by `host_id`, `statuses`, `limit`) over the shared investigation RPC. In investigator mode the adapter additionally exposes `propose_expectation_rule` (`idempotency_key` plus a closed-schema `rule` mirroring `ExpectationRuleSpec`); the proposal is submitted for the run this adapter started via `start_investigation_run` — the caller never picks the `run_id` — and control-d's deterministic rule gate returns a policy decision plus a backtest. Accepted proposals are stored as `proposed` and stay inert until an operator decides them with `admin-cli decide-rule`. Decide rules with `admin-cli list-rules`, `create-rule RULE_JSON --actor`, `decide-rule RULE_ID --approve|--reject --actor` and `revoke-rule RULE_ID --actor --reason`; preview impact first with `backtest-rule RULE_JSON`.
+
+The reasoner worker exposes the same proposal as its `propose_expectation_rule` tool, enabled by default because proposals are inert. The worker caps it at 3 calls per run, records each proposal as run progress, and its system prompt restricts use to benign recurring set-diff noise with a clear service anchor (unit/comm/uid plus bounded ports) — never suspicious or unexplained activity. Control-d independently enforces the per-run (3), per-host (20 pending) and expiry (≤ 30 days) quotas for investigator-origin rules.
 
 Add `--enable-admin --admin-sock ./run-data/admin.sock` only for a trusted local operator session. The default listener is loopback. See [console/README.md](../console/README.md) for options and security boundaries.
 

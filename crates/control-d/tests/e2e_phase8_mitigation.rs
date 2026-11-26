@@ -68,6 +68,7 @@ fn baseline_sockets_watch(host: &str) -> WatchSpec {
             compare_against: CompareTarget::AcceptedBaseline,
             set_field: "sockets".into(),
             identity_key: "socket_key".into(),
+            ignore_fields: vec![],
         },
         wake_policy: WakePolicy {
             cooldown_seconds: 60,

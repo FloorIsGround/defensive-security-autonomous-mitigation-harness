@@ -408,10 +408,16 @@ fn validate_trigger_predicate(
         TriggerPredicate::SetDiff {
             set_field,
             identity_key,
+            ignore_fields,
             ..
         } => {
             if !is_valid_field_name(set_field) || !is_valid_field_name(identity_key) {
                 return Err("set_diff field names must be valid identifiers".into());
+            }
+            if ignore_fields.len() > 8 || ignore_fields.iter().any(|f| !is_valid_field_name(f)) {
+                return Err(
+                    "set_diff ignore_fields must contain at most 8 valid identifiers".into(),
+                );
             }
             Ok(())
         }

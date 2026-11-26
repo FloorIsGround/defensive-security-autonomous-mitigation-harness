@@ -13,6 +13,7 @@ use crate::action::{
 };
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
+use crate::rules::ExpectationRuleSpec;
 use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
@@ -147,6 +148,19 @@ pub enum InvestigationRequest {
         host_id: Option<String>,
         #[serde(default)]
         incident_id: Option<String>,
+        #[serde(default)]
+        statuses: Option<Vec<String>>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    ProposeExpectationRule {
+        run_id: String,
+        idempotency_key: String,
+        rule: ExpectationRuleSpec,
+    },
+    ListExpectationRules {
+        #[serde(default)]
+        host_id: Option<String>,
         #[serde(default)]
         statuses: Option<Vec<String>>,
         #[serde(default)]
@@ -417,6 +431,16 @@ pub enum InvestigationResponse {
     TriggerQueue {
         triggers: Vec<TriggerSummary>,
     },
+    RuleProposalEvaluated {
+        decision: PolicyDecision,
+        #[serde(default)]
+        rule_id: Option<String>,
+        #[serde(default)]
+        backtest: Option<RuleBacktest>,
+    },
+    ExpectationRules {
+        rules: Vec<ExpectationRuleRecord>,
+    },
     ProposalEvaluated {
         decision: PolicyDecision,
         #[serde(default)]
@@ -465,6 +489,33 @@ pub enum AdminRequest {
     EnrollHost {
         host_id: String,
         agent_public_key_hex: Option<String>,
+    },
+    CreateExpectationRule {
+        rule: ExpectationRuleSpec,
+        actor: String,
+    },
+    DecideExpectationRule {
+        rule_id: String,
+        approve: bool,
+        actor: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    RevokeExpectationRule {
+        rule_id: String,
+        actor: String,
+        reason: String,
+    },
+    BacktestExpectationRule {
+        rule: ExpectationRuleSpec,
+    },
+    ListExpectationRules {
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        statuses: Option<Vec<String>>,
+        #[serde(default)]
+        limit: Option<u32>,
     },
     ApplyBaselineWatch {
         spec: WatchSpec,
@@ -533,6 +584,16 @@ pub enum AdminResponse {
         control_signing_key_id: String,
         control_public_key_hex: String,
     },
+    RuleDecided {
+        rule_id: String,
+        status: String,
+    },
+    RuleBacktestResult {
+        backtest: RuleBacktest,
+    },
+    ExpectationRules {
+        rules: Vec<ExpectationRuleRecord>,
+    },
     WatchApplied {
         watch_id: String,
         bundle_version: u64,
@@ -592,4 +653,34 @@ pub enum AdminResponse {
         code: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleBacktest {
+    pub observations_scanned: u32,
+    pub triggered_before: u32,
+    pub triggered_after: u32,
+    pub items_matched: u32,
+    pub sample_keys: Vec<String>,
+    pub currently_matching: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectationRuleRecord {
+    pub rule_id: String,
+    pub status: String,
+    pub origin: String,
+    pub proposed_by: String,
+    pub run_id: Option<String>,
+    pub incident_id: Option<String>,
+    pub spec: ExpectationRuleSpec,
+    pub backtest: Option<RuleBacktest>,
+    pub created_at: DateTime<Utc>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decision_note: Option<String>,
+    pub hit_count: u64,
+    pub last_matched_at: Option<DateTime<Utc>>,
 }

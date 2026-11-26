@@ -21,12 +21,16 @@ import json
 import logging
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from queue import Full, Queue
 from typing import Any, Callable
 
 from defsec_reasoner import PROMPT_SCHEMA_VERSION
+from defsec_reasoner.canonical import (
+    CanonicalizationError,
+    canonical_json,
+    sha256_hex,
+)
 from defsec_reasoner.context import (
     compact_for_prompt,
     has_set_items,
@@ -70,6 +74,7 @@ class RunBudgets:
     max_total_tokens: int = 48000
     max_cost_usd: float = 0.25
     max_proposals_per_run: int = 3
+    max_rule_proposals_per_run: int = 3
     max_action_proposals_per_run: int = 1
     enable_action_proposals: bool = False
     max_context_bytes: int = 32768
@@ -92,6 +97,8 @@ class WorkerOutcome:
     findings: int = 0
     proposals: int = 0
     proposals_accepted: int = 0
+    rule_proposals_submitted: int = 0
+    rule_proposals_accepted: int = 0
     action_proposals_submitted: int = 0
     action_proposals_accepted: int = 0
     budget_stop_reason: str | None = None
@@ -175,6 +182,44 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
                 "rationale": {"type": "string"},
             },
             "required": ["spec", "rationale"],
+        },
+    },
+    {
+        "name": "propose_expectation_rule",
+        "description": (
+            "Propose ONE closed-schema expectation rule telling control-d that "
+            "benign recurring set-diff noise from a known service is expected "
+            "(e.g. a unit that may open and close its own bounded listener "
+            "ports). Use ONLY for benign recurring noise with a clear service "
+            "anchor (systemd_unit/comm/uid plus a bounded local_port); NEVER "
+            "for suspicious or unexplained activity. Rules are INERT until an "
+            "operator approves them on the admin interface; a proposal only "
+            "records an auditable expectation with a backtest. The central "
+            "gate is deterministic and a rejection is final. Exact "
+            "ExpectationRuleSpec JSON shape: "
+            "{scope: {host_id: str (the run host), collector: 'sockets.listening', "
+            "watch_id: str (optional)}, "
+            "matches: [1..8 of {op: 'eq', field: str, value: str|int} "
+            "| {op: 'in', field: str, values: [str|int, ...max 32]} "
+            "| {op: 'range', field: str, min: int, max: int} "
+            "| {op: 'prefix', field: str, value: str}], "
+            "effect: 'allow_optional' | 'require_present' | 'ignore_modified', "
+            "rationale: str (<=1024 bytes), "
+            "expires_at: '<RFC3339 UTC within 30 days, required>'}. Sockets fields: "
+            "protocol, local_addr, local_port, uid, comm, systemd_unit, bind_scope. "
+            "Proposals are idempotent per (run_id, idempotency_key): omit the key "
+            "and an identical resubmission of the same rule replays the stored "
+            "decision instead of proposing twice. "
+            "Arguments: rule (object), optional idempotency_key (string)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "idempotency_key": {"type": "string"},
+                "rule": {"type": "object"},
+            },
+            "required": ["rule"],
+            "additionalProperties": False,
         },
     },
     {
@@ -361,6 +406,56 @@ def _redact_credentials(text: str, client: ControlRpcClient, lease_token: str) -
     return text
 
 
+def _auto_idempotency_key(run_id: str, payload: Any) -> str:
+    """Deterministic default idempotency key for one typed proposal.
+
+    control-d stores a receipt per ``(run_id, idempotency_key)``: replaying
+    the same key with the same canonical spec returns the original response,
+    and reusing it with a different spec is a structured ``conflict``.
+    Deriving the key from the run plus an RFC 8785 canonical serialization
+    of the proposal payload means a proposal whose response was lost can be
+    resubmitted verbatim and replay instead of storing a duplicate: identical
+    proposals in the same run share a key, distinct proposals get distinct
+    keys, and the key is stable across worker restarts because it contains
+    no process-local randomness and no attempt counter.
+
+    A payload outside the canonical JSON subset (e.g. a non-integral float
+    smuggled in by a model) falls back to sorted deterministic JSON: the
+    key stays a pure function of the payload, and control-d's typed boundary
+    still rejects the spec itself.
+    """
+    try:
+        payload_material = canonical_json(payload)
+    except CanonicalizationError:
+        payload_material = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        )
+    material = canonical_json(str(run_id)) + payload_material
+    return "auto-" + sha256_hex(material.encode("utf-8"))[:32]
+
+
+def _outcome_unknown(tool_noun: str, exc: RpcTransportError) -> dict[str, Any]:
+    """A proposal tool result for a transport-level failure (timeout/EOF).
+
+    The call was sent but no structured reply arrived: the proposal may have
+    committed before the connection died, or may never have been parsed.
+    That ambiguity is reported to the model explicitly instead of aborting
+    the run or guessing a schema rejection; the deterministic auto key (or
+    the model's own key) makes an identical resubmission replay the receipt.
+    Callers add their ``_*_attempted`` flag so the attempt is charged
+    against the per-run proposal cap.
+    """
+    return {
+        "error": "outcome_unknown",
+        "detail": clip_utf8(
+            "control-d transport failure while submitting the "
+            f"{tool_noun} (a commit may or may not have landed): {exc}",
+            256,
+        ),
+        "retry_hint": f"re-submitting the identical {tool_noun} is safe; it will replay",
+    }
+
+
 class ReasonerWorker:
     """Bounded episodic worker; dormant until a trigger is leased."""
 
@@ -474,6 +569,7 @@ class ReasonerWorker:
             "budgets": {
                 "max_turns": self.budgets.max_turns,
                 "max_proposals_per_run": self.budgets.max_proposals_per_run,
+                "max_rule_proposals_per_run": self.budgets.max_rule_proposals_per_run,
                 "max_action_proposals_per_run": self.budgets.max_action_proposals_per_run,
                 "enable_action_proposals": self.budgets.enable_action_proposals,
                 "max_total_tokens": self.budgets.max_total_tokens,
@@ -573,16 +669,25 @@ class ReasonerWorker:
                             incident_id=incident_id,
                             host_id=host_id,
                             proposals_done=outcome.proposals,
+                            rule_proposals_done=outcome.rule_proposals_submitted,
                             action_proposals_done=outcome.action_proposals_submitted,
                             findings_done=outcome.findings,
                         )
                         proposal_accepted = bool(result.pop("_accepted_proposal", None))
                         proposal_attempted = result.pop("_proposal_attempted", None)
+                        rule_accepted = bool(result.pop("_accepted_rule_proposal", None))
+                        rule_attempted = result.pop("_rule_proposal_attempted", None)
                         action_accepted = bool(result.pop("_action_proposal_accepted", None))
                         action_attempted = result.pop("_action_proposal_attempted", None)
                         outcome.proposals += int(bool(proposal_attempted) or proposal_accepted)
                         outcome.proposals_accepted += int(proposal_accepted)
-                        outcome.action_proposals_submitted += int(bool(action_attempted) or action_accepted)
+                        outcome.rule_proposals_submitted += int(
+                            bool(rule_attempted) or rule_accepted
+                        )
+                        outcome.rule_proposals_accepted += int(rule_accepted)
+                        outcome.action_proposals_submitted += int(
+                            bool(action_attempted) or action_accepted
+                        )
                         outcome.action_proposals_accepted += int(action_accepted)
                         outcome.findings += int(bool(result.pop("_finding_recorded", None)))
 
@@ -590,8 +695,14 @@ class ReasonerWorker:
                         detail: dict[str, Any] = {"tool": tool_name, "ok": error is None}
                         if error is not None:
                             detail["error_code"] = clip_utf8(str(error), 64)
-                        if tool_name in ("propose_ephemeral_watch", "propose_action"):
-                            detail["accepted"] = proposal_accepted or action_accepted
+                        if tool_name in (
+                            "propose_ephemeral_watch",
+                            "propose_expectation_rule",
+                            "propose_action",
+                        ):
+                            detail["accepted"] = (
+                                proposal_accepted or rule_accepted or action_accepted
+                            )
                         progress.record("tool_result", **detail)
                         messages.append(
                             {
@@ -643,8 +754,9 @@ class ReasonerWorker:
             return outcome
         logger.info(
             "event %s completed: turns=%s findings=%s proposals=%s (accepted=%s) "
-            "action_proposals=%s (accepted=%s)",
+            "rule_proposals=%s (accepted=%s) action_proposals=%s (accepted=%s)",
             event_id, outcome.turns, outcome.findings, outcome.proposals, outcome.proposals_accepted,
+            outcome.rule_proposals_submitted, outcome.rule_proposals_accepted,
             outcome.action_proposals_submitted, outcome.action_proposals_accepted,
         )
         return outcome
@@ -660,6 +772,7 @@ class ReasonerWorker:
         incident_id: str,
         host_id: str,
         proposals_done: int,
+        rule_proposals_done: int,
         action_proposals_done: int,
         findings_done: int,
     ) -> tuple[dict[str, Any], bool]:
@@ -735,7 +848,16 @@ class ReasonerWorker:
                         run_id,
                         incident_id,
                         args.get("idempotency_key")
-                        or f"{run_id}-a{action_proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        or _auto_idempotency_key(
+                            run_id,
+                            {
+                                "verb": verb,
+                                "evidence_observation_ids": sorted({int(i) for i in evidence}),
+                                "expected_effect": expected_effect,
+                                "blast_radius": blast_radius,
+                                "rollback_plan": rollback_plan,
+                            },
+                        ),
                         verb,
                         [int(i) for i in evidence],
                         expected_effect,
@@ -747,6 +869,14 @@ class ReasonerWorker:
                         {
                             "error": exc.code,
                             "detail": exc.message,
+                            "_action_proposal_attempted": True,
+                        },
+                        False,
+                    )
+                except RpcTransportError as exc:
+                    return (
+                        {
+                            **_outcome_unknown("action proposal", exc),
                             "_action_proposal_attempted": True,
                         },
                         False,
@@ -835,7 +965,9 @@ class ReasonerWorker:
                     reply = client.propose_ephemeral_watch(
                         run_id,
                         args.get("idempotency_key")
-                        or f"{run_id}-p{proposals_done + 1}-{uuid.uuid4().hex[:8]}",
+                        or _auto_idempotency_key(
+                            run_id, {"spec": spec, "rationale": rationale}
+                        ),
                         spec,
                         rationale,
                     )
@@ -847,19 +979,17 @@ class ReasonerWorker:
                         False,
                     )
                 except RpcTransportError as exc:
-                    if "unexpected EOF" in str(exc):
-                        return (
-                            {
-                                "error": "schema_rejected",
-                                "detail": (
-                                    "control-d rejected the WatchSpec JSON schema (deny_unknown_fields or missing required field); "
-                                    "verify exact WatchSpec structure"
-                                ),
-                                "_proposal_attempted": True,
-                            },
-                            False,
-                        )
-                    raise
+                    # The proposal may have committed before the connection died,
+                    # or never have been parsed. Report the ambiguity to the model
+                    # (the deterministic key makes an identical resubmission
+                    # replay), charge the attempt, and keep the run going.
+                    return (
+                        {
+                            **_outcome_unknown("ephemeral watch proposal", exc),
+                            "_proposal_attempted": True,
+                        },
+                        False,
+                    )
                 decision = reply.get("decision") or {}
                 result = {
                     "decision": decision,
@@ -869,6 +999,62 @@ class ReasonerWorker:
                 }
                 if decision.get("allowed"):
                     result["_accepted_proposal"] = True
+                return result, False
+            if name == "propose_expectation_rule":
+                if rule_proposals_done >= self.budgets.max_rule_proposals_per_run:
+                    return (
+                        {
+                            "error": "budget",
+                            "detail": "expectation rule proposal budget of "
+                            f"{self.budgets.max_rule_proposals_per_run} "
+                            "for this run is exhausted",
+                        },
+                        False,
+                    )
+                rule = args.get("rule")
+                if not isinstance(rule, dict):
+                    return (
+                        {"error": "invalid", "detail": "rule must be an ExpectationRuleSpec object"},
+                        False,
+                    )
+                try:
+                    reply = client.propose_expectation_rule(
+                        run_id,
+                        args.get("idempotency_key")
+                        or _auto_idempotency_key(run_id, rule),
+                        rule,
+                    )
+                except RpcError as exc:
+                    # A deterministic policy rejection still consumes the call
+                    # budget: rejections are final and must not be retried.
+                    return (
+                        {"error": exc.code, "detail": exc.message, "_rule_proposal_attempted": True},
+                        False,
+                    )
+                except RpcTransportError as exc:
+                    # A read timeout or EOF means the outcome is genuinely
+                    # unknown: the rule may have committed before the response
+                    # was lost, or may never have been parsed (control-d closes
+                    # the socket on a schema violation). Report that to the
+                    # model — never abort the run and never guess a rejection —
+                    # and charge the attempt. The deterministic key makes an
+                    # identical resubmission replay the original receipt.
+                    return (
+                        {
+                            **_outcome_unknown("rule", exc),
+                            "_rule_proposal_attempted": True,
+                        },
+                        False,
+                    )
+                decision = reply.get("decision") or {}
+                result = {
+                    "decision": decision,
+                    "rule_id": reply.get("rule_id"),
+                    "backtest": reply.get("backtest"),
+                    "_rule_proposal_attempted": True,
+                }
+                if decision.get("allowed"):
+                    result["_accepted_rule_proposal"] = True
                 return result, False
             if name == "record_hypothesis_or_finding":
                 kind = str(args.get("kind") or "hypothesis")

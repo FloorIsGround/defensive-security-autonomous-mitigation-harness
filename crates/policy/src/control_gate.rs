@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::edge_floor::{EdgeSafetyConfig, validate_watch_spec};
 
+pub(crate) const DEFAULT_POLICY_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPolicyConfig {
     pub policy_version: u32,
@@ -27,7 +29,7 @@ pub struct ControlPolicyConfig {
 impl Default for ControlPolicyConfig {
     fn default() -> Self {
         Self {
-            policy_version: 1,
+            policy_version: DEFAULT_POLICY_VERSION,
             max_ephemeral_per_incident: 5,
             max_ephemeral_per_host: 10,
             max_proposals_per_incident: 25,
@@ -358,6 +360,44 @@ mod tests {
         let d = evaluate_watch_proposal(&cap, &dup, &dup_ctx, &cfg, now);
         assert!(!d.allowed);
         assert_eq!(d.rule_id, "dedup.equivalent_active_watch");
+    }
+
+    #[test]
+    fn set_diff_ignore_fields_share_edge_and_control_limits() {
+        let now = Utc::now();
+        let cfg = ControlPolicyConfig::default();
+        let cap = make_cap(PrincipalRole::Investigator, now);
+        let mut spec = make_spec("e1", WatchClass::Ephemeral, "edge-07", "sshd.service", now);
+        spec.collector =
+            CollectorSpec::SocketsListening(defsec_protocol::watch::SocketsListeningParams {
+                include_tcp: true,
+                include_udp: false,
+                include_ipv6: true,
+                resolve_process: true,
+            });
+        for (fields, allowed) in [
+            (vec!["inode"; 8], true),
+            (vec!["inode"; 9], false),
+            (vec!["pid start"], false),
+        ] {
+            spec.trigger = TriggerPredicate::SetDiff {
+                compare_against: CompareTarget::LastObserved,
+                set_field: "sockets".into(),
+                identity_key: "socket_key".into(),
+                ignore_fields: fields.into_iter().map(String::from).collect(),
+            };
+            assert_eq!(
+                validate_watch_spec(&spec, &cfg.edge_floor, now).is_ok(),
+                allowed
+            );
+            let decision =
+                evaluate_watch_proposal(&cap, &spec, &ProposalContext::default(), &cfg, now);
+            assert_eq!(decision.allowed, allowed);
+            if !allowed {
+                assert_eq!(decision.rule_id, "spec.safety_floor");
+                assert!(decision.reason.contains("ignore_fields"));
+            }
+        }
     }
 
     #[test]

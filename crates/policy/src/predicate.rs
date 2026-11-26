@@ -172,6 +172,7 @@ pub fn evaluate_predicate(
             compare_against,
             set_field,
             identity_key,
+            ignore_fields,
         } => {
             if !status.is_valid_sample() {
                 return PredicateOutcome::SampleInvalid {
@@ -209,7 +210,12 @@ pub fn evaluate_predicate(
             for (k, cur_item) in &cur_map {
                 match prev_map.get(k) {
                     None => added.push(k.clone()),
-                    Some(prev_item) if prev_item != cur_item => modified.push(k.clone()),
+                    Some(prev_item)
+                        if comparable_item(prev_item, ignore_fields)
+                            != comparable_item(cur_item, ignore_fields) =>
+                    {
+                        modified.push(k.clone());
+                    }
                     Some(_) => {}
                 }
             }
@@ -292,11 +298,11 @@ fn compare_threshold(n: i64, op: ThresholdOp, threshold: i64) -> bool {
     }
 }
 
-fn extract_keyed_set(
-    root: &Value,
+pub(crate) fn extract_keyed_set<'a>(
+    root: &'a Value,
     set_field: &str,
     identity_key: &str,
-) -> Option<BTreeMap<String, String>> {
+) -> Option<BTreeMap<String, &'a Value>> {
     let arr = lookup_field(root, set_field)?.as_array()?;
     let mut map = BTreeMap::new();
     for item in arr {
@@ -305,10 +311,22 @@ fn extract_keyed_set(
             Value::String(s) => s.clone(),
             other => value_to_canonical_json(other).ok()?,
         };
-        let canon = value_to_canonical_json(item).ok()?;
-        map.insert(key, canon);
+        map.insert(key, item);
     }
     Some(map)
+}
+
+fn comparable_item(item: &Value, ignore_fields: &[String]) -> Option<String> {
+    if !ignore_fields.is_empty()
+        && let Some(fields) = item.as_object()
+    {
+        let mut fields = fields.clone();
+        for field in ignore_fields {
+            fields.remove(field);
+        }
+        return value_to_canonical_json(&Value::Object(fields)).ok();
+    }
+    value_to_canonical_json(item).ok()
 }
 
 #[cfg(test)]
@@ -367,6 +385,7 @@ mod tests {
             compare_against: CompareTarget::AcceptedBaseline,
             set_field: "sockets".into(),
             identity_key: "socket_key".into(),
+            ignore_fields: vec![],
         };
         let base = json!({
             "sockets": [

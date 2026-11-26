@@ -588,3 +588,181 @@ export function publicTrigger(t) {
     reason: s.reason ?? null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Expectation rules (Phase 10): closed schema, admin bodies, browser-safe records
+// ---------------------------------------------------------------------------
+//
+// control-d deserializes ExpectationRuleSpec with deny_unknown_fields, so a
+// stray key or a wrong type makes it close the socket instead of answering.
+// The BFF therefore checks the exact *shape* here (keys, types, enums) and
+// rebuilds the spec field by field. Policy bounds (clause counts, text sizes,
+// identity anchors, port bounds, expiry) are deliberately left to control-d's
+// rule gate, so the operator sees its real `rule-gate/*` decision.
+
+/** Every CollectorType value control-d can deserialize; the gate decides which are rule-capable. */
+export const RULE_COLLECTORS = Object.freeze(['sockets.listening', 'systemd.unit_state', 'files.metadata', 'journal.unit_events', 'connections.outbound', 'packages.inventory']);
+export const RULE_EFFECTS = Object.freeze(['allow_optional', 'require_present', 'ignore_modified']);
+export const RULE_OPS = Object.freeze(['eq', 'in', 'range', 'prefix']);
+export const RULE_STATUSES = Object.freeze(['active', 'proposed', 'rejected', 'revoked', 'expired']);
+export const RULES_UNSUPPORTED_MESSAGE = 'expectation rules require control-d ≥ Phase 10';
+const RULE_FIELD_RE = /^[a-z][a-z0-9_]{0,63}$/;
+// Transport sanity only (the 64 KiB body limit applies too); the gate enforces 1..=8 and 1..=32.
+const MAX_WIRE_CLAUSES = 64;
+const MAX_WIRE_VALUES = 256;
+const I64_MIN = -(2n ** 63n);
+const I64_MAX = 2n ** 63n - 1n;
+
+const bad = (message) => new ApiError(400, 'invalid_request', message);
+
+function exactKeys(obj, allowed, name) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw bad(`${name} must be an object`);
+  for (const k of Object.keys(obj)) {
+    if (!allowed.includes(k)) throw bad(`${name}.${k} is not part of the expectation rule schema (allowed: ${allowed.join(', ')})`);
+  }
+}
+
+function ruleInt(v, name) {
+  if (typeof v !== 'number' || !Number.isSafeInteger(v)) throw bad(`${name} must be an integer`);
+  const b = BigInt(v);
+  if (b < I64_MIN || b > I64_MAX) throw bad(`${name} is outside the i64 range`);
+  return v;
+}
+
+/** RuleValue is untagged: an integer, a boolean or a string (floats and objects do not deserialize). */
+function ruleValue(v, name) {
+  if (typeof v === 'boolean' || typeof v === 'string') return v;
+  if (typeof v === 'number') return ruleInt(v, name);
+  throw bad(`${name} must be an integer, a boolean or a string`);
+}
+
+function ruleField(v, name) {
+  if (typeof v !== 'string' || !RULE_FIELD_RE.test(v)) throw bad(`${name} must be a lowercase field name such as systemd_unit or local_port`);
+  return v;
+}
+
+export function parseMatchClause(raw, i) {
+  const name = `rule.matches[${i}]`;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw bad(`${name} must be an object`);
+  const op = requireEnum(raw.op, RULE_OPS, `${name}.op`);
+  switch (op) {
+    case 'eq':
+      exactKeys(raw, ['op', 'field', 'value'], name);
+      return { op, field: ruleField(raw.field, `${name}.field`), value: ruleValue(raw.value, `${name}.value`) };
+    case 'in': {
+      exactKeys(raw, ['op', 'field', 'values'], name);
+      if (!Array.isArray(raw.values)) throw bad(`${name}.values must be an array`);
+      if (raw.values.length > MAX_WIRE_VALUES) throw bad(`${name}.values has more than ${MAX_WIRE_VALUES} entries`);
+      return { op, field: ruleField(raw.field, `${name}.field`), values: raw.values.map((v, j) => ruleValue(v, `${name}.values[${j}]`)) };
+    }
+    case 'range':
+      exactKeys(raw, ['op', 'field', 'min', 'max'], name);
+      return { op, field: ruleField(raw.field, `${name}.field`), min: ruleInt(raw.min, `${name}.min`), max: ruleInt(raw.max, `${name}.max`) };
+    case 'prefix':
+      exactKeys(raw, ['op', 'field', 'value'], name);
+      if (typeof raw.value !== 'string') throw bad(`${name}.value must be a string`);
+      return { op, field: ruleField(raw.field, `${name}.field`), value: raw.value };
+  }
+}
+
+/** Exact ExpectationRuleSpec (crates/protocol/src/rules.rs) rebuilt from untrusted input. */
+export function parseRuleSpec(raw) {
+  exactKeys(raw, ['scope', 'matches', 'effect', 'rationale', 'expires_at'], 'rule');
+  exactKeys(raw.scope, ['host_id', 'collector', 'watch_id'], 'rule.scope');
+  const scope = {
+    host_id: requireIdent(raw.scope.host_id, 'rule.scope.host_id'),
+    collector: requireEnum(raw.scope.collector, RULE_COLLECTORS, 'rule.scope.collector'),
+    watch_id: raw.scope.watch_id === undefined || raw.scope.watch_id === null || raw.scope.watch_id === '' ? null : requireIdent(raw.scope.watch_id, 'rule.scope.watch_id'),
+  };
+  if (!Array.isArray(raw.matches)) throw bad('rule.matches must be an array of match clauses');
+  if (raw.matches.length > MAX_WIRE_CLAUSES) throw bad(`rule.matches has more than ${MAX_WIRE_CLAUSES} clauses`);
+  if (typeof raw.rationale !== 'string') throw bad('rule.rationale must be a string');
+  if (raw.rationale.length > 4096) throw bad('rule.rationale exceeds 4096 characters');
+  let expires_at = null;
+  if (raw.expires_at !== undefined && raw.expires_at !== null && raw.expires_at !== '') {
+    const t = typeof raw.expires_at === 'string' ? Date.parse(raw.expires_at) : NaN;
+    if (!Number.isFinite(t)) throw bad('rule.expires_at must be an RFC 3339 timestamp or null');
+    expires_at = new Date(t).toISOString();
+  }
+  return {
+    scope,
+    matches: raw.matches.map(parseMatchClause),
+    effect: requireEnum(raw.effect, RULE_EFFECTS, 'rule.effect'),
+    rationale: raw.rationale,
+    expires_at,
+  };
+}
+
+/** Body of POST /api/admin/rules and /api/admin/rules/backtest: `{ rule, actor? }`. */
+export function parseRuleBody(body, { actor = false } = {}) {
+  if (!body || typeof body !== 'object') throw bad('request body must be an object');
+  const rule = parseRuleSpec(body.rule);
+  return actor ? { rule, actor: requireText(body.actor, 'actor', 128) } : { rule };
+}
+
+export function parseRuleId(id) {
+  if (typeof id !== 'string' || !/^rule-[A-Za-z0-9-]{1,80}$/.test(id)) throw bad('rule_id must look like rule-<uuid>');
+  return id;
+}
+
+export function parseRuleDecision(body) {
+  if (!body || typeof body !== 'object') throw bad('request body must be an object');
+  if (typeof body.approve !== 'boolean') throw bad('approve must be true or false');
+  const note = body.note === undefined || body.note === null || (typeof body.note === 'string' && !body.note.trim()) ? null : body.note;
+  if (note !== null && (typeof note !== 'string' || note.length > 1024)) throw bad('note must be text of at most 1024 characters');
+  return { approve: body.approve, note, actor: requireText(body.actor, 'actor', 128) };
+}
+
+export function parseRuleRevoke(body) {
+  if (!body || typeof body !== 'object') throw bad('request body must be an object');
+  if (typeof body.reason !== 'string' || !body.reason.trim()) throw bad('a revocation reason is required');
+  return { reason: requireText(body.reason, 'reason', 1024), actor: requireText(body.actor, 'actor', 128) };
+}
+
+export function parseRulesQuery({ status = null, host_id = null, limit = null } = {}) {
+  const statuses = status
+    ? [...new Set(String(status).split(',').map((s) => s.trim()).filter(Boolean))].map((s) => requireEnum(s, RULE_STATUSES, 'status'))
+    : null;
+  return {
+    statuses,
+    host_id: host_id ? requireIdent(host_id, 'host_id') : null,
+    limit: int(limit, 'limit', { min: 1, max: 100, optional: true }) ?? 100,
+  };
+}
+
+export function publicBacktest(b) {
+  if (!b || typeof b !== 'object') return null;
+  const n = (v) => (Number.isFinite(v) ? v : 0);
+  return {
+    observations_scanned: n(b.observations_scanned),
+    triggered_before: n(b.triggered_before),
+    triggered_after: n(b.triggered_after),
+    items_matched: n(b.items_matched),
+    sample_keys: Array.isArray(b.sample_keys) ? b.sample_keys.slice(0, 10).map(String) : [],
+    currently_matching: n(b.currently_matching),
+  };
+}
+
+/** Browser-safe ExpectationRuleRecord: exactly the contract's fields, nothing token-like. */
+export function publicRuleRecord(r) {
+  const s = redactSecrets(r ?? {});
+  return {
+    rule_id: s.rule_id,
+    status: s.status,
+    origin: s.origin ?? null,
+    proposed_by: s.proposed_by ?? null,
+    run_id: s.run_id ?? null,
+    incident_id: s.incident_id ?? null,
+    spec: s.spec ?? null,
+    backtest: publicBacktest(s.backtest),
+    created_at: s.created_at ?? null,
+    decided_by: s.decided_by ?? null,
+    decided_at: s.decided_at ?? null,
+    decision_note: s.decision_note ?? null,
+    hit_count: Number.isFinite(s.hit_count) ? s.hit_count : 0,
+    last_matched_at: s.last_matched_at ?? null,
+  };
+}
+
+/** control-d answers a denied admin rule op with `Error { code: "rule-gate/…", message: reason }`. */
+export const isRuleGateCode = (code) => typeof code === 'string' && code.startsWith('rule-gate/');

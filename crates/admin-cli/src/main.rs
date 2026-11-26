@@ -103,6 +103,38 @@ enum Command {
     RecordReceipt {
         receipt_json_file: PathBuf,
     },
+    ListRules {
+        #[arg(long = "host")]
+        host_id: Option<String>,
+        #[arg(long = "status")]
+        statuses: Vec<String>,
+    },
+    CreateRule {
+        rule_json_file: PathBuf,
+        #[arg(long)]
+        actor: String,
+    },
+    DecideRule {
+        rule_id: String,
+        #[arg(long, conflicts_with = "reject", required_unless_present = "reject")]
+        approve: bool,
+        #[arg(long, conflicts_with = "approve", required_unless_present = "approve")]
+        reject: bool,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    RevokeRule {
+        rule_id: String,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+    },
+    BacktestRule {
+        rule_json_file: PathBuf,
+    },
     ListHosts,
     ListIncidents,
     VerifyAudit,
@@ -194,6 +226,42 @@ impl Command {
                 return Err("command requires local operator key handling".into());
             }
             Self::Pki(_) => return Err("PKI commands operate on local files".into()),
+            Self::ListRules { host_id, statuses } => AdminRequest::ListExpectationRules {
+                host_id,
+                statuses: (!statuses.is_empty()).then_some(statuses),
+                limit: None,
+            },
+            Self::CreateRule {
+                rule_json_file,
+                actor,
+            } => AdminRequest::CreateExpectationRule {
+                rule: serde_json::from_slice(&fs::read(rule_json_file)?)?,
+                actor,
+            },
+            Self::DecideRule {
+                rule_id,
+                approve,
+                actor,
+                note,
+                ..
+            } => AdminRequest::DecideExpectationRule {
+                rule_id,
+                approve,
+                actor,
+                note,
+            },
+            Self::RevokeRule {
+                rule_id,
+                actor,
+                reason,
+            } => AdminRequest::RevokeExpectationRule {
+                rule_id,
+                actor,
+                reason,
+            },
+            Self::BacktestRule { rule_json_file } => AdminRequest::BacktestExpectationRule {
+                rule: serde_json::from_slice(&fs::read(rule_json_file)?)?,
+            },
             Self::ListHosts => AdminRequest::ListHosts,
             Self::ListIncidents => AdminRequest::ListIncidents,
             Self::VerifyAudit => AdminRequest::VerifyAuditChain,
@@ -332,6 +400,63 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_decisions_require_exactly_one_choice_and_list_status_flags_repeat() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("admin-cli").chain(args.iter().copied()))
+        };
+        assert!(parse(&["decide-rule", "rule-1", "--actor", "operator"]).is_err());
+        assert!(
+            parse(&[
+                "decide-rule",
+                "rule-1",
+                "--actor",
+                "operator",
+                "--approve",
+                "--reject"
+            ])
+            .is_err()
+        );
+        for (flag, approve) in [("--approve", true), ("--reject", false)] {
+            let request = parse(&["decide-rule", "rule-1", "--actor", "operator", flag])
+                .unwrap()
+                .command
+                .into_request()
+                .unwrap();
+            assert_eq!(
+                request,
+                AdminRequest::DecideExpectationRule {
+                    rule_id: "rule-1".into(),
+                    approve,
+                    actor: "operator".into(),
+                    note: None,
+                }
+            );
+        }
+
+        let request = parse(&[
+            "list-rules",
+            "--host",
+            "edge",
+            "--status",
+            "proposed",
+            "--status",
+            "active",
+        ])
+        .unwrap()
+        .command
+        .into_request()
+        .unwrap();
+        assert_eq!(
+            request,
+            AdminRequest::ListExpectationRules {
+                host_id: Some("edge".into()),
+                statuses: Some(vec!["proposed".into(), "active".into()]),
+                limit: None,
+            }
+        );
+    }
 
     #[test]
     fn parses_action_commands() {
