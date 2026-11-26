@@ -1,8 +1,11 @@
-use std::{io, path::PathBuf, sync::Mutex, time::Duration};
+mod operator;
+
+use std::{collections::HashMap, io, path::PathBuf, time::Duration};
 
 use clap::ValueEnum;
 use defsec_protocol::{
-    rpc::{InvestigationCall, InvestigationRequest, InvestigationResponse},
+    rpc::{InvestigationCall, InvestigationRequest, InvestigationResponse, PrincipalRole},
+    rules::MatchClause,
     wire::{MAX_FRAME_BYTES, read_frame, write_frame},
 };
 use serde::Deserialize;
@@ -14,7 +17,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::tools::available_tools;
+use crate::tools::{available_tools, is_run_tool};
+use operator::OperatorRun;
 
 const CURRENT_PROTOCOL: &str = "2025-03-26";
 
@@ -23,6 +27,7 @@ pub enum Mode {
     #[default]
     ReadOnly,
     Investigator,
+    Operator,
 }
 
 pub struct McpServer {
@@ -30,9 +35,9 @@ pub struct McpServer {
     socket: PathBuf,
     token: String,
     timeout: Duration,
-    /// The investigation run this adapter started; run-scoped proposal tools
-    /// bind to it instead of trusting a caller-supplied run_id.
-    run: Mutex<Option<String>>,
+    investigator_run: Option<String>,
+    delegated_investigator: bool,
+    operator_runs: HashMap<String, OperatorRun>,
 }
 
 #[derive(Deserialize)]
@@ -71,15 +76,18 @@ impl McpServer {
             socket,
             token,
             timeout,
-            run: Mutex::new(None),
+            investigator_run: None,
+            delegated_investigator: false,
+            operator_runs: HashMap::new(),
         }
     }
 
     pub async fn serve(
-        &self,
+        mut self,
         mut input: impl AsyncBufRead + Unpin,
         mut output: impl AsyncWrite + Unpin,
     ) -> io::Result<()> {
+        self.check_capability().await?;
         let mut line = Vec::new();
         while let Some(oversized) = read_line(&mut input, &mut line).await? {
             let response = if oversized {
@@ -100,7 +108,7 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_line(&self, line: &[u8]) -> Option<Value> {
+    async fn handle_line(&mut self, line: &[u8]) -> Option<Value> {
         let Ok(message) = serde_json::from_slice::<Value>(line) else {
             return Some(error(Value::Null, (-32700, "Parse error")));
         };
@@ -122,7 +130,7 @@ impl McpServer {
         })
     }
 
-    async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+    async fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
             "initialize" => {
                 let params: Initialize =
@@ -139,8 +147,8 @@ impl McpServer {
             }
             "ping" if params.is_object() => Ok(empty_object()),
             "tools/list" if params.is_object() => {
-                let tools: Vec<_> = available_tools(self.mode)
-                    .map(|tool| tool.descriptor())
+                let tools: Vec<_> = available_tools(self.mode, self.delegated_investigator)
+                    .map(|tool| tool.descriptor(self.mode))
                     .collect();
                 Ok(json!({"tools": tools}))
             }
@@ -150,50 +158,106 @@ impl McpServer {
         }
     }
 
-    async fn call_tool(&self, params: Value) -> Result<Value, RpcError> {
+    async fn check_capability(&mut self) -> io::Result<()> {
+        if self.mode == Mode::ReadOnly {
+            return Ok(());
+        }
+        let result = self
+            .investigate(InvestigationRequest::GetCapability {})
+            .await;
+        if let Ok(InvestigationResponse::Capability {
+            capability,
+            delegated,
+        }) = result
+        {
+            if self.mode == Mode::Investigator {
+                self.investigator_run = capability.run_id;
+                self.delegated_investigator = delegated;
+                return Ok(());
+            }
+            if capability.role == PrincipalRole::Investigator
+                && capability.may_spawn_runs
+                && capability.run_id.is_none()
+            {
+                return Ok(());
+            }
+        }
+        let message = match self.mode {
+            Mode::Operator => {
+                "operator mode requires a valid, unbound investigator token with may_spawn_runs"
+            }
+            _ => "could not verify the investigator capability at startup",
+        };
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+    }
+
+    async fn call_tool(&mut self, params: Value) -> Result<Value, RpcError> {
         let call: ToolCall = serde_json::from_value(params).map_err(|_| INVALID_PARAMS)?;
-        let Some(tool) = available_tools(self.mode).find(|tool| tool.name == call.name) else {
+        let Some(tool) = available_tools(self.mode, self.delegated_investigator)
+            .find(|tool| tool.name == call.name)
+        else {
             return Err((-32602, "Tool is unavailable in this mode"));
         };
         let Value::Object(mut arguments) = call.arguments else {
             return Err(INVALID_PARAMS);
         };
-        if tool.name == "propose_expectation_rule" {
-            if arguments.remove("run_id").is_some() {
+        if self.mode == Mode::Operator {
+            self.expire_operator_runs();
+            if tool.name == "start_investigation" {
+                return self.start_operator_run(arguments).await;
+            }
+            if is_run_tool(tool.name) {
+                return self.call_operator_run(tool.name, arguments).await;
+            }
+        }
+        if is_run_tool(tool.name) {
+            if arguments.contains_key("run_id") {
                 return Err(RUN_BOUND_BY_ADAPTER);
             }
-            let run_id = self.current_run().ok_or(NO_ACTIVE_RUN)?;
+            let run_id = self.investigator_run.as_deref().ok_or(NO_ACTIVE_RUN)?;
             arguments.insert("run_id".into(), json!(run_id));
         }
-        if arguments.insert("op".into(), json!(tool.name)).is_some() {
-            return Err(INVALID_PARAMS);
-        }
-        let request =
-            serde_json::from_value(Value::Object(arguments)).map_err(|_| INVALID_PARAMS)?;
-        let response = self.investigate(request).await?;
+        let response = self
+            .investigate(parse_request(tool.name, arguments)?)
+            .await?;
         if let InvestigationResponse::RunStarted { run_id, .. } = &response {
-            self.bind_run(run_id.clone());
+            self.investigator_run = Some(run_id.clone());
+        }
+        if run_inactive(&response) {
+            self.investigator_run = None;
+        }
+        self.tool_response(response)
+    }
+
+    fn tool_response(&self, response: InvestigationResponse) -> Result<Value, RpcError> {
+        if matches!(response, InvestigationResponse::DelegatedRunStarted { .. }) {
+            return Err(INTERNAL_ERROR);
         }
         let is_error = matches!(response, InvestigationResponse::Error { .. });
-        let mut payload = serde_json::to_value(response).map_err(|_| INTERNAL_ERROR)?;
+        self.tool_payload(
+            serde_json::to_value(response).map_err(|_| INTERNAL_ERROR)?,
+            is_error,
+        )
+    }
+
+    fn tool_payload(&self, mut payload: Value, is_error: bool) -> Result<Value, RpcError> {
         self.redact(&mut payload);
         let text = serde_json::to_string_pretty(&payload).map_err(|_| INTERNAL_ERROR)?;
         Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
     }
 
-    fn current_run(&self) -> Option<String> {
-        // A poisoned lock fails closed: no proposal leaves the adapter.
-        self.run.lock().ok().and_then(|run| run.clone())
-    }
-
-    fn bind_run(&self, run_id: String) {
-        if let Ok(mut run) = self.run.lock() {
-            *run = Some(run_id);
-        }
-    }
-
     async fn investigate(
         &self,
+        request: InvestigationRequest,
+    ) -> Result<InvestigationResponse, RpcError> {
+        self.exchange(&self.token, Uuid::new_v4().to_string(), request)
+            .await
+    }
+
+    async fn exchange(
+        &self,
+        token: &str,
+        request_id: String,
         request: InvestigationRequest,
     ) -> Result<InvestigationResponse, RpcError> {
         let exchange = async {
@@ -201,8 +265,8 @@ impl McpServer {
                 .await
                 .map_err(|_| (-32000, "Could not connect to the investigation socket"))?;
             let call = InvestigationCall {
-                request_id: Uuid::new_v4().to_string(),
-                capability_token: self.token.clone(),
+                request_id,
+                capability_token: token.to_owned(),
                 request,
             };
             write_frame(&mut socket, &call)
@@ -220,26 +284,59 @@ impl McpServer {
 
     // Telemetry and policy responses may contain caller-controlled strings.
     fn redact(&self, value: &mut Value) {
-        if self.token.is_empty() {
-            return;
+        redact_token(value, &self.token);
+        for run in self.operator_runs.values() {
+            redact_token(value, &run.token);
         }
-        match value {
-            Value::String(text) if text.contains(&self.token) => {
-                *text = text.replace(&self.token, "[redacted]");
-            }
-            Value::Array(items) => {
-                for item in items {
-                    self.redact(item);
-                }
-            }
-            Value::Object(fields) => {
-                fields.retain(|key, _| !key.contains(&self.token));
-                for item in fields.values_mut() {
-                    self.redact(item);
-                }
-            }
-            _ => {}
+    }
+}
+
+fn parse_request(
+    name: &str,
+    mut arguments: serde_json::Map<String, Value>,
+) -> Result<InvestigationRequest, RpcError> {
+    if arguments.insert("op".into(), json!(name)).is_some() {
+        return Err(INVALID_PARAMS);
+    }
+    let request = serde_json::from_value(Value::Object(arguments)).map_err(|_| INVALID_PARAMS)?;
+    if let InvestigationRequest::ProposeExpectationRule { rule, .. } = &request
+        && (!(1..=8).contains(&rule.matches.len())
+            || rule.matches.iter().any(|clause| {
+                matches!(clause, MatchClause::In { values, .. } if !(1..=32).contains(&values.len()))
+            }))
+    {
+        return Err(INVALID_PARAMS);
+    }
+    Ok(request)
+}
+
+fn run_inactive(response: &InvestigationResponse) -> bool {
+    matches!(response, InvestigationResponse::Error { code, message }
+        if code == "forbidden" && matches!(message.as_str(),
+            "investigation run is inactive" | "invalid capability token"
+            | "capability expired or role is unavailable on this interface" | "incident is closed"))
+}
+
+fn redact_token(value: &mut Value, token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) if text.contains(token) => {
+            *text = text.replace(token, "[redacted]");
         }
+        Value::Array(items) => {
+            for item in items {
+                redact_token(item, token);
+            }
+        }
+        Value::Object(fields) => {
+            fields.retain(|key, _| !key.contains(token));
+            for item in fields.values_mut() {
+                redact_token(item, token);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -289,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinguishes_rpc_errors_and_ignores_notifications() {
-        let server = server("fixture-secret");
+        let mut server = server("fixture-secret");
         for (input, expected_code) in [
             ("{", -32700),
             (r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#, -32600),
@@ -337,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn redacts_token_in_request_ids_and_nested_payloads() {
-        let server = server("fixture-secret");
+        let mut server = server("fixture-secret");
         let reply = server
             .handle_line(br#"{"jsonrpc":"2.0","id":"fixture-secret","method":"unknown"}"#)
             .await
@@ -389,10 +486,72 @@ mod tests {
         assert_eq!(reply["error"]["message"], RUN_BOUND_BY_ADAPTER.1);
     }
 
-    #[tokio::test]
-    async fn run_state_is_bound_once_a_run_starts() {
-        let server = server("fixture-secret");
-        server.bind_run("run-42".into());
-        assert_eq!(server.current_run().as_deref(), Some("run-42"));
+    #[test]
+    fn expectation_rule_schema_enforces_bounds_and_json_integers_before_rpc() {
+        let parse = |collector: &str, matches: Vec<Value>| {
+            parse_request(
+                "propose_expectation_rule",
+                json!({
+                    "run_id":"run-1","idempotency_key":"example",
+                    "rule":{
+                        "scope":{"host_id":"edge","collector":collector},
+                        "matches":matches,"effect":"require_present","rationale":"fixture",
+                    },
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )
+        };
+        let clause = json!({"op":"eq","field":"local_port","value":22});
+        for count in [0, 1, 8, 9] {
+            assert_eq!(
+                parse("sockets.listening", vec![clause.clone(); count]).is_ok(),
+                (1..=8).contains(&count)
+            );
+        }
+        for count in [0, 1, 32, 33] {
+            let clause = json!({"op":"in","field":"remote_port","values":vec![22;count]});
+            assert_eq!(
+                parse("connections.outbound", vec![clause]).is_ok(),
+                (1..=32).contains(&count)
+            );
+        }
+        for clause in [
+            json!({"op":"eq","field":"local_port","value":22.0}),
+            json!({"op":"in","field":"local_port","values":[22.0]}),
+            json!({"op":"range","field":"local_port","min":22.0,"max":24}),
+        ] {
+            assert!(parse("sockets.listening", vec![clause]).is_err());
+        }
+        assert!(
+            parse(
+                "packages.inventory",
+                vec![json!({"op":"eq", "field":"name", "value":"curl"})]
+            )
+            .is_ok()
+        );
+
+        for mode in [Mode::Operator, Mode::Investigator] {
+            let rule_tool = available_tools(mode, false)
+                .find(|tool| tool.name == "propose_expectation_rule")
+                .unwrap();
+            let schema = &rule_tool.descriptor(mode)["inputSchema"];
+            let properties = &schema["properties"]["rule"]["properties"];
+            let collectors = properties["scope"]["properties"]["collector"]["enum"]
+                .as_array()
+                .unwrap();
+            assert!(collectors.contains(&json!("connections.outbound")));
+            assert!(collectors.contains(&json!("packages.inventory")));
+            assert_eq!(properties["matches"]["minItems"], 1);
+            assert_eq!(properties["matches"]["maxItems"], 8);
+            assert_eq!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("run_id")),
+                mode == Mode::Operator
+            );
+        }
     }
 }

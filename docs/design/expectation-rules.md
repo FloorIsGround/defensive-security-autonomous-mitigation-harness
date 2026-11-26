@@ -88,6 +88,7 @@ Unknown fields, type mismatches (e.g. `Prefix` on an integer field) and clauses 
 pub struct RuleEvaluation {
     pub outcome: PredicateOutcome,                 // filtered outcome
     pub suppressed: BTreeMap<String, Vec<String>>, // rule_id -> identity keys suppressed (<= 50 keys per rule)
+    pub suppressed_counts: BTreeMap<String, usize>, // exact counts before key sampling
     pub missing_required: Vec<String>,             // rule_ids whose RequirePresent had no match
     pub matched_rule_ids: Vec<String>,             // rules that matched at least one item (for hit counts)
 }
@@ -168,7 +169,9 @@ CREATE INDEX expectation_rules_scope ON expectation_rules (host_id, collector_ty
 Investigation interface:
 
 * `ProposeExpectationRule { run_id, idempotency_key, rule: ExpectationRuleSpec }`. Requires the investigator role and run scope; the rule host must be within the capability. The gate runs with `Investigator` origin. If allowed, the rule is stored as `proposed` with a backtest. Response: `RuleProposalEvaluated { decision: PolicyDecision, rule_id: Option<String>, backtest: Option<RuleBacktest> }`.
-* `ListExpectationRules { host_id: Option<String>, statuses: Option<Vec<String>>, limit: Option<u32> }`. Any role, scoped to the capability's hosts. Response: `ExpectationRules { rules: Vec<ExpectationRuleRecord> }`.
+* `ListExpectationRules { host_id: Option<String>, statuses: Option<Vec<String>>, limit: Option<u32>, before: Option<String> }`. Any role, scoped to the capability's hosts. Response: `ExpectationRules { rules: Vec<ExpectationRuleRecord>, next_before: Option<String> }`.
+
+* `GetIncidentContext` can include `rule_suppression: { rules: [{ rule_id, rationale, suppressed_keys, count }], total }`. This is the suppression recorded on the newest set-diff trigger event visible to the caller within the incident's collector scope. Each contributing rule is listed in rule ID order, with up to 20 sorted identity keys and the full count of suppressed changes. `total` sums those counts. The rationale identifies the rule even after revocation or expiry. The field is omitted for older triggers and when the newest visible set-diff trigger recorded no suppression.
 
 Admin interface:
 
@@ -176,7 +179,11 @@ Admin interface:
 * `DecideExpectationRule { rule_id, approve: bool, actor, note: Option<String> }`. Only valid on `proposed` rules. Approval re-runs the gate with `Operator` origin.
 * `RevokeExpectationRule { rule_id, actor, reason }`. Only valid on `active` rules.
 * `BacktestExpectationRule { rule }`. Response: `RuleBacktestResult { backtest: RuleBacktest }`.
-* `ListExpectationRules { host_id, statuses, limit }`. Response: `ExpectationRules { .. }`.
+* `ListExpectationRules { host_id, statuses, limit, before }`. Response: `ExpectationRules { .. }`.
+
+Both list interfaces order by creation time descending and rule ID ascending, with a default of 50 and a maximum of 100 records per page. When another page exists, pass the opaque `next_before` string as `before` with the same filters and scope. The boundary is exclusive, including when several rules share a creation timestamp.
+
+Create, approval and backtest gate denials return `Error { code, message, decision: PolicyDecision }`. The decision contains the policy version used for that request. Other admin failures omit `decision`.
 
 Shared types:
 
@@ -203,7 +210,7 @@ Backtests order observations by ledger receipt order and use the watch revision 
 
 ## Surfaces
 
-* **admin-cli**: `list-rules`, `create-rule RULE_JSON --actor`, `decide-rule RULE_ID --approve|--reject --actor [--note]`, `revoke-rule RULE_ID --actor --reason`, `backtest-rule RULE_JSON`.
+* **admin-cli**: `list-rules [--host HOST] [--status STATUS] [--limit N] [--before CURSOR]`, `create-rule RULE_JSON --actor`, `decide-rule RULE_ID --approve|--reject --actor [--note]`, `revoke-rule RULE_ID --actor --reason`, `backtest-rule RULE_JSON`.
 * **mcp-adapter**: `list_expectation_rules` in both modes. `propose_expectation_rule` in investigator (and later operator) mode.
 * **reasoner-d**: a `propose_expectation_rule` tool. Proposals are inert, so it is enabled by default, capped at 3 per run, and the system prompt explains when to use it: benign recurring noise with a clear service anchor, not suspicious activity.
 * **Console**: a Rules view (active, pending with backtest and Approve/Reject, history). The incident diff gains inline "Allow for this service" actions that prefill a rule (unit, comm, uid, protocol, port, loopback scope) and show the backtest before creation.

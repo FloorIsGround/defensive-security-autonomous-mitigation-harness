@@ -195,6 +195,7 @@ impl Fixture {
 
     fn token(&self, role: PrincipalRole, incident_id: Option<String>) -> String {
         let response = self.admin(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
             principal_id: "worker".into(),
             role,
             allowed_hosts: vec!["edge".into()],
@@ -247,8 +248,9 @@ impl Fixture {
             host_id: None,
             statuses,
             limit: Some(100),
+            before: None,
         });
-        let AdminResponse::ExpectationRules { rules } = response else {
+        let AdminResponse::ExpectationRules { rules, .. } = response else {
             panic!("{response:?}")
         };
         rules
@@ -410,10 +412,11 @@ fn rules_change_only_new_observations_and_record_hits_lifecycle_and_audit() {
             host_id: None,
             statuses: Some(vec!["proposed".into()]),
             limit: Some(10),
+            before: None,
         },
     );
     assert!(
-        matches!(listed, InvestigationResponse::ExpectationRules { rules }
+        matches!(listed, InvestigationResponse::ExpectationRules { rules, .. }
         if rules.len() == 1 && rules[0].rule_id == proposal_id && rules[0].hit_count == 0)
     );
 
@@ -596,6 +599,7 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
             host_id: Some("foreign".into()),
             statuses: None,
             limit: None,
+            before: None,
         },
     );
     assert!(matches!(listed, InvestigationResponse::Error { code, .. } if code == "forbidden"));
@@ -605,11 +609,15 @@ fn proposals_enforce_run_host_role_and_host_pending_quotas() {
             host_id: None,
             statuses: None,
             limit: None,
+            before: None,
         },
     );
     assert_eq!(
         listed,
-        InvestigationResponse::ExpectationRules { rules: vec![] }
+        InvestigationResponse::ExpectationRules {
+            rules: vec![],
+            next_before: None
+        }
     );
 
     for i in 0..3 {
@@ -810,7 +818,7 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(
             db.query_row("SELECT host_id FROM hosts", [], |r| r.get::<_, String>(0))
@@ -974,4 +982,233 @@ fn investigator_backtest_scope_includes_own_incident_and_baseline() {
     };
     // baseline watch + own ephemeral = 2 (base empty? Actually baseline watch obs seq1 empty + seq2 nx; plus own ephemeral obs = 3?) 
     assert_eq!(bt.observations_scanned, 3);
+}
+
+#[test]
+fn admin_rule_gate_denials_return_the_decision_for_each_operation() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let mut invalid = allow("expected.service");
+    invalid.matches.clear();
+    let create = f.admin(AdminRequest::CreateExpectationRule {
+        rule: invalid.clone(),
+        actor: "operator".into(),
+    });
+    let backtest = f.admin(AdminRequest::BacktestExpectationRule { rule: invalid });
+
+    f.put(1, vec![]);
+    f.put(2, vec![socket("unexpected.service", 22)]);
+    let (token, run) = f.run(&f.incident());
+    let mut rule = allow("expected.service");
+    rule.expires_at = Some(Utc::now() + Duration::days(1));
+    let (id, _) = proposal_result(f.propose(&token, &run, "approval", rule.clone()));
+    rule.expires_at = Some(Utc::now() - Duration::days(1));
+    f.db()
+        .execute(
+            "UPDATE expectation_rules SET spec_json=?2 WHERE rule_id=?1",
+            params![id, serde_json::to_string(&rule).unwrap()],
+        )
+        .unwrap();
+    let approve = f.decide(&id, true);
+
+    for response in [create, backtest, approve] {
+        let AdminResponse::Error {
+            code,
+            message,
+            decision: Some(decision),
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert!(!decision.allowed);
+        assert_eq!(decision.policy_version, 3);
+        assert_eq!(decision.rule_id, code);
+        assert_eq!(decision.reason, message);
+    }
+    assert!(matches!(
+        f.decide("rule-missing", true),
+        AdminResponse::Error { decision: None, .. }
+    ));
+}
+
+#[test]
+fn rule_pages_are_exclusive_at_tied_timestamps_and_preserve_scope() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let rule = allow("expected.service");
+    for _ in 0..102 {
+        f.create(rule.clone());
+    }
+    let mut foreign = rule;
+    foreign.scope.host_id = "foreign".into();
+    let foreign_id = f.create(foreign);
+    let db = f.db();
+    db.execute(
+        "UPDATE expectation_rules SET created_at='2026-01-01T00:00:00.000000000Z'
+         WHERE host_id='edge'",
+        [],
+    )
+    .unwrap();
+    let all_ids: Vec<String> = db
+        .prepare("SELECT rule_id FROM expectation_rules WHERE host_id='edge' ORDER BY rule_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+
+    let admin_page = |before| {
+        f.admin(AdminRequest::ListExpectationRules {
+            host_id: Some("edge".into()),
+            statuses: Some(vec!["active".into()]),
+            limit: Some(500),
+            before,
+        })
+    };
+    let AdminResponse::ExpectationRules {
+        rules,
+        next_before: Some(cursor),
+    } = admin_page(None)
+    else {
+        panic!("expected an admin continuation");
+    };
+    let ids = |rules: Vec<ExpectationRuleRecord>| {
+        rules.into_iter().map(|r| r.rule_id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(rules), all_ids[..100]);
+    let AdminResponse::ExpectationRules {
+        rules,
+        next_before: None,
+    } = admin_page(Some(cursor.clone()))
+    else {
+        panic!("expected the final admin page");
+    };
+    assert_eq!(ids(rules), all_ids[100..]);
+    assert!(
+        matches!(admin_page(Some("invalid".into())), AdminResponse::Error { code, decision: None, .. } if code == "invalid_request")
+    );
+
+    let token = f.token(PrincipalRole::Observer, None);
+    let scoped_page = |before| {
+        f.investigate(
+            &token,
+            InvestigationRequest::ListExpectationRules {
+                host_id: None,
+                statuses: Some(vec!["active".into()]),
+                limit: Some(1),
+                before,
+            },
+        )
+    };
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: Some(next),
+    } = scoped_page(Some(cursor))
+    else {
+        panic!("expected a scoped continuation");
+    };
+    assert_eq!(ids(rules), all_ids[100..101]);
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: None,
+    } = scoped_page(Some(next))
+    else {
+        panic!("expected the final scoped page");
+    };
+    assert_eq!(ids(rules), all_ids[101..]);
+    assert_ne!(all_ids[101], foreign_id);
+}
+
+#[test]
+fn incident_context_reports_scoped_suppression_with_full_counts_and_capped_keys() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let big = f.create(allow("many.service"));
+    let small = f.create(allow("one.service"));
+    f.put(1, vec![]);
+    let mut sockets: Vec<_> = (4000..4055)
+        .rev()
+        .map(|port| socket("many.service", port))
+        .collect();
+    sockets.push(socket("one.service", 4100));
+    sockets.push(socket("unexpected.service", 22));
+    let observation = f.put(2, sockets);
+    assert!(f.saw_trigger(observation));
+
+    let incident_id = f.incident();
+    let token = f.token(PrincipalRole::Observer, None);
+    let context = |token| {
+        f.investigate(
+            token,
+            InvestigationRequest::GetIncidentContext {
+                incident_id: incident_id.clone(),
+            },
+        )
+    };
+    let InvestigationResponse::IncidentContext {
+        rule_suppression: Some(detail),
+        ..
+    } = context(&token)
+    else {
+        panic!("expected suppression in the incident context");
+    };
+    assert_eq!(detail.total, 56);
+    assert_eq!(detail.rules.len(), 2);
+    assert!(detail.rules[0].rule_id < detail.rules[1].rule_id);
+    let many = detail.rules.iter().find(|r| r.rule_id == big).unwrap();
+    assert_eq!(many.count, 55);
+    assert_eq!(many.rationale, "expected local service listener");
+    assert_eq!(
+        many.suppressed_keys,
+        (4000..4020)
+            .map(|port| format!("tcp:127.0.0.5:{port}"))
+            .collect::<Vec<_>>()
+    );
+    let one = detail.rules.iter().find(|r| r.rule_id == small).unwrap();
+    assert_eq!(one.count, 1);
+    assert_eq!(one.suppressed_keys, ["tcp:127.0.0.5:4100"]);
+
+    let AdminResponse::TokenMinted {
+        token: other_scope, ..
+    } = f.admin(AdminRequest::MintCapabilityToken {
+        may_spawn_runs: false,
+        principal_id: "other-collector-observer".into(),
+        role: PrincipalRole::Observer,
+        allowed_hosts: vec!["edge".into()],
+        allowed_collectors: vec![CollectorType::FilesMetadata],
+        incident_id: None,
+        ttl_seconds: 300,
+    })
+    else {
+        panic!("could not mint observer token");
+    };
+    assert!(matches!(
+        context(&other_scope),
+        InvestigationResponse::IncidentContext {
+            rule_suppression: None,
+            ..
+        }
+    ));
+
+    // A newer trigger with an unsuppressed diff replaces the prior explanation.
+    assert!(matches!(
+        f.admin(AdminRequest::RevokeExpectationRule {
+            rule_id: big,
+            actor: "operator".into(),
+            reason: "reviewed".into(),
+        }),
+        AdminResponse::RuleDecided { .. }
+    ));
+    let observation = f.put(
+        3,
+        vec![
+            socket("unexpected.service", 22),
+            socket("one.service", 4100),
+        ],
+    );
+    assert!(f.saw_trigger(observation));
+    assert!(matches!(
+        context(&token),
+        InvestigationResponse::IncidentContext {
+            rule_suppression: None,
+            ..
+        }
+    ));
 }

@@ -90,6 +90,7 @@ impl Fixture {
         let result = self
             .service
             .handle_admin_request(AdminRequest::MintCapabilityToken {
+                may_spawn_runs: false,
                 principal_id: "fixture".into(),
                 role,
                 allowed_hosts: hosts.iter().map(|s| (*s).into()).collect(),
@@ -491,7 +492,7 @@ fn migrates_existing_v3_ledger_with_run_in_place() {
     let version: u32 =
         f.db.pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let observer = f.mint(PrincipalRole::Observer, &["edge"], None);
     let runs = f.runs(&observer);
     assert_eq!(runs.len(), 1);
@@ -500,4 +501,446 @@ fn migrates_existing_v3_ledger_with_run_in_place() {
     assert!(runs[0].ended_at.is_none());
     assert!(runs[0].outcome.is_none());
     assert_eq!(runs[0].event_count, 0);
+}
+
+fn mint_parent(
+    f: &Fixture,
+    principal: &str,
+    ttl_seconds: u64,
+    hosts: &[&str],
+) -> (String, chrono::DateTime<Utc>) {
+    let response = f
+        .service
+        .handle_admin_request(AdminRequest::MintCapabilityToken {
+            principal_id: principal.into(),
+            role: PrincipalRole::Investigator,
+            allowed_hosts: hosts.iter().map(|s| (*s).into()).collect(),
+            allowed_collectors: vec![defsec_protocol::watch::CollectorType::SocketsListening],
+            incident_id: None,
+            may_spawn_runs: true,
+            ttl_seconds,
+        });
+    let AdminResponse::TokenMinted { token, expires_at } = response else {
+        panic!("{response:?}")
+    };
+    (token, expires_at)
+}
+
+fn delegate(incident_id: &str, ttl_seconds: Option<u64>) -> Request {
+    Request::StartDelegatedRun {
+        incident_id: incident_id.into(),
+        backend_id: "test-worker".into(),
+        model_id: "test-model".into(),
+        prompt_schema_version: "1".into(),
+        ttl_seconds,
+    }
+}
+
+fn delegated(response: Response) -> (String, String, chrono::DateTime<Utc>) {
+    let Response::DelegatedRunStarted {
+        run_id,
+        run_token,
+        expires_at,
+        ..
+    } = response
+    else {
+        panic!("delegation failed");
+    };
+    (run_id, run_token, expires_at)
+}
+
+fn capability(f: &Fixture, token: &str) -> defsec_protocol::rpc::ScopedCapability {
+    let Response::Capability { capability, .. } = f.call(token, Request::GetCapability {}) else {
+        panic!("could not inspect capability");
+    };
+    capability
+}
+
+fn cancel(run_id: &str) -> Request {
+    Request::CancelInvestigationRun {
+        run_id: run_id.into(),
+        reason: "operator stopped run".into(),
+    }
+}
+
+#[test]
+fn delegated_tokens_expire_at_the_minimum_and_do_not_narrow_parent_scope() {
+    use chrono::Duration;
+
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "parent", 7200, &["edge", "foreign"]);
+    let before = capability(&f, &parent);
+    for (ttl, bound) in [(Some(60), 60), (Some(u64::MAX), 3600), (None, 3600)] {
+        let now = Utc::now();
+        let (run, child, expires) = delegated(f.call(&parent, delegate("inc-1", ttl)));
+        assert!(expires >= now + Duration::seconds(bound));
+        assert!(expires <= Utc::now() + Duration::seconds(bound));
+        let cap = capability(&f, &child);
+        assert_eq!(cap.principal_id, before.principal_id);
+        assert_eq!(cap.role, PrincipalRole::Investigator);
+        assert_eq!(cap.run_id.as_deref(), Some(run.as_str()));
+        assert_eq!(cap.incident_id.as_deref(), Some("inc-1"));
+        assert_eq!(cap.expires_at, expires);
+        assert_eq!(cap.allowed_hosts, ["edge"]);
+        assert_eq!(cap.allowed_collectors, before.allowed_collectors);
+        assert!(!cap.may_spawn_runs);
+        for request in [
+            delegate("inc-1", None),
+            Request::ListActiveWatches {
+                host_id: "foreign".into(),
+            },
+            Request::GetIncidentContext {
+                incident_id: "inc-2".into(),
+            },
+        ] {
+            assert!(
+                matches!(f.call(&child, request), Response::Error { code, .. } if code=="forbidden")
+            );
+        }
+        let Response::Capabilities { capabilities } = f.call(
+            &child,
+            Request::ListCollectorCapabilities {
+                host_id: "edge".into(),
+            },
+        ) else {
+            panic!("collector listing failed")
+        };
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].collector_type, before.allowed_collectors[0]);
+    }
+    assert_eq!(capability(&f, &parent), before);
+    delegated(f.call(&parent, delegate("inc-3", None)));
+    let (short, parent_expires) = mint_parent(&f, "short", 45, &["edge"]);
+    assert_eq!(
+        delegated(f.call(&short, delegate("inc-1", Some(3600)))).2,
+        parent_expires
+    );
+    assert!(matches!(f.call(&short, delegate("inc-1", Some(0))),
+        Response::Error {code, ..} if code == "invalid_request"));
+    assert!(matches!(f.call(&short, delegate("inc-3", None)),
+        Response::Error {code, ..} if code == "forbidden"));
+}
+
+#[test]
+fn delegation_quota_spans_tokens_and_cancel_revokes_the_child() {
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "fixture", 7200, &["edge"]);
+    let (same_principal, _) = mint_parent(&f, "fixture", 7200, &["edge"]);
+    let (other, _) = mint_parent(&f, "other", 7200, &["edge"]);
+    let runs: Vec<_> = (0..4)
+        .map(|_| delegated(f.call(&parent, delegate("inc-1", None))))
+        .collect();
+    let (run, child, _) = &runs[0];
+    assert!(matches!(f.call(&same_principal, delegate("inc-1", None)),
+        Response::Error {code, ..} if code=="delegated_run_quota"));
+    delegated(f.call(&other, delegate("inc-1", None)));
+    let no_spawn = f.mint(PrincipalRole::Investigator, &["edge"], None);
+    for wrong in [&other, &no_spawn, &runs[1].1] {
+        assert!(
+            matches!(f.call(wrong, cancel(run)), Response::Error {code, ..} if code=="forbidden")
+        );
+    }
+    let (narrow_parent, _) = mint_parent(&f, "fixture", 7200, &["foreign"]);
+    assert!(
+        matches!(f.call(&narrow_parent, cancel(run)), Response::Error {code, ..} if code=="forbidden")
+    );
+    assert!(matches!(f.call(child, Request::CancelInvestigationRun {
+        run_id: run.clone(), reason: format!("secret {child}"),
+    }), Response::Error {code, ..} if code=="invalid_request"));
+    for (caller, (run, child, _)) in [
+        (same_principal.as_str(), &runs[0]),
+        (runs[1].1.as_str(), &runs[1]),
+    ] {
+        assert_eq!(
+            f.call(caller, cancel(run)),
+            Response::RunFinished {
+                run_id: run.clone(),
+                status: RunTerminalStatus::Cancelled
+            }
+        );
+        for request in [
+            Request::GetCapability {},
+            events(run, None),
+            finish(run, RunTerminalStatus::Completed, "late"),
+        ] {
+            assert!(
+                matches!(f.call(child, request), Response::Error {message, ..} if message=="invalid capability token")
+            );
+        }
+    }
+    assert!(matches!(
+        f.call(&same_principal, cancel(run)),
+        Response::RunFinished { .. }
+    ));
+    let (finished, finished_token, _) = delegated(f.call(&same_principal, delegate("inc-1", None)));
+    assert!(matches!(
+        f.call(
+            &finished_token,
+            finish(&finished, RunTerminalStatus::Completed, "done")
+        ),
+        Response::RunFinished { .. }
+    ));
+    // Finished and expired rows do not consume quota.
+    f.db.execute(
+        "UPDATE agent_runs SET expires_at='2000-01-01T00:00:00Z' WHERE run_id=?1",
+        [&runs[2].0],
+    )
+    .unwrap();
+    for _ in 0..3 {
+        delegated(f.call(&same_principal, delegate("inc-1", None)));
+    }
+    assert!(
+        matches!(f.call(&same_principal, delegate("inc-1", None)), Response::Error {code, ..} if code=="delegated_run_quota")
+    );
+    let stored_audit = f
+        .service
+        .handle_admin_request(AdminRequest::ListAuditEntries { limit: Some(100) });
+    let audit = serde_json::to_string(&stored_audit).unwrap();
+    assert!(audit.contains(run));
+    assert!(!audit.contains(child));
+    assert!(!audit.contains(&parent));
+    assert!(matches!(
+        f.service
+            .handle_admin_request(AdminRequest::VerifyAuditChain),
+        AdminResponse::AuditChainStatus { valid: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn delegated_token_cannot_manage_trigger_leases_over_the_socket() {
+    use control_d::server::{SocketPolicy, UnixServer};
+    use defsec_protocol::wire::{read_frame, write_frame};
+    use tokio::net::UnixStream;
+
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "worker", 300, &["edge"]);
+    let (_, child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    let event_id = f.trigger("pending", "inc-1", "fixture");
+    let lease_request = Request::LeaseNextTrigger {
+        lease_owner: "worker".into(),
+        lease_seconds: 120,
+    };
+    let Response::TriggerLeased { lease: Some(lease) } = f.call(&parent, lease_request.clone())
+    else {
+        panic!("no ongoing lease");
+    };
+    assert_eq!(lease.event_id, event_id);
+    f.trigger("pending", "inc-1", "second fixture");
+
+    let socket = f._dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let task = tokio::spawn(server.serve_investigation(f.service.clone()));
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    for request in [
+        lease_request,
+        Request::CompleteTriggerLease {
+            event_id,
+            lease_token: lease.lease_token.clone(),
+            run_id: None,
+            summary: None,
+        },
+        Request::FailTriggerLease {
+            event_id,
+            lease_token: lease.lease_token,
+            error: "fixture".into(),
+            retryable: true,
+        },
+    ] {
+        write_frame(
+            &mut stream,
+            &InvestigationCall {
+                request_id: "child-lease".into(),
+                capability_token: child.clone(),
+                request,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap(),
+            Some(Response::Error {
+                code: "forbidden".into(),
+                message: "delegated runs cannot manage trigger leases".into(),
+            })
+        );
+    }
+    assert_eq!(f.queue(&parent, Some(vec!["leased".into()])).len(), 1);
+    assert_eq!(f.queue(&parent, Some(vec!["pending".into()])).len(), 1);
+    task.abort();
+}
+
+#[test]
+fn child_cannot_read_another_runs_events_and_cancelled_finish_revokes_it() {
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "parent", 300, &["edge"]);
+    let (run, child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    let (other, other_child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    assert!(matches!(
+        f.call(
+            &other_child,
+            report(&other, json!({"note":"private to the other run"}))
+        ),
+        Response::RunProgressRecorded { .. }
+    ));
+    assert!(matches!(
+        f.call(&child, events(&run, None)),
+        Response::RunEvents { .. }
+    ));
+    assert!(matches!(
+        f.call(&child, events(&other, None)),
+        Response::Error { code, .. } if code == "forbidden"
+    ));
+    assert_eq!(
+        f.call(
+            &child,
+            finish(&run, RunTerminalStatus::Cancelled, "stopped")
+        ),
+        Response::RunFinished {
+            run_id: run.clone(),
+            status: RunTerminalStatus::Cancelled,
+        }
+    );
+    assert!(matches!(
+        f.call(&child, Request::GetCapability {}),
+        Response::Error { message, .. } if message == "invalid capability token"
+    ));
+    assert!(matches!(
+        f.call(&parent, events(&run, None)),
+        Response::RunEvents { .. }
+    ));
+}
+
+#[test]
+fn only_spawn_capable_investigators_can_delegate_open_incidents() {
+    let f = Fixture::new();
+    for role in [PrincipalRole::Observer, PrincipalRole::Investigator] {
+        let token = f.mint(role, &["edge"], None);
+        assert!(
+            matches!(f.call(&token, delegate("inc-1", None)), Response::Error {code, ..} if code=="forbidden")
+        );
+    }
+    assert!(matches!(
+        f.service
+            .handle_admin_request(AdminRequest::MintCapabilityToken {
+                principal_id: "observer".into(),
+                role: PrincipalRole::Observer,
+                allowed_hosts: vec!["edge".into()],
+                allowed_collectors: vec![],
+                incident_id: None,
+                ttl_seconds: 3600,
+                may_spawn_runs: true,
+            }),
+        AdminResponse::Error { .. }
+    ));
+    let (parent, _) = mint_parent(&f, "parent", 7200, &["edge"]);
+    let (_, child, _) = delegated(f.call(&parent, delegate("inc-1", None)));
+    assert!(matches!(
+        f.service.handle_admin_request(AdminRequest::CloseIncident {
+            incident_id: "inc-1".into(),
+            actor: "operator".into(),
+            resolution: "fixture closed".into(),
+        }),
+        AdminResponse::IncidentClosed { .. }
+    ));
+    assert!(
+        matches!(f.call(&parent, delegate("inc-1", None)), Response::Error {message, ..} if message=="incident is closed")
+    );
+    assert!(
+        matches!(f.call(&child, Request::GetCapability {}), Response::Error {message, ..} if message=="invalid capability token")
+    );
+}
+
+#[tokio::test]
+async fn real_control_daemon_keeps_delegated_token_out_of_its_logs() {
+    use defsec_protocol::wire::{read_frame, write_frame};
+    use std::{process::Stdio, time::Duration};
+    use tokio::{
+        net::UnixStream,
+        process::Command,
+        time::{sleep, timeout},
+    };
+
+    let f = Fixture::new();
+    let (parent, _) = mint_parent(&f, "log-test", 300, &["edge"]);
+    let socket = f._dir.0.join("investigate.sock");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_control-d"))
+        .arg("--data-dir")
+        .arg(&f._dir.0)
+        .args(["--liveness-grace-seconds", "0"])
+        .env("RUST_LOG", "trace")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let (child, mut stream) = timeout(Duration::from_secs(5), async {
+        let mut stream = loop {
+            if let Ok(socket) = UnixStream::connect(&socket).await {
+                break socket;
+            }
+            assert!(daemon.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(10)).await;
+        };
+        write_frame(
+            &mut stream,
+            &InvestigationCall {
+                request_id: "delegate-on-wire".into(),
+                capability_token: parent.clone(),
+                request: delegate("inc-1", None),
+            },
+        )
+        .await
+        .unwrap();
+        let (run_id, child, _) = delegated(read_frame(&mut stream).await.unwrap().unwrap());
+        write_frame(
+            &mut stream,
+            &InvestigationCall {
+                request_id: "cancel-on-wire".into(),
+                capability_token: child.clone(),
+                request: cancel(&run_id),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut stream).await.unwrap(),
+            Some(Response::RunFinished {
+                status: RunTerminalStatus::Cancelled,
+                ..
+            })
+        ));
+        (child, stream)
+    })
+    .await
+    .unwrap();
+    // Trigger a transport error that the daemon logs before stopping it.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let invalid = format!(r#"{{"request_id":"bad","capability_token":"{child}","{child}":null}}"#);
+    stream
+        .write_all(&(invalid.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(invalid.as_bytes()).await.unwrap();
+    assert!(
+        read_frame::<_, Response>(&mut stream)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut logs = BufReader::new(daemon.stderr.take().unwrap());
+    let log = timeout(Duration::from_secs(5), async {
+        let mut log = String::new();
+        while !log.contains("local connection ended") {
+            assert!(logs.read_line(&mut log).await.unwrap() > 0);
+        }
+        log
+    })
+    .await
+    .unwrap();
+    daemon.start_kill().unwrap();
+    let output = daemon.wait_with_output().await.unwrap();
+    for token in [&parent, &child] {
+        assert!(!log.contains(token));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+    }
 }

@@ -56,12 +56,8 @@ async fn main() -> ExitCode {
         token,
         Duration::from_secs(args.timeout_seconds),
     );
-    if server
-        .serve(BufReader::new(stdin()), stdout())
-        .await
-        .is_err()
-    {
-        eprintln!("defsecautmit-mcp: stdio connection failed");
+    if let Err(error) = server.serve(BufReader::new(stdin()), stdout()).await {
+        eprintln!("defsecautmit-mcp: {error}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

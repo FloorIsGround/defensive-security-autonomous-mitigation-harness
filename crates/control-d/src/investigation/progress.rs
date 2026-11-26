@@ -13,7 +13,18 @@ pub(super) fn report_progress(
 ) -> Result<InvestigationResponse> {
     require_investigator(capability)?;
     authorize_run(db, capability, &run_id)?;
-    let detail = value_to_canonical_json(&detail)?;
+    let event_seq = append_event(db, &run_id, kind, &detail, now)?;
+    Ok(InvestigationResponse::RunProgressRecorded { run_id, event_seq })
+}
+
+fn append_event(
+    db: &Connection,
+    run_id: &str,
+    kind: RunEventKind,
+    detail: &Value,
+    now: DateTime<Utc>,
+) -> Result<i64> {
+    let detail = value_to_canonical_json(detail)?;
     if detail.len() > 4096 {
         return Err(ControlError::invalid("run event detail exceeds 4096 bytes"));
     }
@@ -32,10 +43,37 @@ pub(super) fn report_progress(
         "INSERT INTO run_events (run_id, kind, detail_json, created_at) VALUES (?1,?2,?3,?4)",
         params![run_id, enum_tag(kind), detail, stamp(now)],
     )?;
-    Ok(InvestigationResponse::RunProgressRecorded {
-        run_id,
-        event_seq: db.last_insert_rowid(),
-    })
+    Ok(db.last_insert_rowid())
+}
+
+// Match the adapter's immediately preceding call by RPC ID so a successful
+// terminal result is durable in the same transaction that ends the run.
+pub(super) fn record_terminal_tool_result(
+    db: &Connection,
+    run_id: &str,
+    request_id: &str,
+    tool: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let matched: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_events
+         WHERE event_seq=(SELECT MAX(event_seq) FROM run_events WHERE run_id=?1)
+           AND (SELECT COUNT(*) FROM run_events WHERE run_id=?1)<256
+           AND kind='tool_call' AND json_extract(detail_json,'$.tool')=?2
+           AND json_extract(detail_json,'$.request_id')=?3)",
+        params![run_id, tool, request_id],
+        |row| row.get(0),
+    )?;
+    if matched {
+        append_event(
+            db,
+            run_id,
+            RunEventKind::ToolResult,
+            &json!({"tool":tool,"request_id":request_id,"result":"run_finished"}),
+            now,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn finish_run(
@@ -75,6 +113,14 @@ pub(super) fn finish_run(
         ));
     }
     if status == "active" {
+        if outcome.status == RunTerminalStatus::Cancelled {
+            db.execute(
+                "UPDATE capability_tokens SET revoked_at=?2 WHERE token_hash=?1
+                 AND EXISTS(SELECT 1 FROM agent_runs WHERE run_id=?3 AND delegated=1)",
+                params![token_hash, stamp(now), run_id],
+            )?;
+        }
+        record_terminal_tool_result(db, &run_id, request_id, "finish_investigation", now)?;
         db.execute(
             "UPDATE agent_runs SET status=?2, ended_at=?3, outcome_json=?4 WHERE run_id=?1",
             params![
@@ -170,6 +216,7 @@ pub(super) fn list_runs(
     incident_id: Option<&str>,
     limit: Option<u32>,
     now: DateTime<Utc>,
+    delegated: bool,
 ) -> Result<Vec<RunSummary>> {
     check_filters(db, capability, host_id, incident_id)?;
     rows(
@@ -188,12 +235,15 @@ pub(super) fn list_runs(
          WHERE i.host_id IN (SELECT value FROM json_each(?1))
            AND (?2 IS NULL OR r.incident_id=?2)
            AND (?3 IS NULL OR i.host_id=?3)
+           AND (NOT ?5 OR r.run_id=?6)
          ORDER BY r.started_at DESC, r.rowid DESC LIMIT ?4",
         params![
             serde_json::to_string(&capability.allowed_hosts)?,
             incident_id.or(capability.incident_id.as_deref()),
             host_id,
             bounded(limit),
+            delegated,
+            capability.run_id,
         ],
         |r| {
             let mut status: String = r.get(6)?;

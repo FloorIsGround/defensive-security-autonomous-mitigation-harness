@@ -507,6 +507,7 @@ mod tests {
 
     fn inv_cap(now: DateTime<Utc>) -> ScopedCapability {
         ScopedCapability {
+            may_spawn_runs: false,
             principal_id: "reasoner-d".into(),
             role: PrincipalRole::Investigator,
             run_id: Some("run-1".into()),

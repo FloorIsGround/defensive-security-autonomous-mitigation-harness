@@ -14,7 +14,7 @@ use crate::action::{
 use crate::audit::AuditEntry;
 use crate::observation::ObservationStatus;
 use crate::profile::HostProfileSummary;
-use crate::rules::ExpectationRuleSpec;
+use crate::rules::{ExpectationRuleSpec, RuleSuppression};
 use crate::signing::SignedEnvelope;
 use crate::watch::{CollectorCapability, CollectorType, WatchSpec};
 
@@ -39,6 +39,8 @@ pub struct ScopedCapability {
     pub run_id: Option<String>,
     #[serde(default)]
     pub incident_id: Option<String>,
+    #[serde(default)]
+    pub may_spawn_runs: bool,
     pub allowed_hosts: Vec<String>,
     pub allowed_collectors: Vec<CollectorType>,
     pub expires_at: DateTime<Utc>,
@@ -83,6 +85,7 @@ pub struct InvestigationCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationRequest {
+    GetCapability {},
     ListHosts {
         #[serde(default)]
         limit: Option<u32>,
@@ -121,6 +124,18 @@ pub enum InvestigationRequest {
         backend_id: String,
         model_id: String,
         prompt_schema_version: String,
+    },
+    StartDelegatedRun {
+        incident_id: String,
+        backend_id: String,
+        model_id: String,
+        prompt_schema_version: String,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+    },
+    CancelInvestigationRun {
+        run_id: String,
+        reason: String,
     },
     ReportRunProgress {
         run_id: String,
@@ -168,6 +183,8 @@ pub enum InvestigationRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ProposeEphemeralWatch {
         run_id: String,
@@ -388,6 +405,10 @@ pub struct BaselineSummaryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationResponse {
+    Capability {
+        capability: ScopedCapability,
+        delegated: bool,
+    },
     Hosts {
         hosts: Vec<HostSummary>,
     },
@@ -405,6 +426,8 @@ pub enum InvestigationResponse {
         active_watches: Vec<WatchSpec>,
         recent_observations: Vec<ObservationSlice>,
         findings: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_suppression: Option<RuleSuppression>,
     },
     Observations {
         observations: Vec<ObservationSlice>,
@@ -417,6 +440,12 @@ pub enum InvestigationResponse {
         run_id: String,
         incident_id: String,
         expires_at: DateTime<Utc>,
+    },
+    DelegatedRunStarted {
+        run_id: String,
+        incident_id: String,
+        expires_at: DateTime<Utc>,
+        run_token: String,
     },
     RunProgressRecorded {
         run_id: String,
@@ -445,6 +474,8 @@ pub enum InvestigationResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     ProposalEvaluated {
         decision: PolicyDecision,
@@ -521,6 +552,8 @@ pub enum AdminRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
     },
     ApplyBaselineWatch {
         spec: WatchSpec,
@@ -544,6 +577,8 @@ pub enum AdminRequest {
         #[serde(default)]
         incident_id: Option<String>,
         ttl_seconds: u64,
+        #[serde(default)]
+        may_spawn_runs: bool,
     },
     CloseIncident {
         incident_id: String,
@@ -601,6 +636,8 @@ pub enum AdminResponse {
     },
     ExpectationRules {
         rules: Vec<ExpectationRuleRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before: Option<String>,
     },
     WatchApplied {
         watch_id: String,
@@ -660,6 +697,8 @@ pub enum AdminResponse {
     Error {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<PolicyDecision>,
     },
 }
 

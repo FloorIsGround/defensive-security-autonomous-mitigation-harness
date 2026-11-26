@@ -249,7 +249,8 @@ impl RuleStore<'_> {
         allowed_hosts: Option<&[String]>,
         statuses: Option<&[String]>,
         limit: Option<u32>,
-    ) -> Result<Vec<ExpectationRuleRecord>> {
+        before: Option<&str>,
+    ) -> Result<(Vec<ExpectationRuleRecord>, Option<String>)> {
         if let Some(statuses) = statuses
             && statuses.iter().any(|s| {
                 !matches!(
@@ -260,7 +261,20 @@ impl RuleStore<'_> {
         {
             return Err(ControlError::invalid("unknown expectation rule status"));
         }
-        rows(
+        let (before_time, before_id) = if let Some(cursor) = before {
+            let invalid = || ControlError::invalid("invalid expectation rule cursor");
+            require_text(cursor, "before", 256)?;
+            let (time, id): (DateTime<Utc>, String) =
+                serde_json::from_str(cursor).map_err(|_| invalid())?;
+            if !is_valid_identifier(&id) {
+                return Err(invalid());
+            }
+            (Some(stamp(time)), Some(id))
+        } else {
+            (None, None)
+        };
+        let limit = limit.unwrap_or(50).min(100) as usize;
+        let mut rules = rows(
             self.db,
             "SELECT rule_id, effective_status, origin, proposed_by, run_id, incident_id, spec_json,
                     backtest_json, created_at, decided_by, decided_at, decision_note, hit_count, last_matched_at
@@ -270,11 +284,12 @@ impl RuleStore<'_> {
                    AND (?2 IS NULL OR host_id IN (SELECT value FROM json_each(?2)))
              )
              WHERE (?3 IS NULL OR effective_status IN (SELECT value FROM json_each(?3)))
+               AND (?6 IS NULL OR created_at<?6 OR (created_at=?6 AND rule_id>?7))
              ORDER BY created_at DESC, rule_id
              LIMIT ?5",
             params![host, allowed_hosts.map(serde_json::to_string).transpose()?,
                 statuses.map(serde_json::to_string).transpose()?, stamp(self.now),
-                limit.unwrap_or(50).min(100)],
+                limit + 1, before_time, before_id],
             |r| Ok(ExpectationRuleRecord {
                 rule_id: r.get(0)?, status: r.get(1)?, origin: r.get(2)?, proposed_by: r.get(3)?,
                 run_id: r.get(4)?, incident_id: r.get(5)?, spec: json_column(r, 6)?,
@@ -283,7 +298,17 @@ impl RuleStore<'_> {
                 decided_at: optional_stamp(r, 10)?, decision_note: r.get(11)?, hit_count: r.get(12)?,
                 last_matched_at: optional_stamp(r, 13)?,
             }),
-        )
+        )?;
+        let next_before = if rules.len() > limit {
+            rules.truncate(limit);
+            rules
+                .last()
+                .map(|rule| serde_json::to_string(&(stamp(rule.created_at), &rule.rule_id)))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok((rules, next_before))
     }
 
     fn backtest(&self, rule: &ExpectationRuleSpec, incident: Option<&str>) -> Result<RuleBacktest> {
@@ -532,8 +557,9 @@ fn canonical_spec(rule: &ExpectationRuleSpec) -> Result<String> {
 
 fn decision_error(decision: PolicyDecision) -> AdminResponse {
     AdminResponse::Error {
-        code: decision.rule_id,
-        message: decision.reason,
+        code: decision.rule_id.clone(),
+        message: decision.reason.clone(),
+        decision: Some(decision),
     }
 }
 

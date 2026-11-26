@@ -1,3 +1,4 @@
+mod delegation;
 mod progress;
 
 use std::collections::BTreeMap;
@@ -18,12 +19,12 @@ use serde_json::{Value, json};
 
 use crate::{
     expectation_rules::RuleStore,
-    ledger::{audit, json_column, rows},
+    ledger::{audit, json_column, optional_json, rows},
     service::{
         ControlError, ControlService, Result,
         actions::{ActionProposal, list_actions},
         active_watches, get_incident, insert_watch, latest_spec, list_hosts, list_incidents,
-        parse_stamp, record_decision, require_host, stamp, uuid,
+        parse_stamp, record_decision, require_host, stamp, store_capability_token, uuid,
     },
 };
 
@@ -58,11 +59,13 @@ impl ControlService {
         let request_id = &call.request_id;
         require_text(request_id, "request_id", 128)?;
         let hash = sha256_hex(call.capability_token.as_bytes());
-        let mut capability: ScopedCapability = db
+        let (mut capability, delegated): (ScopedCapability, bool) = db
             .query_row(
-                "SELECT capability_json FROM capability_tokens WHERE token_hash=?1",
+                "SELECT capability_json,
+                        EXISTS(SELECT 1 FROM agent_runs WHERE delegated=1 AND token_hash=?1)
+                 FROM capability_tokens WHERE token_hash=?1 AND revoked_at IS NULL",
                 [&hash],
-                |r| json_column(r, 0),
+                |r| Ok((json_column(r, 0)?, r.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| ControlError::denied("invalid capability token"))?;
@@ -82,9 +85,17 @@ impl ControlService {
                 .allowed_hosts
                 .retain(|host| host == &incident.host_id);
         }
+        if request_id.contains(&call.capability_token)
+            || serde_json::to_string(&call.request)?.contains(&call.capability_token)
+        {
+            return Err(ControlError::invalid(
+                "request contains its authentication credential",
+            ));
+        }
         let requires_active_run = !matches!(
             call.request,
             InvestigationRequest::FinishInvestigationRun { .. }
+                | InvestigationRequest::CancelInvestigationRun { .. }
                 | InvestigationRequest::CompleteTriggerLease { .. }
                 | InvestigationRequest::FailTriggerLease { .. }
                 | InvestigationRequest::ListInvestigationRuns { .. }
@@ -99,6 +110,18 @@ impl ControlService {
                 return Err(ControlError::denied("investigation run is inactive"));
             }
         }
+        if delegated
+            && matches!(
+                call.request,
+                InvestigationRequest::LeaseNextTrigger { .. }
+                    | InvestigationRequest::CompleteTriggerLease { .. }
+                    | InvestigationRequest::FailTriggerLease { .. }
+            )
+        {
+            return Err(ControlError::denied(
+                "delegated runs cannot manage trigger leases",
+            ));
+        }
         let rule_store = RuleStore {
             db,
             now,
@@ -106,6 +129,32 @@ impl ControlService {
             policy_version: self.policy().policy_version,
         };
         let response = match call.request {
+            InvestigationRequest::GetCapability {} => InvestigationResponse::Capability {
+                capability,
+                delegated,
+            },
+            InvestigationRequest::StartDelegatedRun {
+                incident_id,
+                backend_id,
+                model_id,
+                prompt_schema_version,
+                ttl_seconds,
+            } => delegation::start(
+                db,
+                &capability,
+                request_id,
+                now,
+                delegation::Start {
+                    incident_id,
+                    backend_id,
+                    model_id,
+                    prompt_schema_version,
+                    ttl_seconds,
+                },
+            )?,
+            InvestigationRequest::CancelInvestigationRun { run_id, reason } => {
+                delegation::cancel(db, &capability, &hash, request_id, &run_id, &reason, now)?
+            }
             InvestigationRequest::ProposeExpectationRule {
                 run_id,
                 idempotency_key,
@@ -119,18 +168,19 @@ impl ControlService {
                 host_id,
                 statuses,
                 limit,
+                before,
             } => {
                 if let Some(host) = &host_id {
                     authorize_host(&capability, host)?;
                 }
-                InvestigationResponse::ExpectationRules {
-                    rules: rule_store.list(
-                        host_id.as_deref(),
-                        Some(&capability.allowed_hosts),
-                        statuses.as_deref(),
-                        limit,
-                    )?,
-                }
+                let (rules, next_before) = rule_store.list(
+                    host_id.as_deref(),
+                    Some(&capability.allowed_hosts),
+                    statuses.as_deref(),
+                    limit,
+                    before.as_deref(),
+                )?;
+                InvestigationResponse::ExpectationRules { rules, next_before }
             }
             InvestigationRequest::ListHosts { limit, tag } => InvestigationResponse::Hosts {
                 hosts: list_hosts(db, tag.as_deref())?
@@ -218,11 +268,25 @@ impl ControlService {
                         )
                     },
                 )?;
+                let rule_suppression = db
+                    .query_row(
+                        "SELECT json_extract(t.outcome_json, '$.rule_suppression')
+                     FROM trigger_events t JOIN watch_specs w USING(host_id,watch_id,spec_version)
+                     WHERE t.incident_id=?1
+                       AND json_extract(w.spec_json, '$.collector.type') IN (SELECT value FROM json_each(?2))
+                       AND json_extract(w.spec_json, '$.trigger.type')='set_diff'
+                     ORDER BY t.event_id DESC LIMIT 1",
+                        params![incident_id, collector_scope_json(&capability)?],
+                        |r| optional_json(r, 0),
+                    )
+                    .optional()?
+                    .flatten();
                 InvestigationResponse::IncidentContext {
                     incident,
                     active_watches,
                     recent_observations,
                     findings,
+                    rule_suppression,
                 }
             }
             InvestigationRequest::QueryObservations {
@@ -264,6 +328,11 @@ impl ControlService {
                 prompt_schema_version,
             } => {
                 require_investigator(&capability)?;
+                if capability.may_spawn_runs {
+                    return Err(ControlError::denied(
+                        "spawn-capable tokens must use start_delegated_run",
+                    ));
+                }
                 let incident = authorize_incident(db, &capability, &incident_id)?;
                 require_open(&incident)?;
                 require_text(&backend_id, "backend_id", 128)?;
@@ -328,6 +397,7 @@ impl ControlService {
                     incident_id.as_deref(),
                     limit,
                     now,
+                    delegated,
                 )?,
             },
             InvestigationRequest::GetRunEvents {
@@ -335,6 +405,9 @@ impl ControlService {
                 after_seq,
                 limit,
             } => {
+                if delegated && capability.run_id.as_deref() != Some(&run_id) {
+                    return Err(ControlError::denied("run is outside capability scope"));
+                }
                 let events = progress::get_events(db, &capability, &run_id, after_seq, limit)?;
                 InvestigationResponse::RunEvents { run_id, events }
             }
@@ -447,6 +520,7 @@ impl ControlService {
                     db,
                     ActionProposal {
                         capability: &capability,
+                        delegated,
                         request_id,
                         incident: &incident,
                         run_id: &run_id,
@@ -467,14 +541,21 @@ impl ControlService {
                 if let Some(host) = &host_id {
                     authorize_host(&capability, host)?;
                 }
-                let scoped_id = capability.incident_id.as_deref().ok_or_else(|| {
-                    ControlError::denied("action listing requires an incident scope")
-                })?;
-                if incident_id.as_deref().is_some_and(|id| id != scoped_id) {
-                    return Err(ControlError::denied("incident is outside capability scope"));
+                if let Some(id) = &incident_id {
+                    authorize_incident(db, &capability, id)?;
+                }
+                if capability.incident_id.is_none() && !capability.may_spawn_runs {
+                    return Err(ControlError::denied(
+                        "action listing requires an incident scope",
+                    ));
                 }
                 InvestigationResponse::Actions {
-                    actions: list_actions(db, host_id.as_deref(), Some(scoped_id))?,
+                    actions: list_actions(
+                        db,
+                        host_id.as_deref(),
+                        incident_id.as_deref().or(capability.incident_id.as_deref()),
+                        Some(&capability.allowed_hosts),
+                    )?,
                 }
             }
             InvestigationRequest::LeaseNextTrigger {
@@ -602,6 +683,22 @@ impl ControlService {
                     ));
                 };
                 authorize_incident(db, &capability, &incident_id)?;
+                if let Some(run_id) = &run_id {
+                    let foreign_delegation: bool = db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE run_id=?1 AND delegated=1
+                         AND (principal_id<>?2 OR incident_id<>?3 OR ?4))",
+                        params![
+                            run_id,
+                            capability.principal_id,
+                            incident_id,
+                            capability.run_id.is_some()
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    if foreign_delegation {
+                        return Err(ControlError::denied("run is outside capability scope"));
+                    }
+                }
                 db.execute(
                     "UPDATE trigger_events
                      SET status = 'done', lease_token = NULL, lease_expires_at = NULL, updated_at = ?2
@@ -611,7 +708,7 @@ impl ControlService {
                 if let Some(ref rid) = run_id {
                     let changed = db.execute(
                         "UPDATE agent_runs SET status = 'completed', ended_at = ?3
-                         WHERE run_id = ?1 AND incident_id = ?2 AND status = 'active'",
+                         WHERE run_id = ?1 AND incident_id = ?2 AND status = 'active' AND delegated=0",
                         params![rid, incident_id, stamp(now)],
                     )?;
                     let outcome = if changed == 0 { "done" } else { "completed" };

@@ -763,7 +763,7 @@ function workspaceView(ctx, caps) {
     for (const fn of evidenceListeners) fn();
   };
   // Built first: it indexes added/removed sockets that the fact tables below mark.
-  const changesSlot = changesCard(inc, ctx.changes, { watchMap, triggers: ctx.triggers ?? [] });
+  const changesSlot = changesCard(inc, ctx.changes, { watchMap, triggers: ctx.triggers ?? [], ruleSuppression: ctx.rule_suppression });
 
   const incActions = state.actions.list.filter((a) => a.incident_id === inc.incident_id);
   const incPending = incActions.filter(isAwaiting).length;
@@ -2057,12 +2057,13 @@ function changeView(c, actionFor) {
   );
 }
 
-function changesCard(inc, r, { watchMap = new Map(), triggers = [] } = {}) {
-  if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
+function changesCard(inc, r, { watchMap = new Map(), triggers = [], ruleSuppression = null } = {}) {
+  const suppressed = suppressionNote(inc, triggers, ruleSuppression);
+  if (!r || r.error) return card('What changed', null, el('div', { class: 'card-body' }, suppressed, errorBox(r?.error ?? new Error('unavailable'))), null, 'changes');
   {
     // "Allow for this service": only on set_diff socket watches, only for admins.
     // A socket an active rule already covers is marked instead (matched here in
-    // the browser against the listed rules; control-d only reports a count).
+    // the browser against the currently active rules).
     const allowFor = (c) => {
       const w = watchMap.get(c.watch_id);
       if (c.collector_type !== 'sockets.listening' || c.diff.kind !== 'set' || w?.trigger?.type !== 'set_diff') return () => null;
@@ -2079,7 +2080,6 @@ function changesCard(inc, r, { watchMap = new Map(), triggers = [] } = {}) {
         );
       };
     };
-    const suppressed = suppressionNote(inc, triggers);
     const n = r.changes.length;
     for (const c of r.changes) {
       if (c.diff.kind === 'set' && c.collector_type === 'sockets.listening') {
@@ -2908,12 +2908,19 @@ const suppressedCount = (reason) => {
   return m ? Number(m[1]) : 0;
 };
 
-/**
- * control-d appends "(k suppressed by rules)" to a set_diff trigger reason (and
- * so to the incident summary) when active rules filtered items. The rule IDs
- * themselves are not exposed to the console, only the count.
- */
-function suppressionNote(inc, triggers) {
+function suppressionNote(inc, triggers, ruleSuppression) {
+  const href = `#/rules?host=${enc(inc.host_id)}`;
+  if (ruleSuppression?.rules.length) {
+    const { rules, total } = ruleSuppression;
+    return notice('', 'rules', [
+      el('strong', null, `Suppressed by ${plural(rules.length, 'rule')} (${plural(total, 'item')} total)`),
+      el('ul', null, rules.map((r) => el('li', null,
+        el('a', { href, title: r.rule_id }, r.rationale),
+        ` (${plural(r.count, 'item')})`,
+      ))),
+    ]);
+  }
+  // Older triggers carry the count in the reason.
   const sets = triggers.filter((t) => /^set '/.test(t.reason ?? '')).sort((a, b) => b.event_id - a.event_id);
   const latest = sets[0] ?? null;
   const n = latest ? suppressedCount(latest.reason) : suppressedCount(inc.summary);
@@ -3129,12 +3136,15 @@ async function renderRules(_arg, stale, route) {
   const hostQ = q?.get('host');
   if (hostQ !== null && hostQ !== undefined) state.rv.host = hostQ;
   const f = state.rv;
-  const qs = (statuses) => {
+  const currentStatuses = 'active,proposed';
+  const historyStatuses = 'rejected,revoked,expired';
+  const qs = (statuses, before = null) => {
     const p = new URLSearchParams({ status: statuses, limit: '100' });
     if (f.host) p.set('host_id', f.host);
+    if (before !== null) p.set('before', before);
     return p;
   };
-  const [cur, hist] = await Promise.all([api(`/api/rules?${qs('active,proposed')}`), api(`/api/rules?${qs('rejected,revoked,expired')}`)]);
+  const [cur, hist] = await Promise.all([api(`/api/rules?${qs(currentStatuses)}`), api(`/api/rules?${qs(historyStatuses)}`)]);
   if (stale()) return null;
   if (cur.available === false) {
     return el(
@@ -3183,13 +3193,43 @@ async function renderRules(_arg, stale, route) {
     pending: emptyState('Nothing waiting for approval', 'reasoner-d may propose a rule for benign, recurring noise. Proposals are inert until an operator approves them here.'),
     history: emptyState('No history yet', 'Rejected, revoked and expired rules stay here for the audit trail.'),
   }[f.tab];
-  const list = lists[f.tab];
+  const tab = f.tab;
+  const list = lists[tab];
+  const cards = el('div', { class: 'rule-list' }, list.map(ruleCard));
+  const emptyCard = el('div', { class: 'card', hidden: list.length > 0 }, el('div', { class: 'card-body' }, empty));
+  const errors = el('div');
+  let before = (tab === 'history' ? hist : cur).next_before ?? null;
+  const more = el('button', { class: 'btn', type: 'button', hidden: before === null }, 'Load more');
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    replace(errors);
+    try {
+      const page = await api(`/api/rules?${qs(tab === 'history' ? historyStatuses : currentStatuses, before)}`);
+      if (stale()) return;
+      if (page.available === false) throw new Error(page.message ?? 'Rules unavailable');
+      const shown = new Set(list.map((r) => r.rule_id));
+      const added = page.rules.filter((r) => !shown.has(r.rule_id) && (tab === 'history' || r.status === (tab === 'pending' ? 'proposed' : 'active')));
+      list.push(...added);
+      cards.append(...added.map(ruleCard));
+      emptyCard.hidden = list.length > 0;
+      tabs.querySelectorAll('.tab-count')[RULE_TABS.findIndex(([id]) => id === tab)].textContent = String(list.length);
+      before = page.next_before ?? null;
+      more.hidden = before === null;
+    } catch (err) {
+      if (!stale()) replace(errors, errorBox(err));
+    } finally {
+      more.disabled = false;
+    }
+  });
   return el(
     'div',
     { class: 'stack rules-view' },
     notes,
     el('div', { class: 'rules-toolbar' }, tabs, el('span', { class: 'spacer' }), hosts.length > 1 || f.host ? hostSel : null),
-    list.length ? el('div', { class: 'rule-list' }, list.map(ruleCard)) : el('div', { class: 'card' }, el('div', { class: 'card-body' }, empty)),
+    cards,
+    emptyCard,
+    errors,
+    more,
   );
 }
 

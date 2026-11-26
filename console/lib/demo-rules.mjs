@@ -336,13 +336,30 @@ export function backtestRule(S, rule, nowMs, incidentId = null) {
   return out;
 }
 
-export function listRules(S, { statuses = null, host_id = null, limit = 50 } = {}, nowMs) {
-  return S.rules
+export function listRules(S, { statuses = null, host_id = null, limit = 50, before = null } = {}, nowMs) {
+  let cutoff = null;
+  if (before !== null) {
+    try {
+      const cursor = JSON.parse(before);
+      if (!Array.isArray(cursor) || cursor.length !== 2 || typeof cursor[0] !== 'string' || !Number.isFinite(Date.parse(cursor[0])) ||
+          typeof cursor[1] !== 'string' || !/^[a-zA-Z0-9_.-]{1,96}$/.test(cursor[1])) throw new Error();
+      cutoff = { created_at: cursor[0], rule_id: cursor[1] };
+    } catch {
+      throw new ApiError(400, 'invalid_request', 'invalid expectation rule cursor');
+    }
+  }
+  const compare = (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) ||
+    (a.rule_id < b.rule_id ? -1 : Number(a.rule_id > b.rule_id));
+  const pageSize = Math.min(limit ?? 50, 100);
+  const page = S.rules
     .map((r) => ({ ...r, status: effectiveStatus(r, nowMs) }))
-    .filter((r) => (!host_id || r.spec.scope.host_id === host_id) && (!statuses || statuses.includes(r.status)))
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || a.rule_id.localeCompare(b.rule_id))
-    .slice(0, Math.min(limit ?? 50, 100))
-    .map(publicRuleRecord);
+    .filter((r) => (!host_id || r.spec.scope.host_id === host_id) && (!statuses || statuses.includes(r.status)) && (!cutoff || compare(r, cutoff) > 0))
+    .sort(compare)
+    .slice(0, pageSize + 1);
+  const hasMore = page.length > pageSize;
+  if (hasMore) page.pop();
+  const last = page.at(-1);
+  return { rules: page.map(publicRuleRecord), next_before: hasMore && last ? JSON.stringify([last.created_at, last.rule_id]) : null };
 }
 
 function recordDecision(S, appendAudit, actor, decision, context, nowIso) {
@@ -416,12 +433,14 @@ const sockScope = (host, watch = 'base-sockets-listening') => ({ host_id: host, 
  * for approval (with its stored backtest), and a history of rejected, revoked
  * and expired rules. Backtests are computed against the demo observations.
  */
+export const RESOLVER_RULE_ID = 'rule-5e2c7a10-3b1d-4f0e-9a44-0c6f1d2b8e71';
+
 export function buildDemoRules(S, nowMs) {
   const iso = (ago) => new Date(nowMs - ago).toISOString();
   const rule = (o) => ({ backtest: null, decided_by: null, decided_at: null, decision_note: null, hit_count: 0, last_matched_at: null, run_id: null, incident_id: null, ...o });
   const rules = [
     rule({
-      rule_id: 'rule-5e2c7a10-3b1d-4f0e-9a44-0c6f1d2b8e71', status: 'active', origin: 'operator', proposed_by: 'j.rivera',
+      rule_id: RESOLVER_RULE_ID, status: 'active', origin: 'operator', proposed_by: 'j.rivera',
       spec: { scope: sockScope('edge-vm-07', null), matches: [{ op: 'eq', field: 'systemd_unit', value: 'systemd-resolved.service' }, { op: 'eq', field: 'bind_scope', value: 'loopback' }, { op: 'in', field: 'local_port', values: [53, 5355] }], effect: 'allow_optional', rationale: 'Stub resolver binds and releases its loopback listeners on network changes.', expires_at: null },
       created_at: iso(9 * DAY), decided_by: 'j.rivera', decided_at: iso(9 * DAY), hit_count: 37, last_matched_at: iso(11 * MIN),
     }),

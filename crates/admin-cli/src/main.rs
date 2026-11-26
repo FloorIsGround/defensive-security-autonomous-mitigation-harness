@@ -90,6 +90,8 @@ enum Command {
         incident_id: Option<String>,
         #[arg(long, default_value_t = 3600)]
         ttl_seconds: u64,
+        #[arg(long)]
+        allow_run_spawn: bool,
     },
     CloseIncident {
         incident_id: String,
@@ -130,6 +132,10 @@ enum Command {
         host_id: Option<String>,
         #[arg(long = "status")]
         statuses: Vec<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        before: Option<String>,
     },
     CreateRule {
         rule_json_file: PathBuf,
@@ -216,7 +222,9 @@ impl Command {
                 allowed_collectors,
                 incident_id,
                 ttl_seconds,
+                allow_run_spawn,
             } => AdminRequest::MintCapabilityToken {
+                may_spawn_runs: allow_run_spawn,
                 principal_id,
                 role: match role {
                     Role::Observer => PrincipalRole::Observer,
@@ -251,10 +259,16 @@ impl Command {
                 return Err("command requires local operator key handling".into());
             }
             Self::Pki(_) => return Err("PKI commands operate on local files".into()),
-            Self::ListRules { host_id, statuses } => AdminRequest::ListExpectationRules {
+            Self::ListRules {
+                host_id,
+                statuses,
+                limit,
+                before,
+            } => AdminRequest::ListExpectationRules {
                 host_id,
                 statuses: (!statuses.is_empty()).then_some(statuses),
-                limit: None,
+                limit,
+                before,
             },
             Self::CreateRule {
                 rule_json_file,
@@ -543,6 +557,7 @@ mod tests {
                 host_id: Some("edge".into()),
                 statuses: Some(vec!["proposed".into(), "active".into()]),
                 limit: None,
+                before: None,
             }
         );
     }
@@ -756,6 +771,7 @@ mod tests {
             "user",
             "--role",
             "investigator",
+            "--allow-run-spawn",
             "--host",
             "edge",
             "--host",
@@ -774,6 +790,7 @@ mod tests {
         assert_eq!(
             args.command.into_request().unwrap(),
             AdminRequest::MintCapabilityToken {
+                may_spawn_runs: true,
                 principal_id: "user".into(),
                 role: PrincipalRole::Investigator,
                 allowed_hosts: vec!["edge".into(), "edge2".into()],

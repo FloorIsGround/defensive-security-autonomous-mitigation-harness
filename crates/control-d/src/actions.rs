@@ -25,6 +25,7 @@ use crate::{
 
 pub(crate) struct ActionProposal<'a> {
     pub capability: &'a ScopedCapability,
+    pub delegated: bool,
     pub request_id: &'a str,
     pub incident: &'a IncidentSummary,
     pub run_id: &'a str,
@@ -101,7 +102,10 @@ impl ControlService {
             proposal.incident,
             &proposal.evidence_observation_ids,
         )?;
-        let cfg = &self.0.action_safety;
+        let mut cfg = std::borrow::Cow::Borrowed(&self.0.action_safety);
+        if proposal.delegated {
+            cfg.to_mut().allow_autonomous_verbs.clear();
+        }
         let mut context = recent_actions(db, host, proposal.now, false)?;
         context.verified_evidence_count = evidence.as_ref().map_or(0, |verified| verified.len());
         let mut evaluation = evaluate_action_proposal(
@@ -110,7 +114,7 @@ impl ControlService {
             incident,
             &proposal.verb,
             &context,
-            cfg,
+            &cfg,
             proposal.now,
         );
         if evidence.is_none() {
@@ -387,6 +391,7 @@ pub(crate) fn list_actions(
     db: &Connection,
     host: Option<&str>,
     incident: Option<&str>,
+    allowed_hosts: Option<&[String]>,
 ) -> Result<Vec<ActionSummary>> {
     rows(
         db,
@@ -394,8 +399,9 @@ pub(crate) fn list_actions(
                 p.verb_json,p.expected_effect,p.blast_radius,p.rollback_plan,p.created_at,i.approver
          FROM action_intents i JOIN action_proposals p USING (proposal_id)
          WHERE (?1 IS NULL OR p.host_id=?1) AND (?2 IS NULL OR p.incident_id=?2)
+           AND (?3 IS NULL OR p.host_id IN (SELECT value FROM json_each(?3)))
          ORDER BY p.proposal_id DESC",
-        params![host, incident],
+        params![host, incident, allowed_hosts.map(to_string).transpose()?],
         |row| {
             Ok(ActionSummary {
                 proposal_id: row.get(0)?,
