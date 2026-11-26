@@ -37,7 +37,7 @@ from defsec_reasoner.context import (
     select_observations,
     trigger_diff,
 )
-from defsec_reasoner.models import ModelAdapter, ProviderError, ToolCall
+from defsec_reasoner.models import BudgetExhausted, ModelAdapter, ProviderError, ToolCall, TurnBudget
 from defsec_reasoner.provenance import (
     build_system_prompt,
     clip_utf8,
@@ -79,6 +79,9 @@ class RunBudgets:
     enable_action_proposals: bool = False
     max_context_bytes: int = 32768
     lease_seconds: int = 120
+    max_completion_tokens: int = 4096
+    onboarding_max_total_tokens: int = 24_000
+    onboarding_max_wall_seconds: float = 15.0
 
 
 @dataclass
@@ -93,6 +96,9 @@ class WorkerOutcome:
     tool_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     estimated_cost_usd: float = 0.0
     findings: int = 0
     proposals: int = 0
@@ -471,7 +477,11 @@ class ReasonerWorker:
         prompt_schema_version: str = PROMPT_SCHEMA_VERSION,
         backoff_base_seconds: float = 0.5,
         max_backoff_seconds: float = 30.0,
+        followups_only: bool = False,
+        discovery_only: bool = False,
     ) -> None:
+        self.discovery_only = discovery_only
+        self.followups_only = followups_only
         self._client_or_factory = client_or_factory
         self.adapter = adapter
         self.backend_id = backend_id
@@ -494,13 +504,20 @@ class ReasonerWorker:
     def run_once(self) -> WorkerOutcome | None:
         """Lease and process a single trigger; ``None`` when dormant."""
         client = self._new_client()
+        if self.followups_only:
+            from defsec_reasoner.followups import reassess
+
+            return reassess(self, client)
         try:
-            lease = client.lease_next_trigger(self.lease_owner, self.budgets.lease_seconds)
+            lease = None if self.discovery_only else client.lease_next_trigger(self.lease_owner, self.budgets.lease_seconds)
         except (RpcError, RpcTransportError) as exc:
             logger.warning("lease attempt rejected: %s", exc)
             return None
         if not lease:
-            return None  # dormant: nothing pending in scope
+            from defsec_reasoner.discovery import interpret_next_host
+
+            interpret_next_host(self.adapter, client, self.budgets)
+            return None
         event_id = int(lease["event_id"])
         incident_id = str(lease["incident_id"])
         host_id = str(lease["host_id"])
@@ -616,7 +633,7 @@ class ReasonerWorker:
 
         try:
             for _turn in range(self.budgets.max_turns):
-                if time.monotonic() > deadline:
+                if time.monotonic() >= deadline:
                     outcome.budget_stop_reason = "max_wall_seconds"
                     break
                 if outcome.input_tokens + outcome.output_tokens >= self.budgets.max_total_tokens:
@@ -629,10 +646,20 @@ class ReasonerWorker:
                     "turn_started", turn=_turn + 1,
                     input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
                 )
-                turn = self.adapter.chat(messages, tools)
+                remaining_tokens = (
+                    self.budgets.max_total_tokens - outcome.input_tokens - outcome.output_tokens
+                )
+                budget = TurnBudget(
+                    remaining_tokens, deadline, self.budgets.max_completion_tokens,
+                    session_id=f"trigger/{incident_id}/{event_id}",
+                )
+                turn = self.adapter.chat_with_budget(messages, tools, budget)
                 outcome.turns += 1
                 outcome.input_tokens += turn.input_tokens
                 outcome.output_tokens += turn.output_tokens
+                outcome.cached_input_tokens += turn.cached_input_tokens
+                outcome.reasoning_tokens += turn.reasoning_tokens
+                outcome.cache_creation_input_tokens += turn.cache_creation_input_tokens
                 outcome.estimated_cost_usd += turn.estimated_cost_usd
 
                 tokens_used = outcome.input_tokens + outcome.output_tokens
@@ -642,6 +669,18 @@ class ReasonerWorker:
                         max_total_tokens=self.budgets.max_total_tokens,
                     )
                     budget_warning_sent = True
+                if turn.finish_reason == "budget_exhausted":
+                    outcome.budget_stop_reason = "provider_token_limit"
+                    break
+                if tokens_used >= self.budgets.max_total_tokens:
+                    outcome.budget_stop_reason = "max_total_tokens"
+                    break
+                if outcome.estimated_cost_usd > self.budgets.max_cost_usd:
+                    outcome.budget_stop_reason = "max_cost_usd"
+                    break
+                if time.monotonic() >= deadline:
+                    outcome.budget_stop_reason = "max_wall_seconds"
+                    break
                 if turn.final_text:
                     text = _redact_credentials(turn.final_text, client, lease_token)
                     progress.record("model_text", text=text[:300])
@@ -655,10 +694,16 @@ class ReasonerWorker:
                             for call in turn.tool_calls
                         ],
                     }
+                    if turn.response_items:
+                        assistant_msg["response_items"] = turn.response_items
                     if turn.reasoning_content is not None:
                         assistant_msg["reasoning_content"] = turn.reasoning_content
                     messages.append(assistant_msg)
+                    stop = False
                     for call in turn.tool_calls:
+                        if time.monotonic() >= deadline:
+                            outcome.budget_stop_reason = "max_wall_seconds"
+                            break
                         outcome.tool_calls += 1
                         tool_name, preview = _tool_preview(call)
                         progress.record("tool_call", tool=tool_name, arguments_preview=preview)
@@ -716,14 +761,27 @@ class ReasonerWorker:
                             finish_summary = result["summary"]
                             break
                     self._compact_messages(messages)
+                    if time.monotonic() >= deadline:
+                        outcome.budget_stop_reason = "max_wall_seconds"
+                        break
                     if not stop:
                         continue
                 final_text = turn.final_text
                 break
             else:
                 outcome.budget_stop_reason = "max_turns"
+        except BudgetExhausted as exc:
+            outcome.budget_stop_reason = str(exc)
+            if outcome.budget_stop_reason == "max_total_tokens" and not budget_warning_sent:
+                progress.record(
+                    "budget_warning", total_tokens=outcome.input_tokens + outcome.output_tokens,
+                    max_total_tokens=self.budgets.max_total_tokens,
+                )
         except ProviderError as exc:
-            failure = (f"provider failure: {exc}", exc.retryable)
+            if time.monotonic() >= deadline:
+                outcome.budget_stop_reason = "max_wall_seconds"
+            else:
+                failure = (f"provider failure: {exc}", exc.retryable)
         except RpcTransportError as exc:
             failure = (f"control-d transport failure: {exc}", True)
         finally:

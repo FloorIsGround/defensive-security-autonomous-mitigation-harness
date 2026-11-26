@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use defsec_policy::edge_floor::{
     BundleHighWaterMark, BundleValidationOutcome, EdgeSafetyConfig, validate_bundle,
-    validate_cached_bundle,
+    validate_cached_bundle, validate_watch_spec,
 };
 use defsec_policy::predicate::SustainedCounterState;
 use defsec_protocol::observation::{ObservationPayload, ObservationRecord, ObservationStatus};
@@ -228,6 +228,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
         let mut active_bundle: Option<ActiveBundle> = None;
         let mut hwm: Option<BundleHighWaterMark> = None;
         let mut cached_bundle_rejection = None;
+        let mut baseline_fallback = Vec::new();
         if let Some(envelope) = load_json::<SignedEnvelope>(&state_dir.join(BUNDLE_FILE))
             && let Ok((payload, digest)) = self_verify(&store, &envelope)
         {
@@ -250,6 +251,18 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     });
                 }
                 Err(error) => {
+                    // Recover only locally valid baseline watches from the verified cache.
+                    // Revalidate the filtered bundle header and aggregate limits. Report
+                    // the original as rejected and never acknowledge the subset as active.
+                    let mut fallback = payload.clone();
+                    fallback.watches.retain(|watch| {
+                        watch.class == WatchClass::Baseline
+                            && watch.host_id == host_id
+                            && validate_watch_spec(watch, &cfg, now).is_ok()
+                    });
+                    if validate_cached_bundle(&fallback, &host_id, &cfg, now).is_ok() {
+                        baseline_fallback = fallback.watches;
+                    }
                     tracing::warn!(%error, bundle_version = payload.bundle_version, "cached bundle rejected");
                     cached_bundle_rejection = Some(AgentToControl::BundleAck {
                         host_id: host_id.clone(),
@@ -282,18 +295,21 @@ impl<C: CollectorBackend> AgentEngine<C> {
             .map(|s| s.watch_runtime)
             .unwrap_or_default();
         let mut watches = BTreeMap::new();
-        if let Some(bundle) = &active_bundle {
-            for spec in &bundle.payload.watches {
-                watches.insert(
-                    spec.id.clone(),
-                    WatchRuntime::new(
-                        spec.clone(),
-                        &now,
-                        &host_id,
-                        persisted_runtime.get(&spec.id).cloned(),
-                    ),
-                );
-            }
+        let startup_watches = active_bundle
+            .as_ref()
+            .map_or(baseline_fallback.as_slice(), |bundle| {
+                bundle.payload.watches.as_slice()
+            });
+        for spec in startup_watches {
+            watches.insert(
+                spec.id.clone(),
+                WatchRuntime::new(
+                    spec.clone(),
+                    &now,
+                    &host_id,
+                    persisted_runtime.get(&spec.id).cloned(),
+                ),
+            );
         }
 
         // Preserve baseline monitoring while disconnected, but retire
@@ -397,7 +413,10 @@ impl<C: CollectorBackend> AgentEngine<C> {
         AgentToControl::Register {
             protocol_version: WIRE_PROTOCOL_VERSION,
             host_id: self.host_id.clone(),
-            agent_version: AGENT_VERSION.to_string(),
+            agent_version: format!(
+                "{AGENT_VERSION}{}",
+                defsec_protocol::watch::HOST_DISCOVERY_AGENT_SUFFIX
+            ),
             boot_id: self.boot_id.clone(),
             session_id: self.session_id.clone(),
             active_bundle_version: self.active_bundle_version(),
@@ -619,6 +638,7 @@ impl<C: CollectorBackend> AgentEngine<C> {
                     acked_at: now,
                 }
             }
+            // Leave the persisted bundle and current watch runtimes intact.
             Err(e) => self.bundle_rejected(&envelope, e.to_string()),
         }
     }

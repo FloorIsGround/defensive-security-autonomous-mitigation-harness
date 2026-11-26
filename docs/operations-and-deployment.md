@@ -258,7 +258,13 @@ The reasoner worker exposes the same proposal as its `propose_expectation_rule` 
 
 Add `--enable-admin --admin-sock ./run-data/admin.sock` only for a trusted local operator session. The default listener is loopback. See [console/README.md](../console/README.md) for options and security boundaries.
 
-Set `DEFSEC_CAPABILITY_TOKEN` in the worker's protected environment, then run:
+For the primary incident worker, mint an investigator credential with `--allow-run-spawn`, set `DEFSEC_CAPABILITY_TOKEN` in the service environment, and use the worker account's Codex CLI login. See the [primary worker service unit](operator-agent.md#systemd-unit).
+
+```sh
+PYTHONPATH=reasoner python3 -m defsec_reasoner investigator --socket ./run-data/investigate.sock
+```
+
+To select the custom model worker instead, set `DEFSEC_CAPABILITY_TOKEN` in the worker's protected environment, then run:
 
 ```sh
 PYTHONPATH=reasoner python3 -m defsec_reasoner worker --socket ./run-data/investigate.sock --backend openai --base-url http://localhost:11434/v1 --model MODEL_NAME
@@ -284,3 +290,9 @@ action-exec-d --host-id edge-01 --state-dir /var/lib/defsecautmit/action-exec \
 ```
 
 Capture the JSON receipt and submit it with `admin-cli record-receipt RECEIPT_JSON_FILE`. `--mode enforce` invokes real fixed drivers and can affect availability. Autonomous containment requires `--enable-autonomous-containment` on both control and executor in addition to applicable policy; leave it off unless deliberately enabled. Test expiry, rollback and recovery with the intended environment and privileges first.
+
+### Inspect a receipt and its effect
+
+Run `admin-cli get-action-verification INTENT_ID` after recording a receipt. For a service stop, use a complete, recent observation of the active unit as proposal evidence. Control binds its host, watch revision and agent session before dispatch. After receipt, the first eligible observation within the verification window records the resulting service state and evidence hash. A rollback receipt starts a new check against the original active state. Simulation, missing evidence and unsupported effects yield an indeterminate result. Operators can inspect concurrent transitions on other monitored services.
+
+A new proposal for the same unresolved target can return `action.awaiting_reconciliation`. Retrieve the original receipt and evidence. If an independent check confirms that the action had no effect or the target was restored, record the operator’s evidence reference and rationale with `admin-cli reconcile-action-outcome INTENT_ID --expected-receipt-id RECEIPT_ID --evidence-ref REF --rationale TEXT`. Omit the receipt ID only for an expired authorization with no receipt. A later receipt supersedes the reconciliation. The ledger retains the independent observation and operator attestation separately. [Verification logic](../crates/control-d/src/verification.rs)

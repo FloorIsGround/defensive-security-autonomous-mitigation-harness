@@ -9,6 +9,8 @@ Skipped automatically when no compiled binary is present.
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,6 +21,8 @@ if str(REASONER_ROOT) not in sys.path:
     sys.path.insert(0, str(REASONER_ROOT))
 
 import unittest  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from defsec_reasoner.admin_client import AdminClient  # noqa: E402
 from defsec_reasoner.control_harness import (  # noqa: E402
@@ -34,7 +38,8 @@ from defsec_reasoner.control_harness import (  # noqa: E402
     systemd_unit_watch_spec,
     unit_file_hash,
 )
-from defsec_reasoner.models import ScriptedMockAdapter  # noqa: E402
+from defsec_reasoner.host_review import ReviewLimits, review_once
+from defsec_reasoner.models import ProviderError, ScriptedMockAdapter  # noqa: E402
 from defsec_reasoner.rpc_client import ControlRpcClient, RpcError  # noqa: E402
 from defsec_reasoner.worker import ReasonerWorker, RunBudgets  # noqa: E402
 
@@ -58,7 +63,9 @@ def _changed_sockets() -> list[dict]:
 @unittest.skipUnless(BINARY, "compiled control-d binary not found (cargo build -p control-d)")
 class LiveIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.daemon = ControlDaemon(BINARY).start()
+        self.daemon = ControlDaemon(BINARY)
+        self.addCleanup(self.daemon.stop)
+        self.daemon.start()
         self.admin = AdminClient(self.daemon.admin_sock)
         self.admin.enroll_host(HOST)
         self.admin.apply_baseline_watch(
@@ -72,7 +79,6 @@ class LiveIntegrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.agent.close()
-        self.daemon.stop()
 
     def _client(self, token: str | None = None) -> ControlRpcClient:
         return ControlRpcClient(self.daemon.investigate_sock, token or self.token)
@@ -108,6 +114,117 @@ class LiveIntegrationTests(unittest.TestCase):
             "rationale": "sshd.service legitimately re-listens on its pinned port after restarts",
             "expires_at": expires,
         }
+
+    def test_periodic_host_review_rpc(self) -> None:
+        self.admin.call({
+            "admin_op": "set_host_review_schedule",
+            "schedule": {
+                "host_id": HOST,
+                "interval_seconds": 120,
+                "route": "supervisory",
+                "question": "Which evidence is still missing?",
+                "collectors": ["sockets.listening"],
+            },
+        })
+        token = self.admin.mint_capability_token(
+            "review-worker", "investigator", [HOST], ["sockets.listening"],
+            may_spawn_runs=True,
+        )["token"]
+        client = self._client(token)
+        lease = client.claim_host_review("supervisory", 60)
+        assert lease is not None
+        self.assertEqual(lease["assessment"]["host_id"], HOST)
+        client.complete_host_review(
+            lease["review_id"], lease["lease_token"], "unresolved", "Awaiting discovery."
+        )
+        review = self.admin.call({"admin_op": "get_latest_host_review", "host_id": HOST})["review"]
+        self.assertEqual(review["review_id"], lease["review_id"])
+        self.assertIsNone(client.claim_host_review("supervisory", 60))
+
+    def test_host_review_refresh_survives_provider_outage(self) -> None:
+        self.agent.close()
+        self.agent = SyntheticAgent(
+            self.daemon.agent_sock, HOST, agent_version="synthetic+host-discovery-v1"
+        )
+        self.agent.connect()
+        question = "Does the socket sample establish which service is running?"
+        route = "supervisory"
+        self.admin.call({
+            "admin_op": "set_host_review_schedule",
+            "schedule": {
+                "host_id": HOST, "interval_seconds": 120, "route": route,
+                "question": question, "collectors": ["sockets.listening"],
+            },
+        })
+
+        def scoped(name, collectors):
+            return self._client(self.admin.mint_capability_token(
+                name, "investigator", [HOST], collectors, may_spawn_runs=True,
+            )["token"])
+
+        first = scoped("provider-a", ["sockets.listening"])
+        second = scoped("provider-b", COLLECTORS)
+        narrow = scoped("narrow", ["packages.inventory"])
+        self.assertIsNone(narrow.claim_host_review(route, 10))
+
+        barrier = Barrier(2)
+
+        def claim(client):
+            barrier.wait(timeout=5)
+            return client.claim_host_review(route, 10)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            contenders = [pool.submit(claim, client) for client in (first, second)]
+            claims = [task.result() for task in contenders]
+        ((winner, lease),) = [(client, lease) for client, lease in zip((first, second), claims) if lease]
+        self.assertTrue(lease["needs_fresh_evidence"])
+        self.assertTrue(winner.refresh_host_review(lease["review_id"], lease["lease_token"]))
+        with self.assertRaises(RpcError):
+            winner.complete_host_review(lease["review_id"], lease["lease_token"], "unresolved", "Old lease")
+        self.agent.drain()
+        discovery_watches = [w for w in self.agent.watches() if w["id"].startswith("discovery-")]
+        self.assertEqual(len(discovery_watches), 1, first.get_host_assessment(HOST))
+        watch = discovery_watches[0]
+        self.assertTrue(self.agent.push_snapshot(watch["id"], watch["version"], sockets_snapshot([
+            socket_entry("tcp:0.0.0.0:5432:uid=0", port=5432),
+        ])))
+
+        # The reactive worker can finish a trigger during the review's refresh window.
+        self._fire_sockets_trigger()
+        reactive = ReasonerWorker(self._client(), ScriptedMockAdapter(["Baseline trigger reviewed."]))
+        self.assertIsNotNone(reactive.run_once())
+        time.sleep(2.1)
+
+        failed = ScriptedMockAdapter([ProviderError("simulated outage", True)], name="provider-a")
+        with self.assertRaises(ProviderError):
+            review_once(first, failed, route, ReviewLimits(seconds=0.8, lease_seconds=1))
+        time.sleep(1.1)
+
+        def assess(messages, tools):
+            self.assertEqual(tools, [])
+            self.assertEqual(len(messages), 2)
+            self.assertIn("A socket does not identify its process", messages[0]["content"])
+            prompt = json.loads(messages[1]["content"])
+            self.assertEqual(prompt["question"], question)
+            (sample,) = prompt["samples"]
+            self.assertEqual(sample["collector"], "sockets.listening")
+            self.assertEqual(sample["sample"]["sockets"][0]["local_port"], 5432)
+            return json.dumps({
+                "interpretation": "unresolved",
+                "summary": "The listener does not identify the service.",
+                "citations": [sample["observation_id"]],
+            })
+
+        successor = ScriptedMockAdapter([assess], name="provider-b")
+        review_once(second, successor, route, ReviewLimits())
+        self.assertEqual(successor.turns_used, 1)
+        self.assertEqual(second.get_host_discovery_samples(HOST), [])
+        review = self.admin.call({"admin_op": "get_latest_host_review", "host_id": HOST})["review"]
+        self.assertEqual(review["review_id"], lease["review_id"])
+        self.assertEqual(review["interpretation"], "unresolved")
+        self.assertGreater(review["assessment_version"], lease["assessment"]["version"])
+        self.assertEqual(len(review["citations"]), 1)
+        self.assertEqual(second.query_observations(HOST, watch_id=watch["id"]), [])
 
     def test_lease_run_propose_finding_complete_and_audit_chain(self) -> None:
         self._fire_sockets_trigger()
@@ -299,6 +416,116 @@ class LiveIntegrationTests(unittest.TestCase):
         self.assertTrue(chain["valid"], f"audit chain broken: {chain}")
         self.assertGreaterEqual(chain["entries_checked"], 8)
 
+    def _check_resumed_followup(self, active_state: str, expected: str) -> None:
+        from defsec_reasoner.provenance import envelope_contents
+
+        self._fire_sockets_trigger()
+        origin = self._client()
+        incident = self.admin.list_incidents()[0]["incident_id"]
+        run_id = origin.start_investigation_run(incident, "test", "original", "v1")["run_id"]
+        question = "Does the service still appear active at the time of the new sample?"
+        proposal = origin.propose_ephemeral_watch(run_id, "question-1", self._ephemeral_spec(incident), question)
+        self.assertTrue(proposal["decision"]["allowed"])
+        origin.finish_investigation_run(run_id, {
+            "status": "budget_exhausted", "budget_stop_reason": "max_turns",
+            "summary": "Awaiting unit state", "turns": 1, "tool_calls": 1, "input_tokens": 100,
+            "output_tokens": 50, "findings": 0, "proposals": 1, "proposals_accepted": 1,
+        })
+        token = self.admin.mint_capability_token(
+            "followup-service", "investigator", [HOST], COLLECTORS, may_spawn_runs=True,
+        )["token"]
+        claimant = self._client(token)
+        query = {"op": "list_watch_followups", "incident_id": incident}
+        self.assertEqual(claimant.call(query)["followups"][0]["status"], "awaiting_evidence")
+        self.agent.close()
+        self.daemon.keep_data = True
+        self.daemon.stop()
+        for socket in (self.daemon.agent_sock, self.daemon.investigate_sock, self.daemon.admin_sock):
+            socket.unlink(missing_ok=True)
+        self.daemon.start()
+        self.daemon.keep_data = False
+        self.agent = SyntheticAgent(self.daemon.agent_sock, HOST)
+        self.agent.connect()
+        sample = systemd_snapshot("ghost.service", active_state=active_state)
+        for _ in range(2):
+            self.assertTrue(self.agent.push_snapshot("eph-ghost", 1, sample, collector="systemd.unit_state"))
+        job = claimant.call(query)["followups"][0]
+        self.assertEqual(job["status"], "ready")
+
+        restricted = self._client(self.admin.mint_capability_token(
+            "restricted", "investigator", [HOST], ["systemd.unit_state"], may_spawn_runs=True,
+        )["token"])
+        self.assertEqual(restricted.call(query)["followups"], [])
+        self.assertIsNone(restricted.call({
+            "op": "claim_watch_followup", "backend_id": "test", "model_id": "test", "lease_seconds": 30,
+        })["task"])
+
+        self.assertIsNone(claimant.call({
+            "op": "claim_watch_followup", "backend_id": "test", "model_id": "test", "lease_seconds": 30,
+            "allowed_sources": [{"host_id": HOST, "collectors": ["systemd.unit_state"]}],
+        })["task"])
+        self.assertEqual(claimant.call(query)["followups"][0]["status"], "ready")
+
+        def interpret(messages, tools):
+            self.assertEqual([t["name"] for t in tools], ["assess_observation"])
+            text = messages[-1]["content"]
+            self.assertNotIn(token, text)
+            rationale, payload = envelope_contents(text)
+            self.assertEqual(rationale, question)
+            state = payload["data"]["active_state"]
+            evidence = re.search(r'observation_id="(\d+)"', text)
+            return {"tool_calls": [{"name": "assess_observation", "arguments": {
+                "summary": f"The service was {state} when observed.",
+                "interpretation": "supports" if state == "active" else "contradicts",
+                "observation_id": int(evidence[1]),
+            }}]}
+
+        worker = ReasonerWorker(claimant, ScriptedMockAdapter([interpret]), followups_only=True)
+        result = worker.run_once()
+        self.assertEqual(result.findings, 1)
+        self.assertNotEqual(result.run_id, run_id)
+        self.assertIsNone(worker.run_once())
+        finding = claimant.get_incident_context(incident)["findings"][0]["finding"]
+        self.assertEqual(restricted.get_incident_context(incident)["findings"], [])
+        self.assertEqual(finding["interpretation"], expected)
+        self.assertEqual(finding["evidence_observation_ids"], [job["observation_id"]])
+        self.assertEqual(claimant.call(query)["followups"][0]["status"], "answered")
+        self.assertTrue(self.admin.verify_audit_chain()["valid"])
+
+    def test_unanswered_followup_expires_and_refuses_late_evidence(self):
+        self._fire_sockets_trigger()
+        origin = self._client()
+        incident = self.admin.list_incidents()[0]["incident_id"]
+        run_id = origin.start_investigation_run(incident, "test", "origin", "v1")["run_id"]
+        proposal = origin.propose_ephemeral_watch(run_id, "missing-sample", self._ephemeral_spec(incident),
+                                                   "Was the service active?")
+        token = self.admin.mint_capability_token(
+            "review", "investigator", [HOST], COLLECTORS, may_spawn_runs=True,
+        )["token"]
+        client = self._client(token)
+        query = {"op": "list_watch_followups", "incident_id": incident}
+        self.assertTrue(proposal["decision"]["allowed"])
+        pending, = client.call(query)["followups"]
+        self.assertEqual(pending["status"], "awaiting_evidence")
+        # Advance only the fixture's deadline so the test needs no wall-clock delay.
+        with sqlite3.connect(self.daemon.data_dir / "ledger.sqlite3") as db:
+            db.execute("UPDATE watch_followups SET deadline='2000-01-01T00:00:00Z' WHERE proposal_id=?",
+                       (pending["proposal_id"],))
+        self.assertTrue(self.agent.push_snapshot("eph-ghost", 1, systemd_snapshot("ghost.service"),
+                                                 collector="systemd.unit_state"))
+        question, = client.call(query)["followups"]
+        self.assertEqual(question["status"], "expired")
+        self.assertIsNone(question["observation_id"])
+        self.assertIsNone(question["finding_id"])
+        self.assertIsNone(client.call({"op": "claim_watch_followup", "backend_id": "test", "model_id": "test",
+                                       "lease_seconds": 30})["task"])
+
+    def test_followup_supports_after_restart(self):
+        self._check_resumed_followup("active", "supports")
+
+    def test_followup_contradicts_after_restart(self):
+        self._check_resumed_followup("inactive", "contradicts")
+
     def test_expired_lease_is_fenced_and_requeued_by_control(self) -> None:
         self._fire_sockets_trigger()
         client = self._client()
@@ -308,7 +535,8 @@ class LiveIntegrationTests(unittest.TestCase):
         time.sleep(1.4)  # lease expires
         with self.assertRaises(RpcError) as ctx:
             client.complete_trigger_lease(lease["event_id"], lease["lease_token"], run_id=run["run_id"])
-        self.assertEqual(ctx.exception.code, "forbidden")
+        self.assertIn(ctx.exception.code, ("forbidden", "lease_fenced"))
+        self.assertIn("lease expired", ctx.exception.message)
         # A new lease attempt reclaims the expired lease (bounded requeue).
         next_client = self._client(self.admin.mint_capability_token(
             "fence-2", "investigator", [HOST], COLLECTORS)["token"])

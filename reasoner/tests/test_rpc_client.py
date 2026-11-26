@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import socket
 import sys
-import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -26,19 +25,16 @@ from defsec_reasoner.rpc_client import (  # noqa: E402
 )
 from defsec_reasoner.wire import MAX_FRAME_BYTES, read_frame, send_frame  # noqa: E402
 
-from support import FakeControlServer  # noqa: E402
+from support import FakeControlServer, temporary_socket_path  # noqa: E402
 
 TOKEN = "capability-token-do-not-log-0123456789abcdef"
 
 
 class TestControlRpcClient(unittest.TestCase):
     def setUp(self) -> None:
-        import os
-
-        self.sock_path = str(Path(tempfile.mkdtemp(prefix="rpc-t-")) / "i.sock")
+        self.sock_path = temporary_socket_path(self, "rpc-t-")
         self.server = FakeControlServer(self.sock_path).start()
         self.client = ControlRpcClient(self.sock_path, TOKEN)
-        os.makedirs(os.path.dirname(self.sock_path), exist_ok=True)
 
     def tearDown(self) -> None:
         self.server.stop()
@@ -56,6 +52,17 @@ class TestControlRpcClient(unittest.TestCase):
     def test_omitted_optional_fields_are_absent(self) -> None:
         self.client.query_observations("edge-01")
         self.assertEqual(self.server.last_envelope["request"], {"op": "query_observations", "host_id": "edge-01"})
+
+    def test_delegated_run_fencing_fields_are_optional(self) -> None:
+        self.server.register_token(TOKEN, principal_id="test-parent", may_spawn_runs=True)
+        self.client.start_delegated_run("inc-1", "test", "model", "v1")
+        base = self.server.last_envelope["request"]
+        self.assertNotIn("trigger_event_id", base)
+        self.assertNotIn("lease_token", base)
+        self.client.start_delegated_run("inc-1", "test", "model", "v1",
+                                        trigger_event_id=0, lease_token="test-lease")
+        self.assertEqual(self.server.last_envelope["request"],
+                         {**base, "trigger_event_id": 0, "lease_token": "test-lease"})
 
     def test_all_typed_ops_serialize_with_exact_tags(self) -> None:
         c = self.client
@@ -100,7 +107,7 @@ class TestControlRpcClient(unittest.TestCase):
         self.assertIn("capability scope", ctx.exception.message)
 
     def test_unknown_result_tag_is_transport_error(self) -> None:
-        sock_path = str(Path(tempfile.mkdtemp(prefix="rpc-t2-")) / "i.sock")
+        sock_path = temporary_socket_path(self, "rpc-t2-")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(sock_path)
         listener.listen(1)

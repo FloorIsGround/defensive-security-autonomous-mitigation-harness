@@ -22,8 +22,21 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("host-profiles-{}", Uuid::new_v4()));
-        fs::create_dir(&path).unwrap();
+        let id = &Uuid::new_v4().simple().to_string()[..8];
+        let tmp = std::env::temp_dir();
+        let candidate = if tmp.as_os_str().len() <= 75 {
+            tmp.join(format!("dh{id}"))
+        } else {
+            std::path::Path::new("/tmp").join(format!("dh{id}"))
+        };
+        let path = match fs::create_dir(&candidate) {
+            Ok(()) => candidate,
+            Err(_) => {
+                let fallback = tmp.join(format!("dh{id}"));
+                fs::create_dir(&fallback).unwrap();
+                fallback
+            }
+        };
         Self(path)
     }
 }
@@ -45,10 +58,19 @@ fn enroll(service: &ControlService, host_id: &str) {
 }
 
 fn register(service: &ControlService, host_id: &str, host_profile: Option<HostProfileSummary>) {
+    register_version(service, host_id, "test", host_profile);
+}
+
+fn register_version(
+    service: &ControlService,
+    host_id: &str,
+    version: &str,
+    host_profile: Option<HostProfileSummary>,
+) {
     let replies = service.handle_agent_message(AgentToControl::Register {
         protocol_version: WIRE_PROTOCOL_VERSION,
         host_id: host_id.into(),
-        agent_version: "test".into(),
+        agent_version: version.into(),
         boot_id: "boot".into(),
         session_id: "session".into(),
         active_bundle_version: 0,
@@ -107,10 +129,10 @@ fn migration_from_v5_preserves_rows_and_adds_nullable_profile_columns() {
     }
     for _ in 0..2 {
         let db = ledger::open(&path).unwrap();
-        let version: u32 = db
+        let version: i32 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, control_d::ledger::SCHEMA_VERSION);
         let host: (String, Option<String>, Option<String>) = db
             .query_row(
                 "SELECT agent_version, profile_json, profile_reported_at FROM hosts WHERE host_id='legacy'",
@@ -291,6 +313,7 @@ fn tag_filter_is_exact_and_preserves_investigation_host_scope() {
             principal_id: "reader".into(),
             role: PrincipalRole::Observer,
             allowed_hosts: vec!["edge".into(), "untagged".into()],
+            allowed_purposes: None,
             allowed_collectors: vec![],
             incident_id: None,
             ttl_seconds: 60,
@@ -401,4 +424,162 @@ fn reordered_profiles_and_repeated_rejections_do_not_flood_the_audit_chain() {
             .count(),
         2
     );
+}
+
+#[test]
+fn discovery_is_durable_scoped_and_uses_one_shot_evidence() {
+    use defsec_protocol::{
+        canonical::canonical_sha256_hex,
+        observation::{ObservationPayload, ObservationRecord, ObservationStatus},
+        watch::{HOST_DISCOVERY_AGENT_SUFFIX, WatchClass},
+    };
+
+    let dir = TempDir::new();
+    let service = ControlService::open(&dir.0, "test", 1).unwrap();
+    enroll(&service, "edge");
+    enroll(&service, "edge");
+    enroll(&service, "outside");
+    let AdminResponse::TokenMinted { token, .. } =
+        service.handle_admin_request(AdminRequest::MintCapabilityToken {
+            may_spawn_runs: false,
+            principal_id: "discovery".into(),
+            role: PrincipalRole::Investigator,
+            allowed_hosts: vec!["edge".into()],
+            allowed_purposes: None,
+            allowed_collectors: vec![CollectorType::SocketsListening],
+            incident_id: None,
+            ttl_seconds: 300,
+        })
+    else {
+        panic!("token mint failed");
+    };
+    let call = |service: &ControlService, request| {
+        service.handle_investigation_call(InvestigationCall {
+            request_id: "discovery-test".into(),
+            capability_token: token.clone(),
+            request,
+        })
+    };
+    let advance = || InvestigationRequest::AdvanceHostDiscovery {
+        host_id: Some("edge".into()),
+    };
+    let assessment = |service: &ControlService, version| {
+        let InvestigationResponse::HostAssessment {
+            assessment: Some(value),
+        } = call(
+            service,
+            InvestigationRequest::GetHostAssessment {
+                host_id: "edge".into(),
+                version,
+            },
+        )
+        else {
+            panic!("expected an assessment");
+        };
+        value
+    };
+    assert_eq!(assessment(&service, None).version, 1);
+    assert!(matches!(
+        call(
+            &service,
+            InvestigationRequest::AdvanceHostDiscovery {
+                host_id: Some("outside".into())
+            }
+        ),
+        InvestigationResponse::Error { .. }
+    ));
+    register(&service, "edge", None);
+    assert!(matches!(
+        call(&service, advance()),
+        InvestigationResponse::HostDiscoveryAdvanced {
+            bundle_version: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        assessment(&service, None).collectors[0].gap,
+        Some(HostDiscoveryGap::AgentUnsupported)
+    );
+
+    register_version(
+        &service,
+        "edge",
+        &format!("test{HOST_DISCOVERY_AGENT_SUFFIX}"),
+        None,
+    );
+    assert!(matches!(
+        call(
+            &service,
+            InvestigationRequest::AdvanceHostDiscovery { host_id: None }
+        ),
+        InvestigationResponse::HostDiscoveryAdvanced {
+            bundle_version: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        call(&service, advance()),
+        InvestigationResponse::HostDiscoveryAdvanced {
+            bundle_version: Some(_),
+            ..
+        }
+    ));
+    let InvestigationResponse::Watches { watches } = call(
+        &service,
+        InvestigationRequest::ListActiveWatches {
+            host_id: "edge".into(),
+        },
+    ) else {
+        panic!("expected active watches");
+    };
+    assert_eq!(watches.len(), 1);
+    let watch = &watches[0];
+    assert_eq!(watch.class, WatchClass::Ephemeral);
+    assert_eq!(watch.incident_id, None);
+    assert_eq!(watch.lifecycle.max_runs, Some(1));
+    drop(service);
+
+    let service = ControlService::open(&dir.0, "test", 1).unwrap();
+    assert!(matches!(
+        call(&service, advance()),
+        InvestigationResponse::HostDiscoveryAdvanced {
+            bundle_version: None,
+            ..
+        }
+    ));
+    let data = json!({"count": 0, "partial_attribution": false, "sockets": []});
+    let hash = canonical_sha256_hex(&data).unwrap();
+    let observation = ObservationRecord {
+        host_id: "edge".into(),
+        session_id: "session".into(),
+        seq_no: 1,
+        watch_id: watch.id.clone(),
+        spec_version: watch.version,
+        collector_type: CollectorType::SocketsListening,
+        observed_at: Utc::now(),
+        status: ObservationStatus::Partial,
+        state_hash: hash.clone(),
+        payload: ObservationPayload::Snapshot { data },
+        is_reconciliation: true,
+        sustained_count: None,
+        sustained_active: None,
+        partial_reasons: vec!["limited visibility".into()],
+    };
+    service.handle_agent_message(AgentToControl::PushObservationDelta { observation });
+    call(&service, advance());
+    let latest = assessment(&service, None);
+    assert_eq!(latest.collectors.len(), 1);
+    assert_eq!(
+        latest.collectors[0].gap,
+        Some(HostDiscoveryGap::IncompleteSample)
+    );
+    let evidence = latest.collectors[0].evidence.as_ref().unwrap();
+    assert_eq!(evidence.state_hash, hash);
+    assert_eq!(evidence.status, ObservationStatus::Partial);
+    assert_eq!(
+        assessment(&service, Some(1)).collectors[0].gap,
+        Some(HostDiscoveryGap::AwaitingAgent)
+    );
+    call(&service, advance());
+    assert_eq!(assessment(&service, None), latest);
 }

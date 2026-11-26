@@ -3,10 +3,11 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 use chrono::{SecondsFormat, Utc};
 use control_d::{ControlService, ledger};
 use defsec_protocol::rpc::{
-    AdminRequest, AdminResponse, InvestigationCall, InvestigationRequest as Request,
-    InvestigationResponse as Response, PrincipalRole, RunEventKind, RunOutcome, RunSummary,
-    RunTerminalStatus, TriggerSummary,
+    AdminRequest, AdminResponse, CapabilityPurpose, InvestigationCall,
+    InvestigationRequest as Request, InvestigationResponse as Response, PrincipalRole,
+    RunEventKind, RunOutcome, RunSummary, RunTerminalStatus, TriggerSummary,
 };
+use defsec_protocol::watch::CollectorType;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
@@ -14,9 +15,21 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let path = std::env::temp_dir().join(format!("rp-{}", &id[..12]));
-        fs::create_dir(&path).unwrap();
+        let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp = std::env::temp_dir();
+        let candidate = if tmp.as_os_str().len() <= 75 {
+            tmp.join(format!("dr{id}"))
+        } else {
+            std::path::Path::new("/tmp").join(format!("dr{id}"))
+        };
+        let path = match fs::create_dir(&candidate) {
+            Ok(()) => candidate,
+            Err(_) => {
+                let fallback = tmp.join(format!("dr{id}"));
+                fs::create_dir(&fallback).unwrap();
+                fallback
+            }
+        };
         Self(path)
     }
 }
@@ -66,7 +79,7 @@ impl Fixture {
     fn trigger(&self, status: &str, incident: &str, reason: &str) -> i64 {
         self.db.execute(
             "INSERT OR IGNORE INTO watch_specs (host_id,watch_id,spec_version,spec_json,creator,active,created_at)
-             SELECT host_id,'watch',1,'{}','fixture',1,?2 FROM incidents WHERE incident_id=?1",
+             SELECT host_id,'watch',1,'{\"collector\":{\"type\":\"sockets.listening\"}}','fixture',1,?2 FROM incidents WHERE incident_id=?1",
             params![incident, now()],
         ).unwrap();
         self.db
@@ -94,7 +107,8 @@ impl Fixture {
                 principal_id: "fixture".into(),
                 role,
                 allowed_hosts: hosts.iter().map(|s| (*s).into()).collect(),
-                allowed_collectors: vec![],
+                allowed_purposes: None,
+                allowed_collectors: vec![CollectorType::SocketsListening],
                 incident_id: incident.map(str::to_owned),
                 ttl_seconds: 300,
             });
@@ -489,10 +503,19 @@ fn migrates_existing_v3_ledger_with_run_in_place() {
         db: ledger::open(&path).unwrap(),
         _dir: dir,
     };
-    let version: u32 =
+    let version: i32 =
         f.db.pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 18);
+    assert_eq!(
+        f.db.query_row(
+            "SELECT trigger_event_id,trigger_lease_token FROM agent_runs WHERE run_id='old-run'",
+            [],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap(),
+        (None, None),
+    );
     let observer = f.mint(PrincipalRole::Observer, &["edge"], None);
     let runs = f.runs(&observer);
     assert_eq!(runs.len(), 1);
@@ -515,6 +538,7 @@ fn mint_parent(
             principal_id: principal.into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: hosts.iter().map(|s| (*s).into()).collect(),
+            allowed_purposes: None,
             allowed_collectors: vec![defsec_protocol::watch::CollectorType::SocketsListening],
             incident_id: None,
             may_spawn_runs: true,
@@ -533,6 +557,8 @@ fn delegate(incident_id: &str, ttl_seconds: Option<u64>) -> Request {
         model_id: "test-model".into(),
         prompt_schema_version: "1".into(),
         ttl_seconds,
+        trigger_event_id: None,
+        lease_token: None,
     }
 }
 
@@ -744,6 +770,7 @@ async fn delegated_token_cannot_manage_trigger_leases_over_the_socket() {
             lease_token: lease.lease_token,
             error: "fixture".into(),
             retryable: true,
+            preserve_retry_count: false,
         },
     ] {
         write_frame(
@@ -825,6 +852,7 @@ fn only_spawn_capable_investigators_can_delegate_open_incidents() {
                 principal_id: "observer".into(),
                 role: PrincipalRole::Observer,
                 allowed_hosts: vec!["edge".into()],
+                allowed_purposes: None,
                 allowed_collectors: vec![],
                 incident_id: None,
                 ttl_seconds: 3600,
@@ -943,4 +971,389 @@ async fn real_control_daemon_keeps_delegated_token_out_of_its_logs() {
         assert!(!log.contains(token));
         assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
     }
+}
+
+fn mint_for_purpose(
+    f: &Fixture,
+    purpose: CapabilityPurpose,
+    collectors: Vec<CollectorType>,
+    may_spawn_runs: bool,
+) -> String {
+    let response = f
+        .service
+        .handle_admin_request(AdminRequest::MintCapabilityToken {
+            principal_id: "scoped-worker".into(),
+            role: PrincipalRole::Investigator,
+            allowed_hosts: vec!["edge".into()],
+            allowed_collectors: collectors,
+            allowed_purposes: Some(vec![purpose]),
+            incident_id: None,
+            ttl_seconds: 300,
+            may_spawn_runs,
+        });
+    let AdminResponse::TokenMinted { token, .. } = response else {
+        panic!("{response:?}");
+    };
+    token
+}
+
+fn lease_next() -> Request {
+    Request::LeaseNextTrigger {
+        lease_owner: "worker".into(),
+        lease_seconds: 120,
+    }
+}
+
+#[test]
+fn explicit_purpose_separates_reactive_discovery_and_review_operations() {
+    let f = Fixture::new();
+    let discovery = mint_for_purpose(
+        &f,
+        CapabilityPurpose::HostDiscovery,
+        vec![CollectorType::SocketsListening],
+        true,
+    );
+    let discovery_no_spawn = mint_for_purpose(
+        &f,
+        CapabilityPurpose::HostDiscovery,
+        vec![CollectorType::SocketsListening],
+        false,
+    );
+    let reactive = mint_for_purpose(
+        &f,
+        CapabilityPurpose::ReactiveIncident,
+        vec![CollectorType::SocketsListening],
+        true,
+    );
+    let denied = |token, request| {
+        let response = f.call(token, request);
+        assert!(
+            matches!(&response, Response::Error { code, message }
+            if code == "forbidden" && message.contains("purpose scope")),
+            "{response:?}"
+        );
+    };
+    denied(
+        &discovery_no_spawn,
+        Request::StartInvestigationRun {
+            incident_id: "inc-1".into(),
+            backend_id: "backend".into(),
+            model_id: "model".into(),
+            prompt_schema_version: "1".into(),
+        },
+    );
+    denied(&discovery, delegate("inc-1", None));
+    denied(&discovery, lease_next());
+    denied(
+        &reactive,
+        Request::AdvanceHostDiscovery {
+            host_id: Some("edge".into()),
+        },
+    );
+    denied(
+        &reactive,
+        Request::ClaimHostInterpretation {
+            host_id: "edge".into(),
+            source_ids: vec![1],
+            export_collectors: vec![CollectorType::SocketsListening],
+            lease_seconds: 60,
+        },
+    );
+    denied(
+        &reactive,
+        Request::FinishHostInterpretation {
+            host_id: "edge".into(),
+            lease_id: "lease".into(),
+            proposal: None,
+            usage: None,
+            error: None,
+        },
+    );
+    denied(
+        &reactive,
+        Request::ClaimHostReview {
+            allowed_sources: None,
+            route: "fixture".into(),
+            lease_seconds: 60,
+        },
+    );
+    denied(
+        &reactive,
+        Request::CompleteHostReview {
+            review_id: "review".into(),
+            lease_token: "lease".into(),
+            citations: vec![],
+            interpretation: defsec_protocol::rpc::EvidenceInterpretation::Unresolved,
+            summary: "fixture".into(),
+        },
+    );
+
+    let (_, child, _) = delegated(f.call(&reactive, delegate("inc-1", None)));
+    assert_eq!(
+        capability(&f, &child).allowed_purposes,
+        Some(vec![CapabilityPurpose::ReactiveIncident])
+    );
+}
+
+#[test]
+fn trigger_leases_skip_other_collectors_and_truncate_oversized_legacy_outcomes() {
+    let f = Fixture::new();
+    let excluded = f.trigger("pending", "inc-1", "foreign collector");
+    f.db.execute_batch(r#"
+        INSERT INTO watch_specs(host_id,watch_id,spec_version,spec_json,creator,active,created_at)
+        VALUES ('edge','files',1,'{"collector":{"type":"files.metadata"}}','fixture',1,'');
+        INSERT INTO agent_sessions (host_id,session_id,boot_id) VALUES ('edge','session','boot');
+        INSERT INTO observations (observation_id,host_id,session_id,seq_no,watch_id,spec_version,
+          collector_type,observed_at,received_at,status_json,state_hash,payload_json,record_json)
+        VALUES (1,'edge','session',1,'watch',1,'sockets.listening','now','now','"ok"','hash','{}','{}'),
+               (2,'edge','session',2,'files',1,'files.metadata','now','now','"ok"','hash','{}','{}');
+    "#).unwrap();
+    f.db.execute(
+        "UPDATE trigger_events SET watch_id='files' WHERE event_id=?1",
+        [excluded],
+    )
+    .unwrap();
+    let oversized = f.trigger(
+        "pending",
+        "inc-1",
+        &"é".repeat(defsec_protocol::wire::MAX_FRAME_BYTES),
+    );
+    let next = f.trigger("pending", "inc-2", "next eligible");
+    f.db.execute(
+        "INSERT INTO trigger_evidence VALUES (?1,1),(?1,2)",
+        [oversized],
+    )
+    .unwrap();
+    let scoped = mint_for_purpose(
+        &f,
+        CapabilityPurpose::ReactiveIncident,
+        vec![CollectorType::SocketsListening],
+        true,
+    );
+
+    let Response::TriggerLeased { lease: Some(lease) } = f.call(&scoped, lease_next()) else {
+        panic!("legacy outcome blocked the lease");
+    };
+    assert_eq!(
+        (
+            lease.event_id,
+            lease.incident_id.as_str(),
+            lease.host_id.as_str(),
+            lease.watch_id.as_str()
+        ),
+        (oversized, "inc-1", "edge", "watch")
+    );
+    assert_eq!(lease.outcome["truncated"], true);
+    assert!(lease.outcome["reason"].is_string());
+    assert_eq!(lease.evidence_observation_ids, [1]);
+    assert!(
+        !f.queue(&scoped, None)
+            .iter()
+            .any(|row| row.event_id == excluded)
+    );
+    assert!(
+        matches!(f.call(&scoped, lease_next()), Response::TriggerLeased { lease: Some(lease) } if lease.event_id == next)
+    );
+
+    let files = mint_for_purpose(
+        &f,
+        CapabilityPurpose::ReactiveIncident,
+        vec![CollectorType::FilesMetadata],
+        true,
+    );
+    assert!(
+        matches!(f.call(&files, lease_next()), Response::TriggerLeased { lease: Some(lease) }
+        if lease.event_id == excluded && lease.outcome["reason"] == "foreign collector")
+    );
+}
+
+#[test]
+fn delegated_runs_are_fenced_by_the_current_trigger_lease() {
+    let f = Fixture::new();
+    let event = f.trigger("pending", "inc-1", "first");
+    let (parent, _) = mint_parent(&f, "worker", 3600, &["edge"]);
+    let claim = || {
+        let Response::TriggerLeased { lease: Some(lease) } = f.call(&parent, lease_next()) else {
+            panic!("missing lease");
+        };
+        lease
+    };
+    let start = |incident: &str, id, token| Request::StartDelegatedRun {
+        incident_id: incident.into(),
+        backend_id: "backend".into(),
+        model_id: "model".into(),
+        prompt_schema_version: "1".into(),
+        ttl_seconds: Some(3600),
+        trigger_event_id: id,
+        lease_token: token,
+    };
+
+    let lease = claim();
+    error(
+        f.call(&parent, start("inc-1", Some(event), None)),
+        "invalid_request",
+    );
+    error(
+        f.call(
+            &parent,
+            start("inc-1", None, Some(lease.lease_token.clone())),
+        ),
+        "invalid_request",
+    );
+    error(
+        f.call(
+            &parent,
+            start("inc-2", Some(event), Some(lease.lease_token.clone())),
+        ),
+        "lease_fenced",
+    );
+    error(
+        f.call(&parent, start("inc-1", Some(event), Some("wrong".into()))),
+        "lease_fenced",
+    );
+    let (run, worker, expires) = delegated(f.call(
+        &parent,
+        start("inc-1", Some(event), Some(lease.lease_token.clone())),
+    ));
+    assert_eq!(expires, lease.lease_expires_at);
+    assert_eq!(capability(&f, &worker).expires_at, expires);
+    assert_eq!(
+        f.db.query_row(
+            "SELECT trigger_event_id,trigger_lease_token FROM agent_runs WHERE run_id=?1",
+            [&run],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        )
+        .unwrap(),
+        (event, lease.lease_token.clone())
+    );
+    assert!(matches!(
+        f.call(&worker, report(&run, json!({"message":"before reclaim"}))),
+        Response::RunProgressRecorded { .. }
+    ));
+
+    // Force lease expiry while the original child token still has time remaining.
+    f.db.execute(
+        "UPDATE trigger_events SET lease_expires_at='2000-01-01T00:00:00Z' WHERE event_id=?1",
+        [event],
+    )
+    .unwrap();
+    error(
+        f.call(&worker, report(&run, json!({"message":"after expiry"}))),
+        "lease_fenced",
+    );
+    error(
+        f.call(
+            &parent,
+            start("inc-1", Some(event), Some(lease.lease_token.clone())),
+        ),
+        "lease_fenced",
+    );
+    let successor = claim();
+    assert_eq!(successor.event_id, event);
+    assert_ne!(successor.lease_token, lease.lease_token);
+    error(
+        f.call(&worker, finish(&run, RunTerminalStatus::Completed, "stale")),
+        "lease_fenced",
+    );
+    let (new_run, new_worker, _) = delegated(f.call(
+        &parent,
+        start("inc-1", Some(event), Some(successor.lease_token.clone())),
+    ));
+    assert!(matches!(
+        f.call(
+            &new_worker,
+            finish(&new_run, RunTerminalStatus::Completed, "fresh")
+        ),
+        Response::RunFinished { .. }
+    ));
+    assert!(matches!(f.call(&parent, Request::CompleteTriggerLease {
+        event_id: event, lease_token: successor.lease_token, run_id: Some(new_run), summary: None,
+    }), Response::LeaseUpdated { status, .. } if status == "done"));
+}
+
+#[test]
+fn capacity_deferral_preserves_retry_count_and_followup_cannot_cancel_reactive_run() {
+    let f = Fixture::new();
+    let event = f.trigger("pending", "inc-1", "capacity");
+    let mint = |purposes: Vec<CapabilityPurpose>| {
+        let AdminResponse::TokenMinted { token, .. } =
+            f.service
+                .handle_admin_request(AdminRequest::MintCapabilityToken {
+                    principal_id: "codex-parent".into(),
+                    role: PrincipalRole::Investigator,
+                    allowed_hosts: vec!["edge".into()],
+                    allowed_collectors: vec![CollectorType::SocketsListening],
+                    incident_id: None,
+                    ttl_seconds: 3600,
+                    may_spawn_runs: true,
+                    allowed_purposes: Some(purposes),
+                })
+        else {
+            panic!("mint failed");
+        };
+        token
+    };
+    let parent = mint(vec![CapabilityPurpose::ReactiveIncident]);
+    let followup_only = mint(vec![CapabilityPurpose::WatchFollowup]);
+
+    // Six consecutive capacity deferrals must preserve retry_count=0 and keep trigger pending.
+    for _ in 0..6 {
+        let Response::TriggerLeased {
+            lease: Some(lease),
+        } = f.call(&parent, lease_next())
+        else {
+            panic!("expected trigger lease");
+        };
+        assert_eq!(lease.retry_count, 0);
+        assert!(matches!(
+            f.call(
+                &parent,
+                Request::FailTriggerLease {
+                    event_id: event,
+                    lease_token: lease.lease_token,
+                    error: "delegated_run_quota".into(),
+                    retryable: true,
+                    preserve_retry_count: true,
+                },
+            ),
+            Response::LeaseUpdated { status, .. } if status == "pending"
+        ));
+    }
+
+    // Start a reactive delegated run and confirm a follow-up-only token cannot cancel it.
+    let (run_id, _, _) = delegated(f.call(
+        &parent,
+        Request::StartDelegatedRun {
+            incident_id: "inc-1".into(),
+            backend_id: "backend".into(),
+            model_id: "model".into(),
+            prompt_schema_version: "1".into(),
+            ttl_seconds: Some(3600),
+            trigger_event_id: None,
+            lease_token: None,
+        },
+    ));
+    error(
+        f.call(
+            &followup_only,
+            Request::CancelInvestigationRun {
+                run_id: run_id.clone(),
+                reason: "cross-purpose cancel".into(),
+            },
+        ),
+        "forbidden",
+    );
+    assert!(matches!(
+        f.call(
+            &parent,
+            Request::CancelInvestigationRun {
+                run_id,
+                reason: "reactive parent cancel".into(),
+            },
+        ),
+        Response::RunFinished {
+            status: RunTerminalStatus::Cancelled,
+            ..
+        }
+    ));
 }

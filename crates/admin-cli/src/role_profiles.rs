@@ -117,6 +117,7 @@ mod tests {
             run_id: None,
             incident_id: None,
             allowed_hosts: vec![],
+            allowed_purposes: None,
             allowed_collectors: vec![],
             expires_at: now + Duration::minutes(1),
         };

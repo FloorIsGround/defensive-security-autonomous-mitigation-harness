@@ -1076,6 +1076,16 @@ async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
     let mut engine = engine_with_cfg(&kp, &dir, fake_sockets_host(3), false, loaded.cfg.clone());
     let now = Utc::now();
 
+    let baseline = sync_bundle_msg(&kp, HOST, 1, vec![sockets_watch("w-existing")]);
+    assert!(matches!(
+        engine.handle_control(baseline, now).await.as_slice(),
+        [AgentToControl::BundleAck {
+            status: BundleAckStatus::Accepted,
+            ..
+        }]
+    ));
+    let previous_digest = engine.active_bundle_digest().unwrap().to_owned();
+
     // A bundle containing a watch whose collector is disabled by the profile
     // is rejected through the existing BundleAck rejection path.
     let msgs = engine
@@ -1093,7 +1103,12 @@ async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
         }
         other => panic!("expected BundleAck, got {other:?}"),
     }
-    assert!(engine.watch_ids().is_empty());
+    assert_eq!(engine.watch_ids(), ["w-existing"]);
+    assert_eq!(engine.active_bundle_version(), 1);
+    assert_eq!(
+        engine.active_bundle_digest(),
+        Some(previous_digest.as_str())
+    );
 
     let msgs = engine
         .handle_control(
@@ -1108,6 +1123,12 @@ async fn profile_disabled_collector_bundle_is_rejected_with_explicit_reason() {
         }
         other => panic!("expected BundleAck, got {other:?}"),
     }
+
+    assert_eq!(engine.watch_ids(), ["w-existing"]);
+    assert_eq!(
+        engine.active_bundle_digest(),
+        Some(previous_digest.as_str())
+    );
 
     // A bundle containing only still-enabled collectors is accepted.
     let msgs = engine
@@ -1169,7 +1190,12 @@ async fn tighter_profile_rejects_cached_bundle_and_identical_retransmission() {
     let kp = key_pair();
     let dir = state_dir("profile-cache-reject");
     let now = Utc::now();
-    let msg = sync_bundle_msg(&kp, HOST, 2, vec![outbound_watch("w-out")]);
+    let msg = sync_bundle_msg(
+        &kp,
+        HOST,
+        2,
+        vec![sockets_watch("w-safe"), outbound_watch("w-out")],
+    );
     let mut original = engine_with(&kp, &dir, fake_sockets_host(0), false);
     assert!(matches!(
         original.handle_control(msg.clone(), now).await.as_slice(),
@@ -1185,14 +1211,11 @@ async fn tighter_profile_rejects_cached_bundle_and_identical_retransmission() {
     );
     let mut restarted = engine_with_cfg(&kp, &dir, fake_sockets_host(0), false, loaded.cfg);
     assert_eq!(restarted.active_bundle_version(), 0);
-    assert!(restarted.watch_ids().is_empty());
+    assert_eq!(restarted.watch_ids(), ["w-safe"]);
     assert!(restarted.stale_desired_state());
-    assert!(
-        restarted
-            .run_due_watches(now + Duration::seconds(90))
-            .await
-            .is_empty()
-    );
+    let observations = restarted.run_due_watches(now + Duration::seconds(90)).await;
+    assert!(matches!(observations.as_slice(),
+        [AgentToControl::PushObservationDelta { observation }] if observation.watch_id == "w-safe"));
 
     let registration = ControlToAgent::RegisterAck {
         protocol_version: defsec_protocol::wire::WIRE_PROTOCOL_VERSION,

@@ -141,12 +141,14 @@ impl UnixServer {
         self.serve(move |mut stream| {
             let service = service.clone();
             async move {
+                let actor = format!("unix-uid:{}", stream.peer_cred()?.uid());
                 while let Some(req) =
                     timeout(IO_TIMEOUT, read_frame::<_, AdminRequest>(&mut stream)).await??
                 {
                     let response = spawn_blocking({
                         let service = service.clone();
-                        move || service.handle_admin_request(req)
+                        let actor = actor.clone();
+                        move || service.handle_admin_request_as(req, &actor)
                     })
                     .await?;
                     timeout(IO_TIMEOUT, write_frame(&mut stream, &response)).await??;

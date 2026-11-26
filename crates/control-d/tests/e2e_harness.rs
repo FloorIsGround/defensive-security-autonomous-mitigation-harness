@@ -140,6 +140,7 @@ impl E2eHarness {
                     principal_id: principal.into(),
                     role,
                     allowed_hosts: hosts,
+                    allowed_purposes: None,
                     allowed_collectors: collectors,
                     incident_id,
                     ttl_seconds,
@@ -1094,11 +1095,31 @@ async fn adversarial_corpus_rejected_at_both_control_and_edge_boundaries() {
 /// Ubuntu/Debian host (real `/proc/net` sockets + real `/proc/self/statm` RSS).
 #[tokio::test]
 async fn live_linux_uds_smoke_test_and_rss_telemetry() {
-    let short = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    let dir = std::env::temp_dir().join(format!("live-{short}"));
-    let control = ControlService::open(&dir, "live-key-01", 1).unwrap();
-    let agent_sock = dir.join("ag.sock");
-    let admin_sock = dir.join("ad.sock");
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    struct SocketTestDir(PathBuf);
+    impl Drop for SocketTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let tmp = std::env::temp_dir();
+    let candidate = if tmp.as_os_str().len() <= 75 {
+        tmp.join(format!("dl{id}"))
+    } else {
+        std::path::Path::new("/tmp").join(format!("dl{id}"))
+    };
+    let path = match std::fs::create_dir(&candidate) {
+        Ok(()) => candidate,
+        Err(_) => {
+            let fallback = tmp.join(format!("dl{id}"));
+            std::fs::create_dir(&fallback).unwrap();
+            fallback
+        }
+    };
+    let dir = SocketTestDir(path);
+    let control = ControlService::open(&dir.0, "live-key-01", 1).unwrap();
+    let agent_sock = dir.0.join("ag.sock");
+    let admin_sock = dir.0.join("ad.sock");
 
     let policy = SocketPolicy::default();
     let agent_task = tokio::spawn(
@@ -1168,7 +1189,7 @@ async fn live_linux_uds_smoke_test_and_rss_telemetry() {
         DurabilityProfile::Minimal {
             max_ram_bytes: 256 * 1024,
         },
-        dir.join("ag-state"),
+        dir.0.join("ag-state"),
         store,
         Arc::new(RealLinuxCollectors::new()),
     )
@@ -1222,5 +1243,4 @@ async fn live_linux_uds_smoke_test_and_rss_telemetry() {
     drop(admin);
     agent_task.abort();
     admin_task.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }

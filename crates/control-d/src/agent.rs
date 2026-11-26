@@ -16,7 +16,8 @@ use defsec_protocol::{
     rpc::{PolicyDecision, Severity},
     rules::{RuleSuppression, RuleSuppressionEntry},
     watch::{
-        CollectorSpec, CompareTarget, DataClassification, TriggerPredicate, WatchClass, WatchSpec,
+        CollectorSpec, CollectorType, CompareTarget, DataClassification,
+        HOST_DISCOVERY_AGENT_SUFFIX, TriggerPredicate, WatchClass, WatchSpec,
     },
     wire::{
         AgentToControl, AgentToControlMessage, BundleAckStatus, ControlToAgent,
@@ -88,10 +89,10 @@ impl ControlService {
                         "unsupported protocol or invalid boot/session ID",
                     ));
                 }
-                let (prior_session, desired): (Option<String>, u64) = db.query_row(
-                    "SELECT session_id,desired_bundle_version FROM hosts WHERE host_id=?1",
+                let (prior_session, desired, prior_version): (Option<String>, u64, String) = db.query_row(
+                    "SELECT session_id,desired_bundle_version,agent_version FROM hosts WHERE host_id=?1",
                     [&host_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?;
                 let new_session = prior_session.as_deref() != Some(&session_id);
                 let inserted = db.execute("INSERT INTO agent_sessions (host_id,session_id,boot_id) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING", params![host_id,session_id,boot_id])?;
@@ -110,9 +111,20 @@ impl ControlService {
                     "UPDATE hosts SET agent_version=?2,boot_id=?3,session_id=?4,last_heartbeat_at=?5,liveness_status='online',
                      active_bundle_version=CASE WHEN ?6 THEN ?7 WHEN ?8 THEN 0 ELSE active_bundle_version END WHERE host_id=?1",
                     params![host_id,agent_version,boot_id,session_id,stamp(now),active_matches,active_bundle_version,new_session])?;
-                record_host_profile(db, &host_id, host_profile.map(decode_profile).transpose(), now)?;
+                record_host_profile(
+                    db,
+                    &host_id,
+                    host_profile.map(decode_profile).transpose(),
+                    now,
+                )?;
                 let mut reply = vec![register_ack(now, None, acked)];
-                let renew = bundle_expiring(db, &host_id, desired, now)?;
+                let retired = if agent_version.ends_with(HOST_DISCOVERY_AGENT_SUFFIX) {
+                    false
+                } else {
+                    crate::discovery::retire_unsupported(db, &host_id, now)?
+                        || prior_version.ends_with(HOST_DISCOVERY_AGENT_SUFFIX)
+                };
+                let renew = retired || bundle_expiring(db, &host_id, desired, now)?;
                 let expected = if renew {
                     self.issue_bundle(db, &host_id, "control", &uuid(), now)?;
                     bundle(db, &host_id)?
@@ -289,6 +301,10 @@ fn record_host_profile(
         params![host_id, profile_json, stamp(now), rejection],
     )?;
     if before != after {
+        db.execute(
+            "UPDATE host_review_schedules SET next_due_at=MIN(next_due_at,?2) WHERE host_id=?1",
+            params![host_id, stamp(now)],
+        )?;
         audit(
             db,
             HostProfileChanged,
@@ -511,6 +527,27 @@ fn ingest(
         params![o.host_id,o.session_id,o.seq_no,o.watch_id,o.spec_version,o.collector_type.as_str(),stamp(o.observed_at),stamp(now),
             serde_json::to_string(&o.status)?,o.state_hash,serde_json::to_string(&o.payload)?,sample.map(Value::to_string),serde_json::to_string(&o)?])?;
     let id = db.last_insert_rowid();
+    if !older_than_checkpoint && !is_historical_session && !gap && state.enabled && !state.retired
+        && spec.lifecycle.enabled && o.status == ObservationStatus::Ok
+        && spec.lifecycle.expires_at.is_none_or(|until| now < until)
+        && let (CollectorSpec::SystemdUnitState(unit), Some(data)) = (&spec.collector, sample)
+    {
+        crate::verification::observe(db, &o, id, &unit.unit, data, now)?;
+    }
+    if spec.class == WatchClass::Ephemeral
+        && !older_than_checkpoint
+        && !is_historical_session
+        && !gap
+        && sample.is_some()
+        && spec.lifecycle.enabled
+        && state.enabled
+        && !state.retired
+    {
+        db.execute("UPDATE watch_followups SET observation_id=?1
+            WHERE host_id=?2 AND watch_id=?3 AND spec_version=?4 AND observation_id IS NULL
+              AND cursor<?1 AND admitted_at<=?5 AND ?5<deadline AND deadline>?6 AND policy_version=?7",
+            params![id,o.host_id,o.watch_id,o.spec_version,stamp(o.observed_at),stamp(now),floor.expected_policy_version])?;
+    }
     if !older_than_checkpoint {
         let errors = if o.status.is_valid_sample() {
             0
@@ -529,6 +566,27 @@ fn ingest(
             errors,
             0,
         );
+        // A corroborated service baseline adds a fixed comparison while preserving
+        // transition detection. Only managed FieldChanged watches use this path.
+        let outcome = match (&spec.trigger, &outcome, &state.baseline) {
+            (TriggerPredicate::FieldChanged { compare_against: CompareTarget::LastObserved, fields },
+                PredicateOutcome::NotTriggered, Some(baseline))
+                if db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM monitoring_watches WHERE host_id=?1 AND watch_id=?2 AND spec_version=?3)",
+                    params![o.host_id,o.watch_id,o.spec_version], |r| r.get::<_,bool>(0),
+                )? =>
+            {
+                evaluate_predicate(
+                    &TriggerPredicate::FieldChanged {
+                        compare_against: CompareTarget::AcceptedBaseline,
+                        fields: fields.clone(),
+                    },
+                    o.status, sample, state.last_sample.as_ref(), Some(baseline),
+                    o.sustained_count, errors, 0,
+                )
+            }
+            _ => outcome,
+        };
         let (outcome, rule_suppression) = if let TriggerPredicate::SetDiff {
             compare_against, ..
         } = &spec.trigger
@@ -540,7 +598,37 @@ fn ingest(
                 CompareTarget::LastObserved => state.last_sample.as_ref(),
                 CompareTarget::AcceptedBaseline => state.baseline.as_ref(),
             };
-            let rules = active_rules(db, &o.host_id, o.collector_type, &o.watch_id, now)?;
+            let mut rules = active_rules(db, &o.host_id, o.collector_type, &o.watch_id, now)?;
+            if rules.is_empty()
+                && spec.class == WatchClass::Ephemeral
+                && o.collector_type == CollectorType::SocketsListening
+                && *compare_against == CompareTarget::LastObserved
+                && !is_historical_session
+                && !gap
+                && state.enabled
+                && !state.retired
+                && spec.lifecycle.enabled
+                && spec.lifecycle.expires_at.is_none_or(|expiry| now < expiry)
+                && o.observed_at <= now
+                && o.observed_at >= now - Duration::minutes(15)
+                && o.status == ObservationStatus::Ok
+                && !o.is_reconciliation
+                && o.partial_reasons.is_empty()
+                && state.last_session.as_deref() == Some(o.session_id.as_str())
+                && let (Some(before), Some(after)) = (reference, sample)
+                && db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM watch_state s JOIN observations p
+                       ON p.observation_id=s.last_success_id AND p.observation_id=s.last_observation_id
+                     WHERE s.host_id=?1 AND s.watch_id=?2 AND s.spec_version=?3
+                       AND p.status_json='\"ok\"' AND p.observed_at>=?4 AND p.observed_at<?5
+                       AND json_extract(p.record_json,'$.is_reconciliation') IS NOT 1
+                       AND coalesce(json_array_length(p.record_json,'$.partial_reasons'),0)=0)",
+                    params![o.host_id, o.watch_id, o.spec_version, stamp(now - Duration::minutes(15)), stamp(o.observed_at)],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                rules = crate::expectation_rules::maintenance_rules(db, &spec, before, after, now)?;
+            }
             let evaluation = apply_expectation_rules(
                 &spec.trigger,
                 o.collector_type,
@@ -596,6 +684,7 @@ fn ingest(
             && !state.retired
             && spec.lifecycle.expires_at.is_none_or(|expiry| expiry > now)
             && let PredicateOutcome::Triggered { .. } = outcome
+            && !crate::discovery::is_discovery_watch(db, &spec)?
         {
             let comparison_id = match spec.trigger {
                 TriggerPredicate::SetDiff {

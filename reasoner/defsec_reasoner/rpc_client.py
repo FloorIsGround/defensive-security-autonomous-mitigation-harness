@@ -43,14 +43,28 @@ logger = logging.getLogger("defsec.reasoner.rpc")
 #: ``crates/protocol/src/rpc.rs``). Anything else is a protocol violation.
 _KNOWN_RESULTS = frozenset(
     {
+        "host_discovery_advanced",
+        "host_discovery_samples",
+        "host_interpretation_saved",
+        "host_interpretation_claimed",
+        "host_interpretation_finished",
+        "host_interpretation_attempts",
+        "host_assessment",
+        "host_review_claimed",
+        "host_review_completed",
+        "package_snapshots_correlated",
+        "host_review_refreshed",
         "hosts",
         "incidents",
         "watches",
+        "monitoring",
         "capabilities",
         "incident_context",
         "observations",
         "baseline_summary",
         "run_started",
+        "delegated_run_started",
+        "capability",
         "run_progress_recorded",
         "run_finished",
         "runs",
@@ -61,8 +75,12 @@ _KNOWN_RESULTS = frozenset(
         "proposal_evaluated",
         "finding_recorded",
         "trigger_leased",
+        "watch_followups",
+        "watch_followup_claimed",
+        "watch_assessment_recorded",
         "lease_updated",
         "action_proposal_evaluated",
+        "action_verification",
         "actions",
     }
 )
@@ -247,7 +265,87 @@ class ControlRpcClient:
         # Non-error variants: tag stripped, payload fields returned verbatim.
         return reply
 
+    def monitoring(self, host_id: str, watch_id: str, change: dict[str, Any]) -> dict[str, Any]:
+        """Submit a scoped durable monitoring operation to control-d."""
+        return self.call(
+            {"op": "monitoring", "host_id": host_id, "watch_id": watch_id, "change": change}
+        )["detail"]
+
     # ------------------------------------------------------- discovery tools
+
+    def claim_host_review(self, route: str, lease_seconds: int, allowed_sources: list[dict] | None = None) -> dict[str, Any] | None:
+        return self.call({
+            "op": "claim_host_review",
+            "allowed_sources": allowed_sources,
+            "route": route,
+            "lease_seconds": lease_seconds,
+        })["lease"]
+
+    def get_host_review_samples(self, review_id: str, lease_token: str) -> list[dict[str, Any]]:
+        return self.call({
+            "op": "get_host_review_samples",
+            "review_id": review_id,
+            "lease_token": lease_token,
+        })["samples"]
+
+    def refresh_host_review(self, review_id: str, lease_token: str) -> bool:
+        return self.call({
+            "op": "refresh_host_review",
+            "review_id": review_id,
+            "lease_token": lease_token,
+        })["deferred"]
+
+    def complete_host_review(
+        self, review_id: str, lease_token: str, interpretation: str, summary: str, citations: list[int] | None = None
+    ) -> dict[str, Any]:
+        return self.call({
+            "op": "complete_host_review",
+            "citations": citations or [],
+            "review_id": review_id,
+            "lease_token": lease_token,
+            "interpretation": interpretation,
+            "summary": summary,
+        })
+
+    def advance_host_discovery(self, host_id: str | None = None) -> dict[str, Any]:
+        return self.call({"op": "advance_host_discovery", "host_id": host_id})
+
+    def get_host_discovery_samples(self, host_id: str) -> list[dict[str, Any]]:
+        return self.call({"op": "get_host_discovery_samples", "host_id": host_id})["samples"]
+
+    def claim_host_interpretation(
+        self, host_id: str, source_ids: list[int], export_collectors: list[str], lease_seconds: int,
+    ) -> str | None:
+        return self.call({
+            "op": "claim_host_interpretation", "host_id": host_id,
+            "source_ids": source_ids, "export_collectors": export_collectors,
+            "lease_seconds": lease_seconds,
+        })["lease_id"]
+
+    def finish_host_interpretation(
+        self, host_id: str, lease_id: str, *, proposal: dict[str, Any] | None = None,
+        usage: dict[str, int] | None = None, error: str | None = None,
+    ) -> int | None:
+        return self.call({
+            "op": "finish_host_interpretation", "host_id": host_id, "lease_id": lease_id,
+            "proposal": proposal, "usage": usage, "error": error,
+        })["version"]
+
+    def list_host_interpretation_attempts(self, host_id: str, source_ids: list[int]) -> list[dict[str, Any]]:
+        return self.call({
+            "op": "list_host_interpretation_attempts", "host_id": host_id, "source_ids": source_ids,
+        })["attempts"]
+
+    def submit_host_interpretation(
+        self, host_id: str, source_ids: list[int], proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.call({
+            "op": "submit_host_interpretation", "host_id": host_id,
+            "source_ids": source_ids, "proposal": proposal,
+        })
+
+    def get_host_assessment(self, host_id: str, version: int | None = None) -> dict[str, Any]:
+        return self.call({"op": "get_host_assessment", "host_id": host_id, "version": version})
 
     def list_hosts(self, limit: int | None = None, *, tag: str | None = None) -> list[dict[str, Any]]:
         request: dict[str, Any] = {"op": "list_hosts"}
@@ -313,6 +411,55 @@ class ControlRpcClient:
                 "prompt_schema_version": prompt_schema_version,
             }
         )
+
+    def get_capability(self) -> dict[str, Any]:
+        """Fetch the caller's ``ScopedCapability`` (``get_capability``).
+
+        Returns ``{"capability": {...}, "delegated": bool}`` where
+        ``capability`` mirrors ``crates/protocol/src/rpc.rs`` verbatim
+        (``principal_id``, ``role``, ``run_id``, ``incident_id``,
+        ``may_spawn_runs``, ``allowed_hosts``, ``allowed_collectors``,
+        ``expires_at``).
+        """
+        return self.call({"op": "get_capability"})
+
+    def start_delegated_run(
+        self,
+        incident_id: str,
+        backend_id: str,
+        model_id: str,
+        prompt_schema_version: str,
+        ttl_seconds: int | None = None,
+        *,
+        trigger_event_id: int | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Start a delegated run bound to a fresh child token.
+
+        Requires a parent ``investigator`` token carrying ``may_spawn_runs``.
+        The response (``delegated_run_started``) carries ``run_id``,
+        ``incident_id``, ``expires_at`` and the one-time ``run_token``; this is
+        the only RPC that ever returns a token value, and it must never be
+        logged. The parent token itself is not narrowed.
+        """
+        request: dict[str, Any] = {
+            "op": "start_delegated_run",
+            "incident_id": incident_id,
+            "backend_id": backend_id,
+            "model_id": model_id,
+            "prompt_schema_version": prompt_schema_version,
+        }
+        if ttl_seconds is not None:
+            request["ttl_seconds"] = int(ttl_seconds)
+        if trigger_event_id is not None:
+            request["trigger_event_id"] = trigger_event_id
+        if lease_token is not None:
+            request["lease_token"] = lease_token
+        return self.call(request)
+
+    def cancel_investigation_run(self, run_id: str, reason: str) -> dict[str, Any]:
+        """Cancel a run; allowed for the run's own token or its parent."""
+        return self.call({"op": "cancel_investigation_run", "run_id": run_id, "reason": reason})
 
     def report_run_progress(self, run_id: str, kind: str, detail: Any) -> dict[str, Any]:
         return self.call(
@@ -452,6 +599,13 @@ class ControlRpcClient:
             }
         )
 
+    def correlate_package_snapshots(self, host_ids: list[str], package_name: str, max_age_seconds: int) -> dict[str, Any]:
+        return self.call({"op": "correlate_package_snapshots", "host_ids": host_ids,
+                          "package_name": package_name, "max_age_seconds": max_age_seconds})
+
+    def get_action_verification(self, intent_id: str) -> dict[str, Any]:
+        return self.call({"op": "get_action_verification", "intent_id": intent_id})["detail"]
+
     def list_actions(
         self, host_id: str | None = None, incident_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -494,14 +648,21 @@ class ControlRpcClient:
         return self.call(request)
 
     def fail_trigger_lease(
-        self, event_id: int, lease_token: str, error: str, retryable: bool
+        self,
+        event_id: int,
+        lease_token: str,
+        error: str,
+        retryable: bool,
+        *,
+        preserve_retry_count: bool = False,
     ) -> dict[str, Any]:
-        return self.call(
-            {
-                "op": "fail_trigger_lease",
-                "event_id": int(event_id),
-                "lease_token": lease_token,
-                "error": error[:2048],
-                "retryable": bool(retryable),
-            }
-        )
+        payload: dict[str, Any] = {
+            "op": "fail_trigger_lease",
+            "event_id": int(event_id),
+            "lease_token": lease_token,
+            "error": error[:2048],
+            "retryable": bool(retryable),
+        }
+        if preserve_retry_count:
+            payload["preserve_retry_count"] = True
+        return self.call(payload)

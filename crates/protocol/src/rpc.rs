@@ -29,6 +29,17 @@ pub enum PrincipalRole {
     Admin,
 }
 
+/// Workflows a scoped capability may authorize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityPurpose {
+    ReactiveIncident,
+    HostDiscovery,
+    HostReview,
+    Monitoring,
+    WatchFollowup,
+}
+
 /// Server-validated scoped capability bound to a principal/session/run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +54,9 @@ pub struct ScopedCapability {
     pub may_spawn_runs: bool,
     pub allowed_hosts: Vec<String>,
     pub allowed_collectors: Vec<CollectorType>,
+    /// Omitted for legacy grants. An explicit empty list grants no workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_purposes: Option<Vec<CapabilityPurpose>>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -73,6 +87,96 @@ pub enum Severity {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceInterpretation {
+    Supports,
+    Contradicts,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostEvidenceScope {
+    pub host_id: String,
+    pub collectors: Vec<CollectorType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchFollowupTask {
+    pub run_id: String,
+    pub run_token: String,
+    pub incident_id: String,
+    pub question: String,
+    pub observation: ObservationSlice,
+}
+
+/// Host-scoped durable monitoring operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MonitoringOperation {
+    Inspect {},
+    Test {
+        spec: WatchSpec,
+    },
+    Apply {
+        spec: WatchSpec,
+        expected_revision: u32,
+        purpose: String,
+        expected_signal: String,
+        evidence: Vec<i64>,
+        review_at: chrono::DateTime<Utc>,
+    },
+    Provisional {
+        observations: [i64; 2],
+        rationale: String,
+    },
+    Promote {
+        candidate_id: i64,
+        expected_baseline: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReviewSchedule {
+    pub host_id: String,
+    pub interval_seconds: u32,
+    pub question: String,
+    pub collectors: Vec<CollectorType>,
+    pub route: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReviewLease {
+    pub review_id: String,
+    pub lease_token: String,
+    pub host_id: String,
+    pub question: String,
+    pub due_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub needs_fresh_evidence: bool,
+    #[serde(default)]
+    pub refreshing: bool,
+    pub assessment: HostAssessment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReviewResult {
+    #[serde(default)]
+    pub citations: Vec<i64>,
+    pub review_id: String,
+    pub question: String,
+    pub assessment_version: u32,
+    pub completed_at: DateTime<Utc>,
+    pub interpretation: EvidenceInterpretation,
+    pub summary: String,
+}
+
 /// Authenticated envelope for every Investigation RPC call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,7 +189,91 @@ pub struct InvestigationCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationRequest {
+    ClaimHostReview {
+        #[serde(default)]
+        allowed_sources: Option<Vec<HostEvidenceScope>>,
+        route: String,
+        lease_seconds: u32,
+    },
+    GetHostReviewSamples {
+        review_id: String,
+        lease_token: String,
+    },
+    RefreshHostReview {
+        review_id: String,
+        lease_token: String,
+    },
+    CompleteHostReview {
+        #[serde(default)]
+        citations: Vec<i64>,
+        review_id: String,
+        lease_token: String,
+        interpretation: EvidenceInterpretation,
+        summary: String,
+    },
+    ClaimWatchFollowup {
+        #[serde(default)]
+        allowed_sources: Option<Vec<HostEvidenceScope>>,
+        backend_id: String,
+        model_id: String,
+        lease_seconds: u64,
+    },
+    SubmitWatchAssessment {
+        run_id: String,
+        observation_id: i64,
+        interpretation: EvidenceInterpretation,
+        summary: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    ListWatchFollowups {
+        incident_id: String,
+    },
+    Monitoring {
+        host_id: String,
+        watch_id: String,
+        change: MonitoringOperation,
+    },
     GetCapability {},
+    AdvanceHostDiscovery {
+        #[serde(default)]
+        host_id: Option<String>,
+    },
+    CorrelatePackageSnapshots {
+        host_ids: [String; 2],
+        package_name: String,
+        max_age_seconds: u32,
+    },
+    GetHostDiscoverySamples {
+        host_id: String,
+    },
+    ClaimHostInterpretation {
+        host_id: String,
+        source_ids: Vec<i64>,
+        export_collectors: Vec<CollectorType>,
+        lease_seconds: u32,
+    },
+    FinishHostInterpretation {
+        host_id: String,
+        lease_id: String,
+        proposal: Option<serde_json::Value>,
+        usage: Option<HostInterpretationUsage>,
+        error: Option<HostInterpretationError>,
+    },
+    ListHostInterpretationAttempts {
+        host_id: String,
+        source_ids: Vec<i64>,
+    },
+    SubmitHostInterpretation {
+        host_id: String,
+        source_ids: Vec<i64>,
+        proposal: ProposedHostInterpretation,
+    },
+    GetHostAssessment {
+        host_id: String,
+        #[serde(default)]
+        version: Option<u32>,
+    },
     ListHosts {
         #[serde(default)]
         limit: Option<u32>,
@@ -132,6 +320,10 @@ pub enum InvestigationRequest {
         prompt_schema_version: String,
         #[serde(default)]
         ttl_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_event_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_token: Option<String>,
     },
     CancelInvestigationRun {
         run_id: String,
@@ -170,6 +362,10 @@ pub enum InvestigationRequest {
         statuses: Option<Vec<String>>,
         #[serde(default)]
         limit: Option<u32>,
+    },
+    ActivateExpectationRule {
+        run_id: String,
+        rule_id: String,
     },
     ProposeExpectationRule {
         run_id: String,
@@ -219,6 +415,8 @@ pub enum InvestigationRequest {
         lease_token: String,
         error: String,
         retryable: bool,
+        #[serde(default)]
+        preserve_retry_count: bool,
     },
     ProposeAction {
         run_id: String,
@@ -229,6 +427,9 @@ pub enum InvestigationRequest {
         expected_effect: String,
         blast_radius: String,
         rollback_plan: String,
+    },
+    GetActionVerification {
+        intent_id: String,
     },
     ListActions {
         #[serde(default)]
@@ -405,9 +606,62 @@ pub struct BaselineSummaryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvestigationResponse {
+    ActionVerification { detail: serde_json::Value },
+    HostReviewClaimed {
+        lease: Option<HostReviewLease>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle_version: Option<u64>,
+    },
+    HostReviewCompleted {},
+    HostReviewRefreshed {
+        deferred: bool,
+        bundle_version: Option<u64>,
+    },
+    WatchFollowupClaimed {
+        task: Option<Box<WatchFollowupTask>>,
+    },
+    WatchAssessmentRecorded {
+        finding_id: i64,
+    },
+    WatchFollowups {
+        followups: Vec<serde_json::Value>,
+    },
+    Monitoring {
+        detail: serde_json::Value,
+    },
     Capability {
         capability: ScopedCapability,
         delegated: bool,
+    },
+    HostDiscoveryAdvanced {
+        host_id: Option<String>,
+        bundle_version: Option<u64>,
+    },
+    PackageSnapshotsCorrelated {
+        package_name: String,
+        compared_at: DateTime<Utc>,
+        max_age_seconds: u32,
+        hosts: [PackageSnapshotComparison; 2],
+        both_present: Option<bool>,
+        interpretation: String,
+    },
+    HostDiscoverySamples {
+        samples: Vec<HostDiscoverySample>,
+    },
+    HostInterpretationClaimed {
+        lease_id: Option<String>,
+    },
+    HostInterpretationFinished {
+        version: Option<u32>,
+    },
+    HostInterpretationAttempts {
+        attempts: Vec<HostInterpretationAttempt>,
+    },
+    HostInterpretationSaved {
+        version: u32,
+    },
+    HostAssessment {
+        assessment: Option<HostAssessment>,
     },
     Hosts {
         hosts: Vec<HostSummary>,
@@ -464,6 +718,10 @@ pub enum InvestigationResponse {
     },
     TriggerQueue {
         triggers: Vec<TriggerSummary>,
+    },
+    RuleActivationEvaluated {
+        decision: PolicyDecision,
+        backtest: Option<RuleBacktest>,
     },
     RuleProposalEvaluated {
         decision: PolicyDecision,
@@ -522,9 +780,48 @@ pub enum InvestigationResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "admin_op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminRequest {
+    SetMonitoringGrant {
+        host_id: String,
+        principal_id: String,
+        max_watches: u32,
+        allow_promotion: bool,
+    },
+    CorroborateMonitoring {
+        candidate_id: i64,
+        rationale: String,
+    },
+    RollbackMonitoring {
+        host_id: String,
+        watch_id: String,
+        expected_baseline: i64,
+        rationale: String,
+    },
+    GetLatestHostReview {
+        host_id: String,
+    },
+    SetHostReviewSchedule {
+        schedule: HostReviewSchedule,
+    },
+    CancelHostReviewSchedule {
+        host_id: String,
+    },
     EnrollHost {
         host_id: String,
         agent_public_key_hex: Option<String>,
+    },
+    SetRuleActivationGrant {
+        host_id: String,
+        collector: CollectorType,
+        principal_id: String,
+        enabled: bool,
+        rationale: String,
+    },
+    CorroborateRuleMaintenance {
+        rule_id: String,
+        watch_version: u32,
+        before_id: i64,
+        after_id: i64,
+        rationale: String,
     },
     CreateExpectationRule {
         rule: ExpectationRuleSpec,
@@ -574,6 +871,8 @@ pub enum AdminRequest {
         role: PrincipalRole,
         allowed_hosts: Vec<String>,
         allowed_collectors: Vec<CollectorType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_purposes: Option<Vec<CapabilityPurpose>>,
         #[serde(default)]
         incident_id: Option<String>,
         ttl_seconds: u64,
@@ -605,6 +904,15 @@ pub enum AdminRequest {
         #[serde(default)]
         incident_id: Option<String>,
     },
+    ReconcileActionOutcome {
+        intent_id: String,
+        expected_receipt_id: Option<i64>,
+        evidence_ref: String,
+        rationale: String,
+    },
+    GetActionVerification {
+        intent_id: String,
+    },
     GetActionIntent {
         intent_id: String,
     },
@@ -622,6 +930,16 @@ pub enum AdminRequest {
 #[serde(tag = "admin_result", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum AdminResponse {
+    RuleMaintenanceEvaluated {
+        decision: PolicyDecision,
+    },
+    Monitoring {
+        result: serde_json::Value,
+    },
+    LatestHostReview {
+        review: Option<HostReviewResult>,
+    },
+    HostReviewScheduleUpdated {},
     HostEnrolled {
         host_id: String,
         control_signing_key_id: String,
@@ -680,6 +998,9 @@ pub enum AdminResponse {
     Actions {
         actions: Vec<ActionSummary>,
     },
+    ActionVerification {
+        detail: serde_json::Value,
+    },
     ActionIntentDetail {
         payload: ActionIntentPayload,
         #[serde(default)]
@@ -730,4 +1051,135 @@ pub struct ExpectationRuleRecord {
     pub decision_note: Option<String>,
     pub hit_count: u64,
     pub last_matched_at: Option<DateTime<Utc>>,
+}
+
+/// Durable coverage assessment. Evidence payloads remain in the observation ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAssessment {
+    pub host_id: String,
+    pub version: u32,
+    pub deadline: DateTime<Utc>,
+    pub collectors: Vec<HostDiscoveryCoverage>,
+    #[serde(default)]
+    pub interpretations: Vec<HostInterpretation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageSnapshotComparison {
+    pub host_id: String,
+    pub citation: Option<HostDiscoveryEvidence>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub received_at: Option<DateTime<Utc>>,
+    pub present: Option<bool>,
+    pub gap: Option<PackageSnapshotGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageSnapshotGap {
+    MissingObservation,
+    StaleObservation,
+    FutureObservation,
+    IncompleteObservation,
+    UnusableSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDiscoverySample {
+    pub collector: CollectorType,
+    pub evidence: HostDiscoveryEvidence,
+    pub sample: serde_json::Value,
+    pub omitted_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostInterpretation {
+    pub source_ids: Vec<i64>,
+    pub proposal: ProposedHostInterpretation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInterpretationUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostInterpretationError {
+    ProviderRetryable,
+    ProviderRejected,
+    MalformedResponse,
+    BudgetExhausted,
+    ExportRevoked,
+    LeaseExpired,
+    EvidenceChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostInterpretationAttempt {
+    pub status: String,
+    pub lease_until: DateTime<Utc>,
+    pub retry_at: DateTime<Utc>,
+    pub usage: Option<HostInterpretationUsage>,
+    pub error: Option<HostInterpretationError>,
+    pub assessment_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedHostInterpretation {
+    pub purpose: String,
+    pub dependencies: Vec<String>,
+    pub uncertainty: String,
+    pub visibility_gaps: Vec<String>,
+    pub proposed_watch: ProposedDiscoveryWatch,
+    pub citations: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedDiscoveryWatch {
+    pub collector: CollectorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_unit: Option<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDiscoveryCoverage {
+    pub collector: CollectorType,
+    pub evidence: Option<HostDiscoveryEvidence>,
+    pub gap: Option<HostDiscoveryGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDiscoveryEvidence {
+    pub watch_id: String,
+    pub spec_version: u32,
+    pub observation_id: i64,
+    pub state_hash: String,
+    pub status: ObservationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDiscoveryGap {
+    AwaitingAgent,
+    AgentUnsupported,
+    CollectorDisabled,
+    AwaitingCapacity,
+    AwaitingSample,
+    SampleWindowElapsed,
+    DeadlineElapsed,
+    IncompleteSample,
 }

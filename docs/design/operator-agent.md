@@ -1,6 +1,8 @@
 # Persistent Operator Agent (Phase 12) — Design Contract
 
-Status: frozen contract for Phase 12 implementation lanes. It depends on the Phase 9 run-progress RPCs and the Phase 10 expectation-rule RPCs.
+Historical Phase 12 design. The current [primary investigator](../operator-agent.md#autonomous-worker) saves and resumes incident-scoped Codex sessions. It depends on the Phase 9 run-progress RPCs and the Phase 10 expectation-rule RPCs.
+
+The proposal and approval boundaries below apply to P12. Future host-scoped discovery and delegated monitoring use the [adaptive investigator design](adaptive-investigator.md). Both operator sessions and automated workers will use the same control-plane decisions.
 
 ## Goal
 

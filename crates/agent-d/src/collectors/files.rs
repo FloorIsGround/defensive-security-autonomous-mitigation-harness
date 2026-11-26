@@ -357,12 +357,9 @@ pub async fn collect_files(params: &FilesMetadataParams, cfg: &EdgeSafetyConfig)
 }
 
 /// Temporary-directory helper shared with tests in this crate.
-/// Removes any stale previous-run state first so reruns are deterministic.
 pub fn temp_root(subdir: &str) -> PathBuf {
-    let base = std::env::temp_dir().join("agent-d-tests");
-    let dir = base.join(subdir);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create test temp dir");
+    let dir = std::env::temp_dir().join(format!("agent-d-{subdir}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).expect("create test temp dir");
     dir
 }
 

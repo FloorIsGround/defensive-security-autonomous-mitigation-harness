@@ -49,6 +49,8 @@ impl McpServer {
                 backend_id: "mcp-operator".into(),
                 model_id: "interactive".into(),
                 prompt_schema_version: "1".into(),
+                trigger_event_id: None,
+                lease_token: None,
                 ttl_seconds: None,
             })
             .await?;

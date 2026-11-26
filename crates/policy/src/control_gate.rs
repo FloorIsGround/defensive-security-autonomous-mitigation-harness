@@ -291,6 +291,7 @@ mod tests {
             run_id: Some("run-1".into()),
             incident_id: Some("inc-42".into()),
             allowed_hosts: vec!["edge-07".into()],
+            allowed_purposes: None,
             allowed_collectors: vec![
                 CollectorType::SystemdUnitState,
                 CollectorType::SocketsListening,

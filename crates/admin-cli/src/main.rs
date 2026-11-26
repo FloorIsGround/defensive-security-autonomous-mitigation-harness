@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use defsec_policy::edge_floor::is_valid_identifier;
 use defsec_protocol::{
     action::ActionIntentStatus,
-    rpc::{AdminRequest, AdminResponse, PrincipalRole},
+    rpc::{AdminRequest, AdminResponse, CapabilityPurpose, PrincipalRole},
     signing::{DOMAIN_ACTION_APPROVAL_V1, SigningKeyPair},
     watch::CollectorType,
     wire::{read_frame, write_frame},
@@ -39,6 +39,15 @@ enum Command {
         host_id: String,
         #[arg(long)]
         agent_public_key_hex: Option<String>,
+    },
+    GetLatestHostReview {
+        host_id: String,
+    },
+    SetHostReviewSchedule {
+        file: PathBuf,
+    },
+    CancelHostReviewSchedule {
+        host_id: String,
     },
     ApplyWatch {
         file: PathBuf,
@@ -86,6 +95,8 @@ enum Command {
         allowed_hosts: Vec<String>,
         #[arg(long = "collector", value_parser = parse_collector)]
         allowed_collectors: Vec<CollectorType>,
+        #[arg(long = "purpose", value_parser = parse_purpose)]
+        purposes: Vec<CapabilityPurpose>,
         #[arg(long)]
         incident_id: Option<String>,
         #[arg(long, default_value_t = 3600)]
@@ -111,6 +122,19 @@ enum Command {
         host_id: Option<String>,
         #[arg(long)]
         incident_id: Option<String>,
+    },
+    /// Record an operator's independent confirmation that a prior action is absent or restored.
+    ReconcileActionOutcome {
+        intent_id: String,
+        #[arg(long)]
+        expected_receipt_id: Option<i64>,
+        #[arg(long)]
+        evidence_ref: String,
+        #[arg(long)]
+        rationale: String,
+    },
+    GetActionVerification {
+        intent_id: String,
     },
     GetAction {
         intent_id: String,
@@ -181,6 +205,10 @@ fn parse_collector(value: &str) -> Result<CollectorType, String> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|e| e.to_string())
 }
 
+fn parse_purpose(value: &str) -> Result<CapabilityPurpose, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|e| e.to_string())
+}
+
 impl Command {
     fn into_request(self) -> Result<AdminRequest, Box<dyn std::error::Error>> {
         Ok(match self {
@@ -191,6 +219,13 @@ impl Command {
                 host_id,
                 agent_public_key_hex,
             },
+            Self::GetLatestHostReview { host_id } => AdminRequest::GetLatestHostReview { host_id },
+            Self::SetHostReviewSchedule { file } => AdminRequest::SetHostReviewSchedule {
+                schedule: serde_json::from_slice(&fs::read(file)?)?,
+            },
+            Self::CancelHostReviewSchedule { host_id } => {
+                AdminRequest::CancelHostReviewSchedule { host_id }
+            }
             Self::ApplyWatch {
                 file,
                 actor,
@@ -220,6 +255,7 @@ impl Command {
                 role,
                 allowed_hosts,
                 allowed_collectors,
+                purposes,
                 incident_id,
                 ttl_seconds,
                 allow_run_spawn,
@@ -232,6 +268,7 @@ impl Command {
                 },
                 allowed_hosts,
                 allowed_collectors,
+                allowed_purposes: (!purposes.is_empty()).then_some(purposes),
                 incident_id,
                 ttl_seconds,
             },
@@ -251,6 +288,9 @@ impl Command {
                 host_id,
                 incident_id,
             },
+            Self::ReconcileActionOutcome { intent_id, expected_receipt_id, evidence_ref, rationale } =>
+                AdminRequest::ReconcileActionOutcome { intent_id, expected_receipt_id, evidence_ref, rationale },
+            Self::GetActionVerification { intent_id } => AdminRequest::GetActionVerification { intent_id },
             Self::GetAction { intent_id } => AdminRequest::GetActionIntent { intent_id },
             Self::RecordReceipt { receipt_json_file } => AdminRequest::RecordActionReceipt {
                 receipt: serde_json::from_slice(&fs::read(receipt_json_file)?)?,
@@ -504,6 +544,14 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    struct SocketTestDir(PathBuf);
+
+    impl Drop for SocketTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn rule_decisions_require_exactly_one_choice_and_list_status_flags_repeat() {
         let parse = |args: &[&str]| {
@@ -665,16 +713,29 @@ mod tests {
         };
         use tokio::net::UnixListener;
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let dir = std::env::temp_dir().join(format!("d-{}", &id[..8]));
-        fs::create_dir(&dir).unwrap();
-        let path = dir.join("operator.hex");
+        let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp = std::env::temp_dir();
+        let dir = if tmp.as_os_str().len() <= 75 {
+            tmp.join(format!("da{id}"))
+        } else {
+            Path::new("/tmp").join(format!("da{id}"))
+        };
+        let dir = match fs::create_dir(&dir) {
+            Ok(()) => dir,
+            Err(_) => {
+                let fallback = tmp.join(format!("da{id}"));
+                fs::create_dir(&fallback).unwrap();
+                fallback
+            }
+        };
+        let dir = SocketTestDir(dir);
+        let path = dir.0.join("operator.hex");
         let public = generate_operator_key("operator", &path).unwrap();
         let mut trust = VerifyingKeyStore::new();
         trust
             .insert_public_hex("operator", public["public_hex"].as_str().unwrap())
             .unwrap();
-        let admin_sock = dir.join("admin.sock");
+        let admin_sock = dir.0.join("admin.sock");
         let listener = UnixListener::bind(&admin_sock).unwrap();
         let now = Utc::now();
         let payload = ActionIntentPayload {
@@ -758,7 +819,6 @@ mod tests {
         })
         .await;
         let server_result = server.await;
-        fs::remove_dir_all(&dir).unwrap();
         assert!(!result.unwrap());
         server_result.unwrap();
     }
@@ -778,6 +838,10 @@ mod tests {
             "edge2",
             "--collector",
             "files.metadata",
+            "--purpose",
+            "reactive_incident",
+            "--purpose",
+            "watch_followup",
             "--incident-id",
             "inc",
             "--ttl-seconds",
@@ -794,6 +858,10 @@ mod tests {
                 principal_id: "user".into(),
                 role: PrincipalRole::Investigator,
                 allowed_hosts: vec!["edge".into(), "edge2".into()],
+                allowed_purposes: Some(vec![
+                    CapabilityPurpose::ReactiveIncident,
+                    CapabilityPurpose::WatchFollowup
+                ]),
                 allowed_collectors: vec![CollectorType::FilesMetadata],
                 incident_id: Some("inc".into()),
                 ttl_seconds: 60

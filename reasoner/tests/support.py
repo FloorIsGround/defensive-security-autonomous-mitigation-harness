@@ -9,9 +9,11 @@ findings) so the worker's bounded loop is testable without the Rust binary.
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import sys
 import threading
+import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +25,7 @@ if str(REASONER_ROOT) not in sys.path:
 
 from defsec_reasoner.wire import MAX_FRAME_BYTES, read_frame, send_frame  # noqa: E402
 from defsec_reasoner.canonical import canonical_json  # noqa: E402
+from defsec_reasoner.control_harness import make_socket_temp_dir  # noqa: E402
 
 CAPABILITIES = [
     {
@@ -46,6 +49,12 @@ CAPABILITIES = [
 ]
 
 MAX_RETRIES = 5
+
+
+def temporary_socket_path(test: unittest.TestCase, prefix: str) -> str:
+    directory = make_socket_temp_dir(prefix)
+    test.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+    return str(directory / "i.sock")
 
 
 class DropConnection(Exception):
@@ -72,6 +81,7 @@ class FakeControlServer:
         action_auth_modes: dict[str, str] | None = None,
         triggers: list[dict[str, Any]] | None = None,
         fixed_run_id: str | None = None,
+        delegated_run_quota: int = 4,
     ) -> None:
         self.socket_path = str(socket_path)
         self.lease_seconds = lease_seconds
@@ -135,6 +145,16 @@ class FakeControlServer:
         self.requests: list[dict[str, Any]] = []
         self.completed_events: list[int] = []
         self.last_envelope: dict[str, Any] | None = None
+        #: Registered capability tokens (Phase 12 delegation support). Tokens
+        #: that were never registered behave as plain unscoped investigators.
+        self.tokens: dict[str, dict[str, Any]] = {}
+        #: run_id -> {"run_token", "incident_id", "status", "outcome"} for
+        #: delegated runs minted by ``start_delegated_run``.
+        self.delegated_runs: dict[str, dict[str, Any]] = {}
+        self.delegated_run_quota = int(delegated_run_quota)
+        #: run_id -> appended RunEvent rows (kind, detail) from progress calls.
+        self.run_events: dict[str, list[dict[str, Any]]] = {}
+        self._token_ctx = threading.local()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -203,6 +223,7 @@ class FakeControlServer:
                 if envelope is None:
                     break
                 self.last_envelope = envelope
+                self._token_ctx.token = envelope.get("capability_token")
                 request = envelope.get("request") or {}
                 self.requests.append(request)
                 try:
@@ -215,6 +236,49 @@ class FakeControlServer:
                     break
         finally:
             conn.close()
+
+    # -------------------------------------------------------------- tokens
+
+    @staticmethod
+    def default_capability(**overrides: Any) -> dict[str, Any]:
+        capability = {
+            "principal_id": "fake-investigator",
+            "role": "investigator",
+            "run_id": None,
+            "incident_id": None,
+            "may_spawn_runs": False,
+            "allowed_hosts": ["edge-01"],
+            "allowed_collectors": [cap["collector_type"] for cap in CAPABILITIES],
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        capability.update(overrides)
+        return capability
+
+    def register_token(
+        self, token: str, *, delegated: bool = False, **capability: Any
+    ) -> dict[str, Any]:
+        """Register a caller token with an explicit ScopedCapability."""
+        record = {
+            "capability": self.default_capability(**capability),
+            "delegated": delegated,
+        }
+        self.tokens[token] = record
+        return record
+
+    def _current_token(self) -> str | None:
+        return getattr(self._token_ctx, "token", None)
+
+    def _token_record(self) -> dict[str, Any]:
+        token = self._current_token()
+        if token is None:
+            return {"capability": self.default_capability(), "delegated": False}
+        return self.tokens.get(token) or {
+            "capability": self.default_capability(),
+            "delegated": False,
+        }
+
+    def _delegated_run_for(self, run_id: str) -> dict[str, Any] | None:
+        return self.delegated_runs.get(str(run_id))
 
     # -------------------------------------------------------------- dispatch
 
@@ -276,15 +340,127 @@ class FakeControlServer:
         self.runs.append(run)
         return {"result": "run_started", **run}
 
+    def _op_get_capability(self, _req: dict[str, Any]) -> dict[str, Any]:
+        record = self._token_record()
+        return {
+            "result": "capability",
+            "capability": record["capability"],
+            "delegated": record["delegated"],
+        }
+
+    def _op_start_delegated_run(self, req: dict[str, Any]) -> dict[str, Any]:
+        record = self._token_record()
+        capability = record["capability"]
+        if (
+            capability.get("role") != "investigator"
+            or not capability.get("may_spawn_runs")
+            or capability.get("run_id") is not None
+        ):
+            return self._error("forbidden", "capability cannot spawn delegated runs")
+        incident_id = req["incident_id"]
+        if incident_id != "inc-1":
+            return self._error("forbidden", "incident is outside capability scope")
+        principal = capability.get("principal_id", "fake-investigator")
+        active = sum(1 for run in self.delegated_runs.values() if run["status"] == "active")
+        if active >= self.delegated_run_quota:
+            return self._error(
+                "delegated_run_quota", f"active delegated run quota of {self.delegated_run_quota} reached"
+            )
+        run_id = str(uuid.uuid4())
+        run_token = f"child-token-{run_id[:8]}"
+        self.register_token(
+            run_token,
+            delegated=True,
+            principal_id=principal,
+            run_id=run_id,
+            incident_id=incident_id,
+            may_spawn_runs=False,
+            allowed_hosts=["edge-01"],
+        )
+        self.delegated_runs[run_id] = {
+            "run_token": run_token,
+            "incident_id": incident_id,
+            "principal_id": principal,
+            "status": "active",
+            "outcome": None,
+        }
+        self.run_events.setdefault(run_id, [])
+        return {
+            "result": "delegated_run_started",
+            "run_id": run_id,
+            "incident_id": incident_id,
+            "expires_at": "2026-11-24T13:00:00Z",
+            "run_token": run_token,
+        }
+
+    def _op_cancel_investigation_run(self, req: dict[str, Any]) -> dict[str, Any]:
+        run = self._delegated_run_for(req["run_id"])
+        if run is None:
+            return self._error("forbidden", "run is outside capability scope")
+        record = self._token_record()
+        capability = record["capability"]
+        allowed = (
+            self._current_token() == run["run_token"]
+            or (
+                capability.get("principal_id") == run["principal_id"]
+                and capability.get("run_id") is None
+                and not record["delegated"]
+            )
+        )
+        if not allowed:
+            return self._error("forbidden", "run is outside capability scope")
+        if run["status"] != "active":
+            return self._error("conflict", "run already finished")
+        run["status"] = "cancelled"
+        return {"result": "run_finished", "run_id": req["run_id"], "status": "cancelled"}
+
     def _op_report_run_progress(self, req: dict[str, Any]) -> dict[str, Any]:
+        delegated = self._delegated_run_for(req["run_id"])
+        if delegated is not None:
+            if delegated["status"] != "active":
+                return self._error("forbidden", "investigation run is inactive")
+            if self._current_token() != delegated["run_token"]:
+                return self._error("forbidden", "run is outside capability scope")
         if self.progress_error is not None:
             return self._error(self.progress_error, "simulated progress failure")
-        return {"result": "run_progress_recorded", "run_id": req["run_id"], "event_seq": len(self.requests)}
+        events = self.run_events.setdefault(str(req["run_id"]), [])
+        if len(events) >= 256:
+            return self._error("run_event_quota", "run event quota of 256 reached")
+        events.append({"kind": req["kind"], "detail": req.get("detail")})
+        return {"result": "run_progress_recorded", "run_id": req["run_id"], "event_seq": len(events)}
+
+    def _op_get_run_events(self, req: dict[str, Any]) -> dict[str, Any]:
+        record = self._token_record()
+        if record["delegated"] and record["capability"].get("run_id") != str(req["run_id"]):
+            return self._error("forbidden", "run is outside capability scope")
+        events = [
+            {"event_seq": index + 1, **event}
+            for index, event in enumerate(self.run_events.get(str(req["run_id"]), []))
+        ]
+        after = req.get("after_seq")
+        if after is not None:
+            events = [event for event in events if event["event_seq"] > int(after)]
+        return {"result": "run_events", "run_id": req["run_id"], "events": events}
 
     def _op_finish_investigation_run(self, req: dict[str, Any]) -> dict[str, Any]:
-        run = next(run for run in self.runs if run["run_id"] == req["run_id"])
-        run["outcome"] = req["outcome"]
-        return {"result": "run_finished", "run_id": run["run_id"], "status": req["outcome"]["status"]}
+        run = self._delegated_run_for(req["run_id"])
+        if run is not None:
+            if self._current_token() != run["run_token"]:
+                return self._error("forbidden", "run is outside capability scope")
+            if run["status"] != "active":
+                if run["outcome"] != req["outcome"]:
+                    return self._error("conflict", "run already finished with a different outcome")
+            else:
+                run["status"] = req["outcome"]["status"]
+                run["outcome"] = req["outcome"]
+            return {
+                "result": "run_finished",
+                "run_id": req["run_id"],
+                "status": req["outcome"]["status"],
+            }
+        legacy = next(run for run in self.runs if run["run_id"] == req["run_id"])
+        legacy["outcome"] = req["outcome"]
+        return {"result": "run_finished", "run_id": legacy["run_id"], "status": req["outcome"]["status"]}
 
     def _op_propose_ephemeral_watch(self, req: dict[str, Any]) -> dict[str, Any]:
         spec = req["spec"]
@@ -459,7 +635,12 @@ class FakeControlServer:
             actions = [a for a in actions if a["incident_id"] == req["incident_id"]]
         return {"result": "actions", "actions": actions}
 
+    def _op_advance_host_discovery(self, req: dict[str, Any]) -> dict[str, Any]:
+        return {"result": "host_discovery_advanced", "host_id": None, "bundle_version": 1}
+
     def _op_lease_next_trigger(self, req: dict[str, Any]) -> dict[str, Any]:
+        if self._token_record()["delegated"]:
+            return self._error("forbidden", "delegated runs cannot manage trigger leases")
         now = self._now()
         # Reclaim expired leases first (mirrors control-d).
         for trigger in self.triggers:
@@ -500,6 +681,8 @@ class FakeControlServer:
         return None
 
     def _op_complete_trigger_lease(self, req: dict[str, Any]) -> dict[str, Any]:
+        if self._token_record()["delegated"]:
+            return self._error("forbidden", "delegated runs cannot manage trigger leases")
         trigger = self._leased(req)
         if trigger is None:
             return self._error("forbidden", "lease expired, already completed, or fencing token mismatch")
@@ -512,6 +695,8 @@ class FakeControlServer:
         return {"result": "lease_updated", "event_id": trigger["event_id"], "status": "done"}
 
     def _op_fail_trigger_lease(self, req: dict[str, Any]) -> dict[str, Any]:
+        if self._token_record()["delegated"]:
+            return self._error("forbidden", "delegated runs cannot manage trigger leases")
         trigger = self._leased(req)
         if trigger is None:
             return self._error("forbidden", "lease not found or fencing token mismatch")

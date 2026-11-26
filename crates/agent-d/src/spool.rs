@@ -420,10 +420,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("agent-d-tests/spool").join(tag);
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::collectors::files::temp_root(&format!("spool-{tag}"))
     }
 
     #[test]

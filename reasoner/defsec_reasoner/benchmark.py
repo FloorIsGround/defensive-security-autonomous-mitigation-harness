@@ -254,12 +254,14 @@ class BenchmarkRunner:
             self.admin = AdminClient(self.daemon.admin_sock)
             self.admin.enroll_host(HOST_ID)
             self.label = label
+            self.agents: list[SyntheticAgent] = []
 
         def apply(self, spec: dict[str, Any], rationale: str) -> None:
             self.admin.apply_baseline_watch(spec, "operator-bench", rationale)
 
         def agent(self) -> SyntheticAgent:
             agent = SyntheticAgent(self.daemon.agent_sock, HOST_ID)
+            self.agents.append(agent)
             agent.connect()
             return agent
 
@@ -286,6 +288,8 @@ class BenchmarkRunner:
             )
 
         def close(self) -> None:
+            for agent in self.agents:
+                agent.close()
             self.daemon.stop()
 
     def _lab(self, label: str) -> "_Lab":

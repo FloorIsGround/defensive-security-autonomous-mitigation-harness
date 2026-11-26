@@ -25,23 +25,32 @@ use tokio::{
 
 const HOST: &str = "edge";
 const READ_TOOLS: &[&str] = &[
+    "correlate_package_snapshots",
+    "get_host_discovery_samples",
+    "list_host_interpretation_attempts",
+    "get_host_assessment",
     "list_hosts",
     "list_active_incidents",
     "list_active_watches",
     "list_collector_capabilities",
+    "list_watch_followups",
     "get_incident_context",
     "query_observations",
     "get_host_baseline_summary",
     "list_investigation_runs",
     "get_run_events",
     "list_trigger_queue",
+    "get_action_verification",
     "list_actions",
     "list_expectation_rules",
 ];
 const WRITE_TOOLS: &[&str] = &[
+    "advance_host_discovery",
     "start_investigation_run",
+    "monitoring",
     "propose_ephemeral_watch",
     "record_hypothesis_or_finding",
+    "activate_expectation_rule",
     "propose_expectation_rule",
 ];
 
@@ -49,9 +58,21 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let path = std::env::temp_dir().join(format!("m-{}", &id[..8]));
-        fs::create_dir(&path).unwrap();
+        let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let tmp = std::env::temp_dir();
+        let candidate = if tmp.as_os_str().len() <= 75 {
+            tmp.join(format!("dp{id}"))
+        } else {
+            std::path::Path::new("/tmp").join(format!("dp{id}"))
+        };
+        let path = match fs::create_dir(&candidate) {
+            Ok(()) => candidate,
+            Err(_) => {
+                let fallback = tmp.join(format!("dp{id}"));
+                fs::create_dir(&fallback).unwrap();
+                fallback
+            }
+        };
         Self(path)
     }
 }
@@ -401,6 +422,7 @@ async fn investigator_flow_preserves_controller_decisions() {
             principal_id: "operator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
+            allowed_purposes: None,
             allowed_collectors: vec![
                 CollectorType::SystemdUnitState,
                 CollectorType::FilesMetadata,
@@ -419,6 +441,7 @@ async fn investigator_flow_preserves_controller_decisions() {
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
+        allowed_purposes: None,
         allowed_collectors: vec![CollectorType::SystemdUnitState],
         incident_id: Some(incident_id.clone()),
         ttl_seconds: 300,
@@ -434,6 +457,28 @@ async fn investigator_flow_preserves_controller_decisions() {
         .handshake("2025-03-26", &[READ_TOOLS, WRITE_TOOLS].concat())
         .await;
 
+    let assessment = client.tool("get_host_assessment", json!({"host_id":HOST}), false).await;
+    assert_eq!(assessment["assessment"]["host_id"], HOST);
+    assert_eq!(assessment["assessment"]["version"], 1);
+    let monitoring = client.tool(
+        "monitoring",
+        json!({"host_id":HOST,"watch_id":"unit","change":{"operation":"inspect"}}),
+        false,
+    ).await;
+    assert_eq!(monitoring["detail"]["allowed"], false);
+
+    let samples = client
+        .tool("get_host_discovery_samples", json!({"host_id":HOST}), true)
+        .await;
+    assert_eq!(samples["code"], "forbidden");
+    let correlation = client
+        .tool(
+            "correlate_package_snapshots",
+            json!({"host_ids":[HOST,"other"],"package_name":"openssl","max_age_seconds":120}),
+            true,
+        )
+        .await;
+    assert_eq!(correlation["code"], "forbidden");
     let hosts = client.tool("list_hosts", json!({}), false).await;
     assert_eq!(hosts["hosts"][0]["host_id"], HOST);
     let filtered_hosts = client
@@ -634,6 +679,7 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
             principal_id: "investigator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: vec![HOST.into()],
+            allowed_purposes: None,
             allowed_collectors: vec![CollectorType::SocketsListening],
             incident_id: Some(incident_id.clone()),
             ttl_seconds: 300,
@@ -649,6 +695,7 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
         principal_id: "observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec![HOST.into()],
+        allowed_purposes: None,
         allowed_collectors: vec![CollectorType::SocketsListening],
         incident_id: Some(incident_id.clone()),
         ttl_seconds: 300,
@@ -720,6 +767,12 @@ async fn investigator_proposes_expectation_rule_for_current_run() {
     assert_eq!(accepted["decision"]["policy_version"], 1);
     let rule_id = accepted["rule_id"].as_str().unwrap().to_string();
     assert!(rule_id.starts_with("rule-"));
+    let activation = client
+        .tool("activate_expectation_rule", json!({"rule_id":rule_id}), false)
+        .await;
+    assert_eq!(activation["result"], "rule_activation_evaluated");
+    assert_eq!(activation["decision"]["allowed"], false);
+    assert!(activation["backtest"].is_null());
     assert_eq!(
         accepted["backtest"],
         json!({
@@ -871,6 +924,7 @@ fn mint_operator_fixture(service: &ControlService, spawn: bool, hosts: &[&str]) 
             principal_id: "operator".into(),
             role: PrincipalRole::Investigator,
             allowed_hosts: hosts.iter().map(|host| (*host).into()).collect(),
+            allowed_purposes: None,
             allowed_collectors: vec![CollectorType::SocketsListening],
             incident_id: None,
             ttl_seconds: 300,
@@ -937,12 +991,14 @@ async fn operator_routes_delayed_calls_to_named_run_and_reports_lifecycle() {
             &[
                 READ_TOOLS,
                 &[
+                    "advance_host_discovery",
                     "start_investigation",
                     "finish_investigation",
                     "cancel_investigation",
                     "propose_action",
                     "propose_ephemeral_watch",
                     "record_hypothesis_or_finding",
+                    "activate_expectation_rule",
                     "propose_expectation_rule",
                 ],
             ]
@@ -1419,6 +1475,8 @@ async fn investigator_binds_delegated_token_at_startup_and_keeps_binding_after_f
             backend_id: "worker".into(),
             model_id: "fixture".into(),
             prompt_schema_version: "1".into(),
+            trigger_event_id: None,
+            lease_token: None,
             ttl_seconds: None,
         },
     )
@@ -1547,5 +1605,227 @@ async fn operator_binary_rejects_token_without_spawn_permission_before_serving_s
     let log = String::from_utf8(output.stderr).unwrap();
     assert!(log.contains("with may_spawn_runs"));
     assert!(!log.contains(&token));
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn package_correlation_uses_only_authorized_recorded_discovery() {
+    use defsec_protocol::watch::HOST_DISCOVERY_AGENT_SUFFIX;
+
+    let dir = TestDir::new();
+    let service = ControlService::open(&dir.0, "key", 1).unwrap();
+    let host_ids = [HOST, "other"];
+    let enrolled = [HOST, "other", "current"];
+    for host in enrolled {
+        assert!(matches!(
+            service.handle_admin_request(AdminRequest::EnrollHost {
+                host_id: host.into(),
+                agent_public_key_hex: None,
+            }),
+            AdminResponse::HostEnrolled { .. }
+        ));
+        let replies = service.handle_agent_message(AgentToControl::Register {
+            protocol_version: WIRE_PROTOCOL_VERSION,
+            host_id: host.into(),
+            agent_version: format!("fixture{HOST_DISCOVERY_AGENT_SUFFIX}"),
+            boot_id: "boot".into(),
+            session_id: "session".into(),
+            active_bundle_version: 0,
+            active_bundle_digest: None,
+            sent_at: Utc::now(),
+            host_profile: None,
+        });
+        assert!(matches!(
+            replies.first(),
+            Some(ControlToAgent::RegisterAck { accepted: true, .. })
+        ));
+    }
+    let mint = |allowed_hosts: &[&str], collector| {
+        let AdminResponse::TokenMinted { token, .. } =
+            service.handle_admin_request(AdminRequest::MintCapabilityToken {
+                principal_id: "correlation".into(),
+                role: PrincipalRole::Investigator,
+                allowed_hosts: allowed_hosts.iter().map(|host| (*host).into()).collect(),
+                allowed_purposes: None,
+                allowed_collectors: vec![collector],
+                incident_id: None,
+                ttl_seconds: 300,
+                may_spawn_runs: false,
+            })
+        else {
+            panic!("token mint failed");
+        };
+        token
+    };
+    let collector = CollectorType::PackagesInventory;
+    let token = mint(&enrolled, collector);
+    let restricted_host = mint(&host_ids[..1], collector);
+    let restricted_collector = mint(&host_ids, CollectorType::SocketsListening);
+    let call = |token: &str, request| {
+        service.handle_investigation_call(InvestigationCall {
+            request_id: "package-correlation".into(),
+            capability_token: token.into(),
+            request,
+        })
+    };
+    let compare = || Request::CorrelatePackageSnapshots {
+        host_ids: host_ids.map(str::to_owned),
+        package_name: "openssl".into(),
+        max_age_seconds: 120,
+    };
+    for restricted in [&restricted_host, &restricted_collector] {
+        assert!(
+            matches!(call(restricted, compare()), Response::Error {code, ..} if code == "forbidden")
+        );
+    }
+    let mut watches = Vec::new();
+    for host in enrolled {
+        let result = call(
+            &token,
+            Request::AdvanceHostDiscovery {
+                host_id: Some(host.into()),
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Response::HostDiscoveryAdvanced {
+                    bundle_version: Some(_),
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        let Response::Watches { watches: active } = call(
+            &token,
+            Request::ListActiveWatches {
+                host_id: host.into(),
+            },
+        ) else {
+            panic!("could not list discovery watches")
+        };
+        assert_eq!(active.len(), 1);
+        watches.extend(active);
+    }
+    let socket = dir.0.join("investigate.sock");
+    let server = UnixServer::bind(&socket, SocketPolicy::default()).unwrap();
+    let server_task = tokio::spawn(server.serve_investigation(service.clone()));
+    let mut client = Client::new(Mode::ReadOnly, socket.clone(), token.clone());
+    client.handshake("2025-03-26", READ_TOOLS).await;
+    let tool = "correlate_package_snapshots";
+    let args = json!({"host_ids":host_ids,"package_name":"openssl","max_age_seconds":120});
+    let mut denied = Client::new(Mode::ReadOnly, socket, restricted_host);
+    denied.handshake("2025-03-26", READ_TOOLS).await;
+    assert_eq!(
+        denied.tool(tool, args.clone(), true).await["code"],
+        "forbidden"
+    );
+
+    let observed_at = Utc::now();
+    let record = |watch: &WatchSpec, status, observed_at| {
+        let data = json!({
+            "packages":[{"package_key":"openssl:amd64","name":"openssl","arch":"amd64","version":watch.host_id}],
+            "total_packages":1,"status_file_sha256":"a".repeat(64)
+        });
+        let state_hash = canonical_sha256_hex(&data).unwrap();
+        let replies = service.handle_agent_message(AgentToControl::PushObservationDelta {
+            observation: ObservationRecord {
+                host_id: watch.host_id.clone(),
+                session_id: "session".into(),
+                seq_no: 1,
+                watch_id: watch.id.clone(),
+                spec_version: watch.version,
+                collector_type: collector,
+                observed_at,
+                status,
+                state_hash: state_hash.clone(),
+                payload: ObservationPayload::Snapshot { data },
+                is_reconciliation: true,
+                sustained_count: None,
+                sustained_active: None,
+                partial_reasons: if status == ObservationStatus::Partial {
+                    vec!["limited visibility".into()]
+                } else {
+                    vec![]
+                },
+            },
+        });
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [ControlToAgent::ObservationAck {
+                    acked_seq_no: 1,
+                    ..
+                }]
+            ),
+            "{replies:?}"
+        );
+        state_hash
+    };
+
+    let first_hash = record(&watches[0], ObservationStatus::Ok, observed_at);
+    let missing = client.tool(tool, args.clone(), false).await;
+    assert_eq!(missing["hosts"][0]["present"], true);
+    assert_eq!(missing["hosts"][1]["gap"], "missing_observation");
+    assert!(missing["both_present"].is_null());
+
+    let second_hash = record(&watches[1], ObservationStatus::Partial, observed_at);
+    let response = client.tool(tool, args, false).await;
+    assert_eq!(response["hosts"][1]["gap"], "incomplete_observation");
+    assert!(response["hosts"][1]["present"].is_null());
+    assert!(response["both_present"].is_null());
+    let Response::PackageSnapshotsCorrelated { hosts, .. } = call(&token, compare()) else {
+        panic!("expected package comparison");
+    };
+    for (index, hash) in [first_hash, second_hash].iter().enumerate() {
+        let citation = hosts[index].citation.as_ref().unwrap();
+        assert_eq!(hosts[index].host_id, host_ids[index]);
+        assert_eq!(hosts[index].observed_at, Some(observed_at));
+        assert_eq!(&citation.state_hash, hash);
+        assert_eq!(citation.watch_id, watches[index].id);
+        assert_eq!(citation.spec_version, watches[index].version);
+        assert_eq!(response["hosts"][index]["citation"], json!(citation));
+        assert_eq!(response["hosts"][index]["observed_at"], json!(observed_at));
+        assert!(citation.observation_id > 0);
+    }
+    assert_ne!(hosts[0].citation, hosts[1].citation);
+    let current_hash = record(
+        &watches[2],
+        ObservationStatus::Ok,
+        observed_at - chrono::Duration::seconds(10),
+    );
+    let current = client
+        .tool(
+            tool,
+            json!({
+                "host_ids":[HOST,"current"], "package_name":"openssl","max_age_seconds":120
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(current["both_present"], true);
+    assert_eq!(current["hosts"][1]["citation"]["state_hash"], current_hash);
+    let different_package = client
+        .tool(
+            tool,
+            json!({
+                "host_ids":[HOST,"current"], "package_name":"openssl-extra","max_age_seconds":120
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(different_package["both_present"], false);
+    let stale = client
+        .tool(
+            tool,
+            json!({
+                "host_ids":[HOST,"current"], "package_name":"openssl","max_age_seconds":1
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(stale["hosts"][1]["gap"], "stale_observation");
+    assert_eq!(stale["hosts"][1]["citation"]["state_hash"], current_hash);
+    assert!(stale["both_present"].is_null());
     server_task.abort();
 }

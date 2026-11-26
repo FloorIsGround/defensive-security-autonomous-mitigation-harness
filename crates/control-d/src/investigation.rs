@@ -1,4 +1,6 @@
 mod delegation;
+mod followups;
+pub(crate) mod monitoring;
 mod progress;
 
 use std::collections::BTreeMap;
@@ -23,8 +25,9 @@ use crate::{
     service::{
         ControlError, ControlService, Result,
         actions::{ActionProposal, list_actions},
-        active_watches, get_incident, insert_watch, latest_spec, list_hosts, list_incidents,
-        parse_stamp, record_decision, require_host, stamp, store_capability_token, uuid,
+        active_watches, bundle_collector_denial, get_incident, insert_watch, latest_spec,
+        list_hosts, list_incidents, parse_stamp, record_decision, require_host, stamp,
+        store_capability_token, uuid,
     },
 };
 
@@ -37,7 +40,17 @@ impl ControlService {
                     InvestigationResponse::ProposalEvaluated {
                         bundle_version: Some(_),
                         ..
+                    } | InvestigationResponse::HostDiscoveryAdvanced {
+                        bundle_version: Some(_),
+                        ..
+                    } | InvestigationResponse::HostReviewClaimed {
+                        bundle_version: Some(_),
+                        ..
+                    } | InvestigationResponse::HostReviewRefreshed {
+                        bundle_version: Some(_),
+                        ..
                     }
+                ) || matches!(&response, InvestigationResponse::Monitoring { detail: result } if result.get("bundle_version").is_some()
                 ) {
                     self.bundle_changed();
                 }
@@ -69,6 +82,10 @@ impl ControlService {
             )
             .optional()?
             .ok_or_else(|| ControlError::denied("invalid capability token"))?;
+        authorize_purpose(&capability, &call.request)?;
+        if let Some(run) = &capability.run_id {
+            authorize_run_lease(db, run, now)?;
+        }
         if capability.expires_at <= now || capability.role == PrincipalRole::Admin {
             return Err(ControlError::denied(
                 "capability expired or role is unavailable on this interface",
@@ -92,9 +109,27 @@ impl ControlService {
                 "request contains its authentication credential",
             ));
         }
+        if let Some(run) = &capability.run_id {
+            let followup: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM followup_attempts WHERE run_id=?1)",
+                [run],
+                |r| r.get(0),
+            )?;
+            let ending_attempt = matches!(&call.request, InvestigationRequest::FinishInvestigationRun {outcome,..}
+                if matches!(outcome.status,RunTerminalStatus::Failed | RunTerminalStatus::BudgetExhausted));
+            if followup && !ending_attempt && !matches!(call.request,
+                InvestigationRequest::SubmitWatchAssessment { .. }
+                | InvestigationRequest::CancelInvestigationRun { .. }
+                | InvestigationRequest::GetCapability {}) {
+                return Err(ControlError::denied(
+                    "follow-up token is restricted to its evidence assessment",
+                ));
+            }
+        }
         let requires_active_run = !matches!(
             call.request,
             InvestigationRequest::FinishInvestigationRun { .. }
+                | InvestigationRequest::SubmitWatchAssessment { .. }
                 | InvestigationRequest::CancelInvestigationRun { .. }
                 | InvestigationRequest::CompleteTriggerLease { .. }
                 | InvestigationRequest::FailTriggerLease { .. }
@@ -128,7 +163,174 @@ impl ControlService {
             request: request_id,
             policy_version: self.policy().policy_version,
         };
-        let response = match call.request {
+        let reviews = crate::host_reviews::Worker {
+            db,
+            grant: &capability,
+            grant_hash: &hash,
+            now,
+        };
+        let mut response = match call.request {
+            InvestigationRequest::ClaimHostReview {
+                route,
+                lease_seconds,
+                allowed_sources,
+            } => reviews.claim(self, &route, lease_seconds, request_id, allowed_sources.as_deref())?,
+            InvestigationRequest::GetHostReviewSamples { review_id, lease_token } => {
+                reviews.samples(&review_id, &lease_token)?
+            }
+            InvestigationRequest::RefreshHostReview { review_id, lease_token } => {
+                reviews.refresh(self, &review_id, &lease_token, request_id)?
+            }
+            InvestigationRequest::CompleteHostReview {
+                review_id,
+                lease_token,
+                interpretation,
+                summary,
+                citations,
+            } => reviews.complete(&review_id, &lease_token, interpretation, &summary, &citations)?,
+
+            InvestigationRequest::ClaimWatchFollowup {
+                allowed_sources,
+                backend_id,
+                model_id,
+                lease_seconds,
+            } => followups::claim(
+                db,
+                &capability,
+                request_id,
+                now,
+                self.policy().policy_version,
+                allowed_sources.as_deref(),
+                delegation::Start {
+                    incident_id: String::new(),
+                    backend_id,
+                    model_id,
+                    ttl_seconds: Some(lease_seconds),
+                    trigger_event_id: None,
+                    lease_token: None,
+                    prompt_schema_version: "watch-followup.v1".into(),
+                },
+            )?,
+            InvestigationRequest::SubmitWatchAssessment {
+                run_id,
+                observation_id,
+                interpretation,
+                summary,
+                input_tokens,
+                output_tokens,
+            } => followups::submit(
+                db,
+                &capability,
+                request_id,
+                now,
+                self.policy().policy_version,
+                followups::Assessment {
+                    run_id,
+                    observation_id,
+                    interpretation,
+                    summary,
+                    input_tokens,
+                    output_tokens,
+                },
+            )?,
+            InvestigationRequest::ListWatchFollowups { incident_id } => {
+                followups::list(db, &capability, &incident_id, self.policy().policy_version)?
+            }
+            InvestigationRequest::AdvanceHostDiscovery { host_id } => {
+                require_investigator(&capability)?;
+                if capability.run_id.is_some()
+                    || capability.incident_id.is_some()
+                    || !capability.allowed_collectors.iter().any(|collector| {
+                        matches!(
+                            collector,
+                            CollectorType::SocketsListening | CollectorType::PackagesInventory
+                        )
+                    })
+                {
+                    return Err(ControlError::denied(
+                        "host discovery requires a host-scoped discovery collector grant",
+                    ));
+                }
+                if let Some(host) = &host_id {
+                    authorize_host(&capability, host)?;
+                    require_host(db, host)?;
+                }
+                self.advance_discovery(db, &capability, host_id.as_deref(), request_id, now)?
+            }
+            InvestigationRequest::CorrelatePackageSnapshots {
+                host_ids,
+                package_name,
+                max_age_seconds,
+            } => {
+                for host in &host_ids {
+                    authorize_host(&capability, host)?;
+                }
+                crate::discovery::correlate_packages(
+                    db,
+                    &capability,
+                    host_ids,
+                    package_name,
+                    max_age_seconds,
+                    now,
+                )?
+            }
+            InvestigationRequest::GetHostDiscoverySamples { host_id } => {
+                authorize_host(&capability, &host_id)?;
+                require_host(db, &host_id)?;
+                InvestigationResponse::HostDiscoverySamples {
+                    samples: crate::discovery::samples(db, &capability, &host_id, None)?,
+                }
+            }
+            InvestigationRequest::ClaimHostInterpretation {
+                host_id, source_ids, export_collectors, lease_seconds,
+            } => {
+                require_investigator(&capability)?;
+                authorize_host(&capability, &host_id)?;
+                crate::discovery::AttemptScope { db, cap: &capability, host: &host_id, now }
+                    .claim(&hash, request_id, source_ids, &export_collectors, lease_seconds)?
+            }
+            InvestigationRequest::FinishHostInterpretation {
+                host_id, lease_id, proposal, usage, error,
+            } => {
+                require_investigator(&capability)?;
+                authorize_host(&capability, &host_id)?;
+                crate::discovery::AttemptScope { db, cap: &capability, host: &host_id, now }
+                    .finish(&hash, &lease_id, proposal, usage, error)?
+            }
+            InvestigationRequest::ListHostInterpretationAttempts { host_id, source_ids } => {
+                authorize_host(&capability, &host_id)?;
+                crate::discovery::AttemptScope { db, cap: &capability, host: &host_id, now }
+                    .list(source_ids)?
+            }
+            InvestigationRequest::SubmitHostInterpretation {
+                host_id,
+                source_ids,
+                proposal,
+            } => {
+                require_investigator(&capability)?;
+                authorize_host(&capability, &host_id)?;
+                crate::discovery::submit(db, &capability, &host_id, source_ids, proposal)?
+            }
+            InvestigationRequest::GetHostAssessment { host_id, version } => {
+                authorize_host(&capability, &host_id)?;
+                require_host(db, &host_id)?;
+                crate::discovery::get(db, &capability, &host_id, version)?
+            }
+            InvestigationRequest::Monitoring {
+                host_id,
+                watch_id,
+                change,
+            } => {
+                let result = monitoring::Monitoring {
+                    service: self,
+                    db,
+                    now,
+                    request: request_id,
+                }
+                .investigate(&capability, &host_id, &watch_id, change)?;
+                InvestigationResponse::Monitoring { detail: result }
+            }
+
             InvestigationRequest::GetCapability {} => InvestigationResponse::Capability {
                 capability,
                 delegated,
@@ -139,6 +341,8 @@ impl ControlService {
                 model_id,
                 prompt_schema_version,
                 ttl_seconds,
+                trigger_event_id,
+                lease_token,
             } => delegation::start(
                 db,
                 &capability,
@@ -150,10 +354,15 @@ impl ControlService {
                     model_id,
                     prompt_schema_version,
                     ttl_seconds,
+                    trigger_event_id,
+                    lease_token,
                 },
             )?,
             InvestigationRequest::CancelInvestigationRun { run_id, reason } => {
                 delegation::cancel(db, &capability, &hash, request_id, &run_id, &reason, now)?
+            }
+            InvestigationRequest::ActivateExpectationRule { run_id, rule_id } => {
+                rule_store.activate(&capability, &run_id, &rule_id)?
             }
             InvestigationRequest::ProposeExpectationRule {
                 run_id,
@@ -175,7 +384,7 @@ impl ControlService {
                 }
                 let (rules, next_before) = rule_store.list(
                     host_id.as_deref(),
-                    Some(&capability.allowed_hosts),
+                    Some(&capability),
                     statuses.as_deref(),
                     limit,
                     before.as_deref(),
@@ -237,7 +446,9 @@ impl ControlService {
             }
             InvestigationRequest::GetIncidentContext { incident_id } => {
                 let incident = authorize_incident(db, &capability, &incident_id)?;
-                let active_watches = scoped_watches(db, &capability, &incident.host_id, now)?
+                let mut incident_scope = capability.clone();
+                incident_scope.incident_id = Some(incident_id.clone());
+                let active_watches = scoped_watches(db, &incident_scope, &incident.host_id, now)?
                     .into_iter()
                     .filter(|w| w.incident_id.as_ref().is_none_or(|id| id == &incident_id))
                     .collect();
@@ -260,6 +471,10 @@ impl ControlService {
                       WHERE e.finding_id=f.finding_id
                       AND (o.collector_type NOT IN (SELECT value FROM json_each(?2))
                         OR (w.incident_id IS NOT NULL AND w.incident_id<>?1)))
+                    AND NOT EXISTS (
+                      SELECT 1 FROM watch_followup_status q WHERE q.finding_id=f.finding_id
+                      AND EXISTS (SELECT value FROM json_each(q.origin_scope,'$.allowed_collectors')
+                                  EXCEPT SELECT value FROM json_each(?2)))
                     ORDER BY f.finding_id DESC LIMIT 20",
                     params![incident_id, collector_scope_json(&capability)?],
                     |r| {
@@ -534,6 +749,12 @@ impl ControlService {
                     },
                 )?
             }
+            InvestigationRequest::GetActionVerification { intent_id } => {
+                if capability.incident_id.is_none() && !capability.may_spawn_runs {
+                    return Err(ControlError::denied("verification requires an incident or supervisory scope"));
+                }
+                crate::verification::scoped_detail(db, &intent_id, &capability)?
+            }
             InvestigationRequest::ListActions {
                 host_id,
                 incident_id,
@@ -584,18 +805,21 @@ impl ControlService {
                 )?;
 
                 let host_scope = serde_json::to_string(&capability.allowed_hosts)?;
-                let candidate: Option<(i64, String, String, String, u32, u32, Value)> = db
+                let candidate = db
                     .query_row(
-                        "SELECT t.event_id, t.incident_id, t.host_id, t.watch_id, t.spec_version, t.retry_count, t.outcome_json
+                        "SELECT t.event_id, t.incident_id, t.host_id, t.watch_id, t.spec_version, t.retry_count,
+                                CASE WHEN length(CAST(t.outcome_json AS BLOB)) <= ?4 THEN t.outcome_json END
                          FROM trigger_events t
                          JOIN incidents i ON i.incident_id = t.incident_id
+                         JOIN watch_specs w ON (w.host_id,w.watch_id,w.spec_version)=(t.host_id,t.watch_id,t.spec_version)
                          WHERE t.status = 'pending'
                            AND i.status = 'open'
                            AND t.host_id IN (SELECT value FROM json_each(?1))
                            AND (?2 IS NULL OR t.incident_id = ?2)
+                           AND json_extract(w.spec_json,'$.collector.type') IN (SELECT value FROM json_each(?3))
                          ORDER BY t.event_id ASC
                          LIMIT 1",
-                        params![host_scope, capability.incident_id],
+                        params![host_scope, capability.incident_id, collector_scope_json(&capability)?, MAX_FRAME_BYTES - 4096],
                         |r| {
                             Ok((
                                 r.get(0)?,
@@ -604,7 +828,7 @@ impl ControlService {
                                 r.get(3)?,
                                 r.get(4)?,
                                 r.get(5)?,
-                                json_column(r, 6)?,
+                                optional_json(r, 6)?,
                             ))
                         },
                     )
@@ -640,8 +864,11 @@ impl ControlService {
                     )?;
                     let evidence_observation_ids = rows(
                         db,
-                        "SELECT observation_id FROM trigger_evidence WHERE event_id = ?1 ORDER BY observation_id ASC",
-                        [event_id],
+                        "SELECT o.observation_id FROM trigger_evidence e JOIN observations o USING(observation_id)
+                         WHERE e.event_id=?1 AND o.host_id=?2
+                           AND o.collector_type IN (SELECT value FROM json_each(?3))
+                         ORDER BY o.observation_id",
+                        params![event_id,host_id,collector_scope_json(&capability)?],
                         |r| r.get(0),
                     )?;
                     Some(LeasedTrigger {
@@ -653,7 +880,7 @@ impl ControlService {
                         lease_token,
                         lease_expires_at,
                         retry_count,
-                        outcome,
+                        outcome: outcome.unwrap_or_else(truncated_trigger_outcome),
                         evidence_observation_ids,
                     })
                 } else {
@@ -669,19 +896,8 @@ impl ControlService {
             } => {
                 require_investigator(&capability)?;
                 require_text(&lease_token, "lease_token", 128)?;
-                let incident_id: Option<String> = db
-                    .query_row(
-                        "SELECT incident_id FROM trigger_events
-                         WHERE event_id = ?1 AND status = 'leased' AND lease_token = ?2 AND lease_expires_at > ?3",
-                        params![event_id, lease_token, stamp(now)],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let Some(incident_id) = incident_id else {
-                    return Err(ControlError::denied(
-                        "lease expired, already completed, or fencing token mismatch",
-                    ));
-                };
+                let ActiveTriggerLease { incident_id, .. } =
+                    active_trigger_lease(db, &capability, event_id, &lease_token, now)?;
                 authorize_incident(db, &capability, &incident_id)?;
                 if let Some(run_id) = &run_id {
                     let foreign_delegation: bool = db.query_row(
@@ -730,30 +946,28 @@ impl ControlService {
                 lease_token,
                 error,
                 retryable,
+                preserve_retry_count,
             } => {
                 require_investigator(&capability)?;
                 require_text(&lease_token, "lease_token", 128)?;
                 require_text(&error, "error", 2048)?;
                 const MAX_RETRIES: u32 = 5;
-                let row: Option<(String, u32)> = db
-                    .query_row(
-                        "SELECT incident_id, retry_count FROM trigger_events
-                         WHERE event_id = ?1 AND status = 'leased' AND lease_token = ?2",
-                        params![event_id, lease_token],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                let Some((incident_id, retry_count)) = row else {
-                    return Err(ControlError::denied(
-                        "lease not found or fencing token mismatch",
-                    ));
-                };
+                let ActiveTriggerLease {
+                    incident_id,
+                    retry_count,
+                    ..
+                } = active_trigger_lease(db, &capability, event_id, &lease_token, now)?;
                 authorize_incident(db, &capability, &incident_id)?;
-                let next_retry = retry_count.saturating_add(1);
-                let next_status = if retryable && next_retry < MAX_RETRIES {
-                    "pending"
+                let (next_retry, next_status) = if retryable && preserve_retry_count {
+                    (retry_count, "pending")
                 } else {
-                    "dead_letter"
+                    let next_retry = retry_count.saturating_add(1);
+                    let next_status = if retryable && next_retry < MAX_RETRIES {
+                        "pending"
+                    } else {
+                        "dead_letter"
+                    };
+                    (next_retry, next_status)
                 };
                 db.execute(
                     "UPDATE trigger_events
@@ -779,12 +993,18 @@ impl ControlService {
                 }
             }
         };
-        if serde_json::to_vec(&response)?.len() > MAX_FRAME_BYTES {
-            return Err(ControlError::invalid(
-                "response exceeds the frame limit; query a smaller slice",
-            ));
+        if serde_json::to_vec(&response)?.len() <= MAX_FRAME_BYTES {
+            return Ok(response);
         }
-        Ok(response)
+        if let InvestigationResponse::TriggerLeased { lease: Some(lease) } = &mut response {
+            lease.outcome = truncated_trigger_outcome();
+            if serde_json::to_vec(&response)?.len() <= MAX_FRAME_BYTES {
+                return Ok(response);
+            }
+        }
+        Err(ControlError::invalid(
+            "response exceeds the frame limit; query a smaller slice",
+        ))
     }
 
     fn propose(&self, db: &Connection, p: Proposal<'_>) -> Result<InvestigationResponse> {
@@ -835,6 +1055,24 @@ impl ControlService {
         };
         spec.version = 1;
         let mut decision = evaluate_watch_proposal(capability, &spec, &context, self.policy(), now);
+        if decision.allowed
+            && let Some((rule_id, reason)) = bundle_collector_denial(
+                db,
+                &spec.host_id,
+                context
+                    .active_host_watches
+                    .iter()
+                    .chain([&spec])
+                    .map(|watch| watch.collector.collector_type()),
+            )?
+        {
+            decision = PolicyDecision {
+                allowed: false,
+                rule_id: rule_id.into(),
+                reason,
+                policy_version: self.policy().policy_version,
+            };
+        }
         if decision.allowed {
             let floor = &self.policy().edge_floor;
             let invalid = if latest_spec(db, &spec.host_id, &spec.id)?.is_some() {
@@ -893,6 +1131,13 @@ impl ControlService {
         db.execute("INSERT INTO watch_proposals (run_id,idempotency_key,incident_id,fingerprint,spec_json,rationale,response_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![run_id,key,incident.incident_id,watch_target_fingerprint(&spec),submitted,rationale,serde_json::to_string(&response)?,stamp(now)])?;
         let proposal_id = db.last_insert_rowid();
+        if decision.allowed {
+            db.execute("INSERT INTO watch_followups
+                (proposal_id,host_id,watch_id,spec_version,admitted_at,deadline,policy_version,cursor)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,(SELECT COALESCE(MAX(observation_id),0) FROM observations))",
+                params![proposal_id,spec.host_id,spec.id,spec.version,stamp(now),
+                    spec.lifecycle.expires_at.map(stamp),decision.policy_version])?;
+        }
         audit(
             db,
             WatchProposed,
@@ -977,6 +1222,126 @@ fn require_open(incident: &IncidentSummary) -> Result<()> {
     Ok(())
 }
 
+fn authorize_purpose(capability: &ScopedCapability, request: &InvestigationRequest) -> Result<()> {
+    use CapabilityPurpose::*;
+    use InvestigationRequest::*;
+    let Some(purposes) = &capability.allowed_purposes else {
+        return Ok(());
+    };
+    let allowed: &[CapabilityPurpose] = match request {
+        GetCapability {} => return Ok(()),
+        ListHosts { .. }
+        | ListActiveWatches { .. }
+        | ListCollectorCapabilities { .. }
+        | QueryObservations { .. }
+        | GetHostBaselineSummary { .. } => &[
+            ReactiveIncident,
+            HostDiscovery,
+            HostReview,
+            CapabilityPurpose::Monitoring,
+            WatchFollowup,
+        ],
+        ClaimHostReview { .. }
+        | GetHostReviewSamples { .. }
+        | RefreshHostReview { .. }
+        | CompleteHostReview { .. } => &[HostReview],
+        AdvanceHostDiscovery { .. }
+        | CorrelatePackageSnapshots { .. }
+        | GetHostDiscoverySamples { .. }
+        | ClaimHostInterpretation { .. }
+        | FinishHostInterpretation { .. }
+        | ListHostInterpretationAttempts { .. }
+        | SubmitHostInterpretation { .. } => &[HostDiscovery],
+        GetHostAssessment { .. } => &[HostDiscovery, HostReview, ReactiveIncident],
+        ClaimWatchFollowup { .. } | SubmitWatchAssessment { .. } => &[WatchFollowup],
+        ListWatchFollowups { .. }
+        | CancelInvestigationRun { .. }
+        | FinishInvestigationRun { .. } => &[ReactiveIncident, WatchFollowup],
+        InvestigationRequest::Monitoring { .. } => &[CapabilityPurpose::Monitoring],
+        ListExpectationRules { .. } => &[ReactiveIncident, CapabilityPurpose::Monitoring],
+        ListActiveIncidents { .. }
+        | GetIncidentContext { .. }
+        | StartInvestigationRun { .. }
+        | StartDelegatedRun { .. }
+        | ReportRunProgress { .. }
+        | ListInvestigationRuns { .. }
+        | GetRunEvents { .. }
+        | ListTriggerQueue { .. }
+        | ActivateExpectationRule { .. }
+        | ProposeExpectationRule { .. }
+        | ProposeEphemeralWatch { .. }
+        | RecordHypothesisOrFinding { .. }
+        | LeaseNextTrigger { .. }
+        | CompleteTriggerLease { .. }
+        | FailTriggerLease { .. }
+        | ProposeAction { .. }
+        | GetActionVerification { .. }
+        | ListActions { .. } => &[ReactiveIncident],
+    };
+    if allowed.iter().any(|purpose| purposes.contains(purpose)) {
+        Ok(())
+    } else {
+        Err(ControlError::denied(
+            "operation is outside capability purpose scope",
+        ))
+    }
+}
+
+fn lease_fenced() -> ControlError {
+    ControlError::Request {
+        code: "lease_fenced",
+        message: "trigger lease expired or fencing token does not match".into(),
+    }
+}
+
+// Applied at run-token authorization, including terminal and other requests
+// that do not require an active run. The check and mutation share a transaction.
+fn authorize_run_lease(db: &Connection, run: &str, now: DateTime<Utc>) -> Result<()> {
+    let fenced: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs r WHERE r.run_id=?1 AND r.trigger_event_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM trigger_events t WHERE t.event_id=r.trigger_event_id
+           AND t.status='leased' AND t.lease_token=r.trigger_lease_token AND t.lease_expires_at>?2))",
+        params![run, stamp(now)], |r| r.get(0),
+    )?;
+    if fenced {
+        return Err(lease_fenced());
+    }
+    Ok(())
+}
+
+struct ActiveTriggerLease {
+    incident_id: String,
+    host_id: String,
+    expires_at: DateTime<Utc>,
+    retry_count: u32,
+}
+
+fn active_trigger_lease(
+    db: &Connection,
+    capability: &ScopedCapability,
+    event: i64,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<ActiveTriggerLease> {
+    db.query_row(
+        "SELECT t.incident_id,t.host_id,t.lease_expires_at,t.retry_count
+         FROM trigger_events t JOIN watch_specs w USING(host_id,watch_id,spec_version)
+         WHERE t.event_id=?1 AND t.lease_token=?2 AND t.status='leased' AND t.lease_expires_at>?3
+           AND json_extract(w.spec_json,'$.collector.type') IN (SELECT value FROM json_each(?4))",
+        params![event, token, stamp(now), collector_scope_json(capability)?],
+        |r| {
+            Ok(ActiveTriggerLease {
+                incident_id: r.get(0)?,
+                host_id: r.get(1)?,
+                expires_at: parse_stamp(&r.get::<_, String>(2)?, 2)?,
+                retry_count: r.get(3)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(lease_fenced)
+}
+
 fn require_investigator(capability: &ScopedCapability) -> Result<()> {
     if capability.role != PrincipalRole::Investigator {
         return Err(ControlError::denied("investigator role required"));
@@ -1012,7 +1377,9 @@ pub(crate) fn scoped_evidence(
     let mut query = db.prepare(
         "SELECT o.state_hash FROM observations o JOIN watch_specs w USING (host_id,watch_id,spec_version)
          WHERE o.observation_id=?1 AND o.host_id=?2 AND o.collector_type IN (SELECT value FROM json_each(?3))
-           AND (w.incident_id IS NULL OR w.incident_id=?4)",
+           AND (w.incident_id IS NULL OR w.incident_id=?4)
+           AND NOT EXISTS (SELECT 1 FROM discovery_watch_origins d
+             WHERE d.host_id=o.host_id AND d.watch_id=o.watch_id AND d.spec_version=o.spec_version)",
     )?;
     for id in ids {
         let hash = query
@@ -1027,6 +1394,10 @@ pub(crate) fn scoped_evidence(
     Ok(Some(evidence))
 }
 
+fn truncated_trigger_outcome() -> Value {
+    json!({"truncated":true,"reason":"trigger outcome exceeds the lease response budget"})
+}
+
 fn collector_scope_json(cap: &ScopedCapability) -> Result<String> {
     Ok(serde_json::to_string(&cap.allowed_collectors)?)
 }
@@ -1037,8 +1408,19 @@ fn scoped_watches(
     host: &str,
     now: DateTime<Utc>,
 ) -> Result<Vec<WatchSpec>> {
+    let discovery: Vec<String> = if cap.incident_id.is_some() {
+        rows(
+            db,
+            "SELECT watch_id FROM discovery_watch_origins WHERE host_id=?1",
+            [host],
+            |r| r.get(0),
+        )?
+    } else {
+        Vec::new()
+    };
     Ok(active_watches(db, host, now)?
         .into_iter()
+        .filter(|watch| !discovery.contains(&watch.id))
         .filter(|w| {
             cap.allowed_collectors
                 .contains(&w.collector.collector_type())
@@ -1068,6 +1450,9 @@ fn observations(
         FROM observations o JOIN watch_specs w USING (host_id,watch_id,spec_version)
         WHERE o.host_id=?1 AND (?2 IS NULL OR o.watch_id=?2) AND (?3 IS NULL OR o.observed_at>=?3 OR incident_evidence)
         AND (?4 IS NULL OR w.incident_id IS NULL OR w.incident_id=?4)
+        AND NOT EXISTS (SELECT 1 FROM discovery_watch_origins d
+             WHERE d.host_id=o.host_id AND d.watch_id=o.watch_id AND d.spec_version=o.spec_version
+               AND (d.review_only=1 OR ?2 IS NULL OR ?4 IS NOT NULL))
         AND o.collector_type IN (SELECT value FROM json_each(?5))
         ORDER BY incident_evidence DESC,o.observation_id DESC LIMIT ?6",
         params![host,watch,since.map(stamp),incident,collector_scope_json(cap)?,limit,include_incident_evidence],|r|Ok(ObservationSlice {

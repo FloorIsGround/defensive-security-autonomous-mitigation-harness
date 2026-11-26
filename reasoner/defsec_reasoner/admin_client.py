@@ -106,6 +106,7 @@ class AdminClient:
         allowed_collectors: list[str],
         incident_id: str | None = None,
         ttl_seconds: int = 3600,
+        may_spawn_runs: bool = False,
     ) -> dict[str, Any]:
         if role not in ("observer", "investigator"):
             raise ValueError("role must be 'observer' or 'investigator'")
@@ -118,6 +119,7 @@ class AdminClient:
                 "allowed_collectors": list(allowed_collectors),
                 "incident_id": incident_id,
                 "ttl_seconds": int(ttl_seconds),
+                "may_spawn_runs": bool(may_spawn_runs),
             }
         )
 

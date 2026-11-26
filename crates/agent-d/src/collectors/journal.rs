@@ -269,12 +269,6 @@ pub fn parse_journalctl_json(bytes: &[u8], requested_unit: &str) -> Vec<JournalE
             .get("PRIORITY")
             .and_then(|v| v.as_str().and_then(|s| s.parse::<u8>().ok()).or_else(|| v.as_u64().and_then(|n| u8::try_from(n).ok())))
             .unwrap_or(DEFAULT_MIN_PRIORITY);
-        let unit = value
-            .get("_SYSTEMD_UNIT")
-            .or_else(|| value.get("UNIT"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(requested_unit)
-            .to_string();
         let pid = value
             .get("_PID")
             .and_then(|v| v.as_str().and_then(|s| s.parse::<u32>().ok()).or_else(|| v.as_u64().and_then(|n| u32::try_from(n).ok())));
@@ -286,7 +280,9 @@ pub fn parse_journalctl_json(bytes: &[u8], requested_unit: &str) -> Vec<JournalE
         events.push(JournalEventRecord {
             cursor: cursor.to_string(),
             timestamp_us,
-            unit,
+            // The scoped query includes service-manager messages about the unit.
+            // _SYSTEMD_UNIT identifies the emitter, which can be init.scope.
+            unit: requested_unit.to_string(),
             priority,
             pid,
             uid,
