@@ -10,6 +10,7 @@ import { POLICY_VERSION, EDGE_FLOOR, evaluateProposal, isActiveWatch, watchFinge
 import { advanceDemoReasoner, buildDemoReasoner, demoRunEvents, demoRuns, demoTriggers, endRunsForIncident, logOperatorStep, openOperatorSession } from './demo-reasoner.mjs';
 import { RESOLVER_RULE_ID, buildDemoRules, demoBacktest, demoCreate, demoDecide, demoRevoke, demoRuleAuditEvents, listRules } from './demo-rules.mjs';
 import { advanceDemoActions, approveDemoAction, buildDemoActions, createDemoSigner, proposeDemoAction, signingInfo, summaryOf } from './demo-actions.mjs';
+import { DISCOVERY_AGENT, adaptiveHandlers, advanceDemoAdaptive, buildDemoAdaptive, demoAdaptiveRaw, demoAdaptiveWatches, demoHostProfile, demoOutstanding, demoServicePrecondition, seedVerification } from './demo-adaptive.mjs';
 import {
   ApiError,
   COLLECTOR_TYPES,
@@ -40,6 +41,8 @@ const CAPABILITY_CATALOG = {
   'systemd.unit_state': ['metadata_low', 'Systemd unit status and configuration hashes'],
   'files.metadata': ['metadata_sensitive', 'Metadata and hashes for approved file paths'],
   'journal.unit_events': ['bounded_redacted_text', 'Bounded, redacted systemd journal events'],
+  'connections.outbound': ['metadata_sensitive', 'Grouped outbound connection flows with owning process'],
+  'packages.inventory': ['metadata_low', 'Installed package names, versions and architectures'],
 };
 
 function capabilities() {
@@ -154,11 +157,11 @@ function buildState(now, signer) {
   const iso = (ago) => new Date(now - ago).toISOString();
 
   const hosts = [
-    { host_id: 'edge-vm-07', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 7, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
-    { host_id: 'edge-vm-03', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 9, hb: 12_000, health: { rss_bytes: 19_116_032, spool_bytes_used: 401_408, spool_bytes_cap: 67_108_864, active_watches: 3, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-11' },
+    { host_id: 'edge-vm-07', agent_version: DISCOVERY_AGENT, liveness_status: 'online', active_bundle_version: 14, hb: 8_000, health: { rss_bytes: 23_552_000, spool_bytes_used: 1_204_224, spool_bytes_cap: 67_108_864, active_watches: 7, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-14' },
+    { host_id: 'edge-vm-03', agent_version: DISCOVERY_AGENT, liveness_status: 'online', active_bundle_version: 9, hb: 12_000, health: { rss_bytes: 19_116_032, spool_bytes_used: 401_408, spool_bytes_cap: 67_108_864, active_watches: 3, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-a / esx-11' },
     { host_id: 'edge-vm-11', agent_version: '0.1.9', liveness_status: 'stale', active_bundle_version: 7, hb: 4 * MIN + 12_000, health: { rss_bytes: 31_870_976, spool_bytes_used: 58_720_256, spool_bytes_cap: 67_108_864, active_watches: 1, dropped_events_total: 214 }, vm: 'vSphere / cl-edge-b / esx-02' },
-    { host_id: 'edge-vm-12', agent_version: '0.2.0', liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 4, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
-    { host_id: 'edge-db-02', agent_version: '0.1.9', liveness_status: 'offline', active_bundle_version: 6, hb: 3 * HOUR + 7 * MIN, health: null, vm: 'vSphere / cl-data / esx-21' },
+    { host_id: 'edge-vm-12', agent_version: DISCOVERY_AGENT, liveness_status: 'online', active_bundle_version: 11, hb: 5_000, health: { rss_bytes: 18_350_080, spool_bytes_used: 212_992, spool_bytes_cap: 67_108_864, active_watches: 4, dropped_events_total: 0 }, vm: 'vSphere / cl-edge-b / esx-05' },
+    { host_id: 'edge-db-02', agent_version: DISCOVERY_AGENT, liveness_status: 'offline', active_bundle_version: 6, hb: 3 * HOUR + 7 * MIN, health: null, vm: 'vSphere / cl-data / esx-21' },
   ];
 
   const helperV1 = '[Unit]\nDescription=Custom Helper\n[Service]\nExecStart=/opt/helper/helperd --oneshot\n';
@@ -209,6 +212,8 @@ function buildState(now, signer) {
     baselineWatch('edge-vm-07', 'base-sshd-journal', journalColl('sshd.service'), healthTrig),
     baselineWatch('edge-db-02', 'base-sockets-listening', sockColl, sockTrig),
     baselineWatch('edge-db-02', 'base-postgres-unit', unitColl('postgresql.service'), unitTrig),
+    // P15/P16: investigator-managed service watches and (retired) discovery watches.
+    ...demoAdaptiveWatches(iso),
   ];
 
   // --- observations (key, host, watch, agoMs, status, payload) ----------------
@@ -273,7 +278,7 @@ function buildState(now, signer) {
     }],
     ['sshd_recent', 'edge-vm-07', 'base-sshd-unit', 14 * MIN, 'ok', snap(sshdSnap)],
     ['sock_latest', 'edge-vm-07', 'base-sockets-listening', 11 * MIN, 'ok', snap(sockSnap([...BASE_SOCKETS, { ...ROGUE, pid: 24410, pid_start_time_ticks: 74_230 }]))],
-    ['unit_u3', 'edge-vm-07', 'ephem-0042-helper-unit', 2 * MIN, 'ok', snap(unitSnap('custom-helper.service', 24410, '/opt/helper/helperd --listen 0.0.0.0:4444 --beacon 300', helperV3, 131))],
+    ['unit_u3', 'edge-vm-07', 'ephem-0042-helper-unit', 4 * MIN + 20_000, 'ok', snap(unitSnap('custom-helper.service', 24410, '/opt/helper/helperd --listen 0.0.0.0:4444 --beacon 300', helperV3, 131))],
 
     ['v3_sock', 'edge-vm-03', 'base-sockets-listening', 7 * HOUR, 'ok', snap(sockSnap(BASE_SOCKETS.slice(0, 3)))],
     ['v3_nginx_unit', 'edge-vm-03', 'base-nginx-unit', 7 * HOUR - 30_000, 'ok', snap(unitSnap('nginx.service', 1290, '/usr/sbin/nginx -g daemon off;', nginxUnit, 211))],
@@ -318,17 +323,18 @@ function buildState(now, signer) {
 
     ['db_sock', 'edge-db-02', 'base-sockets-listening', 3 * HOUR + 9 * MIN, 'ok', snap(sockSnap([sock('tcp', '10.20.4.12', 5432, 113, 33120, 950, 'postgres', 'postgresql.service'), BASE_SOCKETS[0]]))],
     ['db_pg', 'edge-db-02', 'base-postgres-unit', 3 * HOUR + 9 * MIN, 'ok', snap(unitSnap('postgresql.service', 950, '/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main', '[Service]\nExecStart=/usr/lib/postgresql/16/bin/postgres\n', 703))],
+    ...demoAdaptiveRaw({ sock, sockSnap, unitSnap, BASE_SOCKETS }),
   ];
 
   raw.sort((a, b) => b[3] - a[3]);
   const obsByKey = {};
-  const observations = raw.map(([key, host, watch, ago, status, payload], i) => {
+  const observations = raw.map(([key, host, watch, ago, status, payload, extra], i) => {
     const hashInput = payload.kind === 'snapshot' ? payload.data : payload;
     const o = {
       observation_id: 9001 + i,
       host_id: host,
       watch_id: watch,
-      spec_version: 1,
+      spec_version: extra?.spec_version ?? 1,
       observed_at: iso(ago),
       status,
       state_hash: h(canonicalJson(hashInput)),
@@ -384,6 +390,8 @@ function buildState(now, signer) {
   ];
 
   const ids = (...keys) => keys.map((k) => obsByKey[k].observation_id).sort((a, b) => a - b);
+  // --- P11–P18 adaptive investigator (assessments, monitoring, reviews, follow-ups)
+  const adaptiveSet = buildDemoAdaptive({ now, iso, obsByKey });
   const findings = [
     {
       finding_id: 301, incident_id: 'inc-2026-0042', run_id: 'run-7f3a91c2', created_at: iso(36 * MIN),
@@ -421,6 +429,7 @@ function buildState(now, signer) {
         escalation_requested: false, evidence_observation_ids: ids('v3_conf_2'),
       },
     },
+    ...adaptiveSet.findings,
   ];
 
   const proposals = [
@@ -485,12 +494,15 @@ function buildState(now, signer) {
     ...actionSet.events,
     ...reasonerSet.auditEvents,
     ...demoRuleAuditEvents(rules, now),
+    ...adaptiveSet.auditEvents,
   ].sort((a, b) => b.ago - a.ago);
+  // Delegated (corroborated) revisions are audited by buildDemoAdaptive itself.
+  baselineRevisions.push(...adaptiveSet.revisions);
 
   const audit = [];
   for (const e of events) appendAudit(audit, e.event_type, e.actor, e.payload, iso(e.ago));
 
-  return {
+  const S = {
     hosts,
     watches,
     observations,
@@ -511,7 +523,10 @@ function buildState(now, signer) {
     nextProposalId: 80,
     tampered: false,
     createdAt: now,
+    adaptive: adaptiveSet.adaptive,
   };
+  seedVerification(S, iso);
+  return S;
 }
 
 function appendAudit(audit, event_type, actor, payload, timestamp = new Date().toISOString()) {
@@ -540,6 +555,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
   const advance = () => {
     advanceDemoActions(S, now(), appendAudit);
     advanceDemoReasoner(S, now(), appendAudit);
+    advanceDemoAdaptive(S, now(), appendAudit);
   };
 
   const host = (id) => {
@@ -567,6 +583,14 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     for (const r of S.baselineRevisions.filter((x) => x.host_id === hostId)) {
       if (!latest.has(r.watch_id) || latest.get(r.watch_id).revision_id < r.revision_id) latest.set(r.watch_id, r);
     }
+    // A rolled-back delegated baseline points at its predecessor (or at nothing).
+    for (const [key, revision] of S.adaptive.baselinePointers) {
+      const [h0, watch] = key.split('/');
+      if (h0 !== hostId) continue;
+      const r = revision === null ? null : S.baselineRevisions.find((x) => x.revision_id === revision);
+      if (r) latest.set(watch, r);
+      else latest.delete(watch);
+    }
     return [...latest.values()]
       .map(({ watch_id, revision_id, state_hash, approver, approved_at, ticket_ref }) => ({ watch_id, revision_id, state_hash, approver, approved_at, ticket_ref }))
       .sort((a, b) => a.watch_id.localeCompare(b.watch_id));
@@ -589,6 +613,18 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
     completed_runs: w.runtime?.completed_runs ?? null,
     expired: Boolean(w.lifecycle.expires_at && Date.parse(w.lifecycle.expires_at) <= now()),
     active: isActiveWatch(w, now()),
+  });
+
+  const adaptive = adaptiveHandlers(() => S, {
+    now,
+    appendAudit,
+    requireAdmin,
+    host,
+    incidentRow,
+    hostWatches,
+    currentBaselines,
+    capabilities,
+    enableAdmin,
   });
 
   return {
@@ -628,6 +664,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
             watch_count: hostWatches(hst.host_id).length,
             baseline_watch_count: hostWatches(hst.host_id).filter((w) => w.class === 'baseline').length,
             stream_watch_count: hostWatches(hst.host_id).filter((w) => isStreamWatch(w)).length,
+            host_profile: demoHostProfile(hst.host_id) ?? undefined,
             health: hst.health ?? undefined,
             placement: hst.vm ?? undefined,
           };
@@ -814,7 +851,11 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         return o && o.host_id === inc.host_id && !(w?.incident_id && w.incident_id !== incidentId);
       });
       const { run_id: _r, ...proposal } = a;
-      const res = proposeDemoAction(S, { incident: inc, run, actor: 'console-operator', proposal, evidenceOk, signer, nowMs: now(), appendAudit });
+      const res = proposeDemoAction(S, {
+        incident: inc, run, actor: 'console-operator', proposal, evidenceOk, signer, nowMs: now(), appendAudit,
+        outstanding: (host, verb) => demoOutstanding(S, host, verb),
+        servicePrecondition: (host, unit, ids, at) => demoServicePrecondition(S, host, unit, ids, at),
+      });
       logOperatorStep(S, run.run_id, now(), 'propose_action', { args_preview: JSON.stringify(proposal.verb), accepted: res.decision.allowed, code: res.decision.rule_id });
       inc.updated_at = new Date(now()).toISOString();
       return res;
@@ -894,6 +935,8 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         observation_id: observationId,
       };
       S.baselineRevisions.push(revision);
+      // A fresh promotion supersedes any earlier rollback pointer for this watch.
+      S.adaptive.baselinePointers.delete(`${hostId}/${watchId}`);
       appendAudit(S.audit, 'baseline_promoted', approver, {
         revision_id: revision.revision_id,
         previous_revision_id: prior?.revision_id ?? null,
@@ -993,6 +1036,7 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
         nowMs: now(),
         incidentOpen: (id) => S.incidents.find((i) => i.incident_id === id)?.status === 'open',
         appendAudit,
+        outstanding: (host, verb) => demoOutstanding(S, host, verb),
       });
     },
 
@@ -1025,6 +1069,51 @@ export function createDemoBackend({ enableAdmin = true, now = () => Date.now() }
       requireAdmin();
       const id = parseRuleId(ruleId);
       return demoRevoke(S, appendAudit, id, parseRuleRevoke(body), now());
+    },
+
+    // ---- P11–P18 adaptive investigator -------------------------------------------
+    async hostProfile(hostId) {
+      advance();
+      return adaptive.hostProfile(hostId);
+    },
+    async discovery(hostId, query = {}) {
+      return adaptive.discovery(hostId, query);
+    },
+    async advanceDiscovery(hostId) {
+      return adaptive.advanceDiscovery(hostId);
+    },
+    async monitoring(hostId) {
+      return adaptive.monitoring(hostId);
+    },
+    async setMonitoringGrant(hostId, body = {}) {
+      return adaptive.setMonitoringGrant(hostId, body);
+    },
+    async corroborateMonitoring(candidateId, body = {}) {
+      return adaptive.corroborateMonitoring(candidateId, body);
+    },
+    async rollbackMonitoring(hostId, watchId, body = {}) {
+      return adaptive.rollbackMonitoring(hostId, watchId, body);
+    },
+    async hostReview(hostId) {
+      return adaptive.hostReview(hostId);
+    },
+    async setReviewSchedule(hostId, body = {}, ctx = {}) {
+      return adaptive.setReviewSchedule(hostId, body, ctx);
+    },
+    async cancelReviewSchedule(hostId) {
+      return adaptive.cancelReviewSchedule(hostId);
+    },
+    async followups(incidentId) {
+      advance();
+      return adaptive.followups(incidentId);
+    },
+    async actionVerification(intentId) {
+      advance();
+      return adaptive.actionVerification(intentId);
+    },
+    async reconcileAction(intentId, body = {}) {
+      advance();
+      return adaptive.reconcileAction(intentId, body);
     },
 
     // ---- demo-only helpers ---------------------------------------------------

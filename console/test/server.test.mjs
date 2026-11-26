@@ -13,6 +13,8 @@
 // 9. Reasoner activity (demo, mock frames, real control-d)
 // 10. Expectation rules (demo, mock frames, real control-d: create, backtest,
 //     list, revoke, investigator proposal approved through the console)
+// 11. Adaptive investigator P11–P18 (demo, exact mock frames, pre-P11
+//     degradation, roles and token isolation, real control-d quiet host)
 
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,6 +23,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import vm from 'node:vm';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -38,15 +41,32 @@ const CONSOLE_DIR = path.resolve(HERE, '..');
 const REPO = path.resolve(CONSOLE_DIR, '..');
 const CONTROL_D = path.join(REPO, 'target', 'debug', 'control-d');
 const ALL_COLLECTORS = ['sockets.listening', 'systemd.unit_state', 'files.metadata', 'journal.unit_events'];
+/** Every CollectorType in crates/protocol/src/watch.rs (P11 added outbound connections and packages). */
+const EVERY_COLLECTOR = [...ALL_COLLECTORS, 'connections.outbound', 'packages.inventory'];
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
+// sun_path holds 108 bytes on Linux and 104 on macOS, including the NUL. The
+// longest socket path these tests build is <dir>/<leaf> with a leaf of at most
+// SOCKET_LEAF_BYTES, and mkdtemp appends six characters to the prefix.
+const SUN_PATH_MAX = 103;
+const SOCKET_LEAF_BYTES = 16; // e.g. "/missing.sock" plus margin
+
+/** A fresh temp directory whose socket paths always fit sun_path, even under a long TMPDIR. */
 function shortTmp(prefix = 'dsc-') {
-  const base = os.tmpdir();
-  const dir = fs.mkdtempSync(path.join(base, prefix));
-  return dir;
+  const fits = (base) => Buffer.byteLength(path.join(base, `${prefix}XXXXXX`)) + SOCKET_LEAF_BYTES <= SUN_PATH_MAX;
+  const candidates = [os.tmpdir(), '/tmp', '/var/tmp', '/dev/shm'].filter((b, i, all) => all.indexOf(b) === i);
+  for (const base of candidates) {
+    if (!fits(base)) continue;
+    try {
+      return fs.mkdtempSync(path.join(base, prefix));
+    } catch {
+      /* not writable here: try the next short directory */
+    }
+  }
+  throw new Error(`no writable temp directory short enough for Unix socket paths (TMPDIR=${os.tmpdir()})`);
 }
 
 function request(port, method, urlPath, { headers = {}, body, rawBody, host } = {}) {
@@ -1081,7 +1101,7 @@ describe('demo mode API walkthrough', () => {
 
   test('capabilities, observations filters and three-state baselines', async () => {
     const caps = (await get(port, '/api/hosts/edge-vm-07/capabilities')).json.capabilities;
-    assert.deepEqual(caps.map((c) => c.collector_type), ALL_COLLECTORS);
+    assert.deepEqual(caps.map((c) => c.collector_type), EVERY_COLLECTOR);
 
     const all = (await get(port, '/api/hosts/edge-vm-07/observations')).json.observations;
     const filtered = (await get(port, '/api/hosts/edge-vm-07/observations?watch_id=base-sockets-listening&limit=2')).json.observations;
@@ -2286,6 +2306,35 @@ describe('operator console copy and identity binding', () => {
     assert.ok(files[1].includes('#/reasoner'), 'Reasoner activity is in the navigation');
   });
 
+  test('reconciliation drawer binds receipt detail and drafts to the exact receipt_id', () => {
+    const app = fs.readFileSync(path.join(CONSOLE_DIR, 'public/app.js'), 'utf8');
+    assert.ok(!/nothing has been executed/.test(app), 'absence of a receipt does not prove nothing executed');
+    assert.ok(app.includes("'No receipt recorded yet.'"));
+    // Pairing is a pure function: run it in isolation against racing snapshots.
+    const src = app.slice(app.indexOf('function pairLatestReceipt('), app.indexOf('function verificationSection('));
+    const pair = vm.runInNewContext(`(${src.trim()})`);
+    const v = (ids, statuses) => ({ latest_receipt_id: ids.at(-1), receipt_checks: ids.map((receipt_id, i) => ({ receipt_id, receipt_status: statuses[i] })) });
+    const executed = { status: 'executed', detail: 'applied' };
+    const rolled = { status: 'rolled_back', detail: 'TTL elapsed' };
+    assert.equal(pair(v([4], ['executed']), [executed]), executed);
+    assert.equal(pair(v([4, 9], ['executed', 'rolled_back']), [executed]), null, 'a new receipt is never labelled with the previous receipt\'s detail');
+    assert.equal(pair(v([4], ['executed']), [executed, rolled]), null, 'receipt list ahead of verification');
+    assert.equal(pair(v([4, 9], ['executed', 'rolled_back']), [executed, rolled]), rolled);
+    assert.equal(pair(v([4, 9], ['executed', 'rolled_back']), [executed, { ...executed }]), null, 'status must agree');
+    assert.equal(pair({ latest_receipt_id: null, receipt_checks: [] }, []), null);
+    // Each poll re-reads the executor receipts with the verification.
+    const section = app.slice(app.indexOf('function verificationSection('), app.indexOf('function renderVerification('));
+    assert.match(section, /api\(`\/api\/admin\/actions\/\$\{enc\(a\.intent_id\)\}\/verification`\), api\(`\/api\/admin\/actions\/\$\{enc\(a\.intent_id\)\}`\)/);
+    // The form is rebuilt only when the attested receipt changes, and a carried draft needs re-confirmation.
+    const render = app.slice(app.indexOf('function renderVerification('), app.indexOf('function reconcileForm('));
+    assert.match(render, /if \(key !== ctx\.formKey\)/);
+    const form = app.slice(app.indexOf('function reconcileForm('), app.indexOf('// ---------------------------------------------------------------------------\n// Boot'));
+    assert.match(form, /f\.reconfirmed = !carried/);
+    assert.match(form, /ctx\.latestKey !== key/, 'the receipt is re-checked after the confirmation dialog');
+    // Review schedules keep an existing interval to the second.
+    assert.match(app, /interval_seconds: intervalEdited \? f\.interval_hours \* 3600 : exact/);
+  });
+
   test('with an access gate, approver and actor are the signed-in account', async () => {
     const backend = createDemoBackend();
     const auth = createAuth({ mode: 'proxy-header', proxyRoleHeader: 'x-forwarded-groups', proxyAdminGroup: 'defsec-admins' });
@@ -2718,6 +2767,797 @@ describe('expectation rules over a mock control-d', () => {
       await a.app.close();
       oldSrv.close();
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. Adaptive investigator (P11–P18): host deep-dive, follow-ups and receipt
+//     verification in demo mode, exact wire frames over a mock control-d,
+//     graceful degradation, roles, and the real control-d.
+// ---------------------------------------------------------------------------
+
+const ASSESSMENT_KEYS = ['collectors', 'deadline', 'host_id', 'interpretations', 'version'];
+const FOLLOWUP_KEYS = ['deadline', 'finding_id', 'finding_visible', 'interpretation', 'observation_id', 'origin_run', 'overdue', 'proposal_id', 'question', 'spec_version', 'status', 'summary', 'watch_id'];
+const VERIFICATION_KEYS = ['available', 'collateral_coverage', 'concurrent_service_changes', 'expected_effect', 'intent_id', 'latest_receipt_id', 'operator_reconciliations', 'outcome', 'precondition_observation_id', 'receipt_checks', 'reconcile', 'recovery_plan'];
+const CHECK_KEYS = ['deadline', 'expected_state', 'observation_id', 'reason', 'receipt_id', 'receipt_status', 'result', 'state_hash'];
+const TOKENISH = /"(capability_token|lease_token|run_token|token)"\s*:/;
+
+describe('adaptive investigator (demo)', () => {
+  let app;
+  let port;
+  let clock;
+  let backend;
+  before(async () => {
+    clock = Date.now();
+    backend = createDemoBackend({ now: () => clock });
+    ({ app, port } = await startConsole(backend));
+  });
+  after(() => app.close());
+
+  test('P11: profiles and six-collector coverage, including the agent without a profile', async () => {
+    const quiet = (await get(port, '/api/hosts/edge-vm-12/profile')).json;
+    assert.equal(quiet.available, true);
+    assert.deepEqual(quiet.host_profile.expected_services, [], 'the quiet host declares no role');
+    assert.equal(quiet.discovery_support, true);
+    assert.deepEqual(quiet.coverage.map((c) => c.collector), EVERY_COLLECTOR);
+    assert.equal(quiet.coverage.find((c) => c.collector === 'packages.inventory').state, 'sampled', 'sampled by discovery, not watched');
+    const web = (await get(port, '/api/hosts/edge-vm-03/profile')).json;
+    assert.equal(web.coverage.find((c) => c.collector === 'connections.outbound').state, 'disabled');
+    const legacy = (await get(port, '/api/hosts/edge-vm-11/profile')).json;
+    assert.equal(legacy.host_profile, null);
+    assert.ok(legacy.coverage.every((c) => c.profile === 'unknown'));
+    assert.equal(legacy.coverage.find((c) => c.collector === 'sockets.listening').state, 'error');
+    const hosts = (await get(port, '/api/hosts')).json.hosts;
+    assert.deepEqual(hosts.find((h) => h.host_id === 'edge-vm-12').host_profile.host_tags, ['edge']);
+    assert.equal((await get(port, '/api/hosts/nope/profile')).status, 404);
+    assert.equal((await get(port, '/api/hosts/..%2Fx/profile')).status, 400);
+  });
+
+  test('P15: versioned assessments, citations, samples, attempts and advance', async () => {
+    const d = (await get(port, '/api/hosts/edge-vm-12/discovery')).json;
+    assert.equal(d.available, true);
+    assert.equal(d.latest_version, 4);
+    assert.deepEqual(Object.keys(d.assessment).sort(), ASSESSMENT_KEYS);
+    const interp = d.assessment.interpretations.at(-1);
+    assert.deepEqual(Object.keys(interp.proposal).sort(), ['citations', 'dependencies', 'proposed_watch', 'purpose', 'uncertainty', 'visibility_gaps']);
+    assert.ok(interp.proposal.citations.every((id) => d.source_ids.includes(id)), 'citations name current discovery samples');
+    assert.deepEqual(d.samples.map((s) => s.collector).sort(), ['packages.inventory', 'sockets.listening']);
+    assert.equal(d.samples.find((s) => s.collector === 'sockets.listening').partial_attribution, true);
+    assert.ok(d.samples.every((s) => s.entries.length <= 40));
+    const attempts = d.attempts.find((g) => JSON.stringify(g.source_ids) === JSON.stringify(d.source_ids)).attempts;
+    assert.deepEqual(attempts.map((a) => [a.status, a.error, a.assessment_version]), [['failed', 'provider_retryable', null], ['saved', null, 4]]);
+    const v2 = (await get(port, '/api/hosts/edge-vm-12/discovery?version=2')).json;
+    assert.equal(v2.assessment.version, 2);
+    assert.deepEqual(v2.assessment.collectors.map((c) => c.gap), ['awaiting_sample', 'awaiting_sample']);
+    assert.equal((await get(port, '/api/hosts/edge-vm-12/discovery?version=0')).status, 400);
+    const offline = (await get(port, '/api/hosts/edge-db-02/discovery')).json;
+    assert.equal(offline.assessment.collectors.find((c) => c.collector === 'sockets.listening').gap, 'deadline_elapsed');
+
+    // edge-vm-03 is mid-discovery: the requested package sample arrives on advance.
+    const before = (await get(port, '/api/hosts/edge-vm-03/discovery')).json;
+    assert.equal(before.latest_version, 2);
+    const adv = await post(port, '/api/admin/hosts/edge-vm-03/discovery/advance', {});
+    assert.equal(adv.status, 200, adv.text);
+    assert.equal(adv.json.assessment_version, 3);
+    const after = (await get(port, '/api/hosts/edge-vm-03/discovery')).json;
+    assert.ok(after.assessment.collectors.every((c) => c.evidence && !c.gap));
+    assert.equal((await post(port, '/api/admin/hosts/edge-vm-03/discovery/advance', {})).json.assessment_version, 3, 'finished discovery does not churn revisions');
+  });
+
+  test('P16: grants, managed watches, corroboration and rollback through the audit chain', async () => {
+    const m = (await get(port, '/api/hosts/edge-vm-12/monitoring')).json;
+    assert.equal(m.available, true);
+    assert.equal(m.source, 'audit');
+    assert.deepEqual(m.grants.map((g) => [g.principal_id, g.max_watches, g.allow_promotion]), [['reasoner-d:discovery', 3, true]]);
+    const w = m.watches.find((x) => x.watch_id === 'mon-cron-service');
+    assert.equal(w.baseline_state, 'trusted');
+    assert.equal(w.baseline_revision, 36);
+    assert.ok(w.purpose && w.expected_signal && w.evidence.length && w.review_at);
+    assert.deepEqual(m.candidates.map((c) => [c.candidate_id, c.state]), [[13, 'provisional'], [12, 'trusted'], [11, 'rolled_back']]);
+    assert.ok(m.decisions.some((x) => x.allowed === false && /duplicates existing coverage/.test(x.reason)));
+
+    const bad = await post(port, '/api/admin/monitoring/candidates/13/corroborate', { rationale: '' });
+    assert.equal(bad.status, 400);
+    const ok = await post(port, '/api/admin/monitoring/candidates/13/corroborate', { rationale: 'Matches CHG-4511' });
+    assert.deepEqual(ok.json, { allowed: true, candidate_id: 13, reason: null });
+    assert.equal((await post(port, '/api/admin/monitoring/candidates/13/corroborate', { rationale: 'again' })).json.allowed, false);
+    assert.equal((await post(port, '/api/admin/monitoring/candidates/999/corroborate', { rationale: 'x' })).json.allowed, false);
+
+    const rb = await post(port, '/api/admin/hosts/edge-vm-12/monitoring/mon-cron-service/rollback', { expected_baseline: 36, rationale: 'recapture' });
+    assert.equal(rb.status, 200, rb.text);
+    assert.deepEqual([rb.json.allowed, rb.json.baseline, rb.json.rolled_back], [true, null, 36]);
+    const stale = await post(port, '/api/admin/hosts/edge-vm-12/monitoring/mon-cron-service/rollback', { expected_baseline: 36, rationale: 'twice' });
+    assert.deepEqual([stale.json.allowed, stale.json.reason], [false, 'expected managed baseline is no longer current']);
+    assert.equal((await post(port, '/api/admin/hosts/edge-vm-12/monitoring/mon-cron-service/rollback', { expected_baseline: 'x', rationale: 'r' })).status, 400);
+    const tri = (await get(port, '/api/hosts/edge-vm-12/baselines')).json.three_state.find((r) => r.watch_id === 'mon-cron-service');
+    assert.equal(tri.accepted_baseline, null, 'the trusted baseline was rolled back to none');
+
+    // Rollback -> promote -> read: a fresh promotion replaces the rollback override.
+    const latestCron = (await get(port, '/api/hosts/edge-vm-12/observations?watch_id=mon-cron-service&limit=1')).json.observations[0];
+    const promoted = await post(port, '/api/admin/baselines/promote', { host_id: 'edge-vm-12', watch_id: 'mon-cron-service', observation_id: latestCron.observation_id, approver: 'j.rivera', rationale: 'settled sample after recapture' });
+    assert.equal(promoted.status, 200, promoted.text);
+    const reread = (await get(port, '/api/hosts/edge-vm-12/baselines')).json;
+    assert.equal(reread.baselines.find((b) => b.watch_id === 'mon-cron-service')?.revision_id, promoted.json.revision_id, 'the new revision is current');
+    assert.equal(reread.three_state.find((r) => r.watch_id === 'mon-cron-service').accepted_baseline?.revision_id, promoted.json.revision_id);
+    assert.equal((await get(port, '/api/hosts/edge-vm-12/monitoring')).json.watches.find((x) => x.watch_id === 'mon-cron-service').current_baseline?.revision_id, promoted.json.revision_id);
+
+    const grant = await post(port, '/api/admin/hosts/edge-vm-03/monitoring/grant', { principal_id: 'reasoner-d:discovery', max_watches: 2, allow_promotion: false });
+    assert.deepEqual(grant.json, { allowed: true, host_id: 'edge-vm-03', principal_id: 'reasoner-d:discovery', max_watches: 2, allow_promotion: false });
+    assert.equal((await post(port, '/api/admin/hosts/edge-vm-03/monitoring/grant', { principal_id: 'p', max_watches: 99 })).status, 400);
+    const after = (await get(port, '/api/hosts/edge-vm-12/monitoring')).json;
+    assert.equal(after.candidates.find((c) => c.candidate_id === 13).state, 'corroborated');
+    assert.equal(after.candidates.find((c) => c.candidate_id === 12).state, 'rolled_back');
+    assert.equal((await get(port, '/api/hosts/edge-vm-03/monitoring')).json.grants.length, 1);
+    const audit = (await get(port, '/api/admin/audit?limit=500')).json;
+    assert.equal(audit.chain.valid, true);
+    assert.equal(audit.independent.valid, true);
+  });
+
+  test('P17: latest review, freshness and schedule set/cancel', async () => {
+    const r07 = (await get(port, '/api/hosts/edge-vm-07/review')).json;
+    assert.deepEqual(Object.keys(r07.review).sort(), ['assessment_version', 'citations', 'completed_at', 'interpretation', 'question', 'review_id', 'summary']);
+    assert.equal(r07.review.interpretation, 'contradicts');
+    assert.equal((await get(port, '/api/hosts/edge-db-02/review')).json.freshness.state, 'assessment_advanced');
+    assert.equal((await get(port, '/api/hosts/edge-vm-12/review')).json.freshness.state, 'current');
+    const none = (await get(port, '/api/hosts/edge-vm-03/review')).json;
+    assert.deepEqual([none.review, none.schedule, none.freshness.state], [null, null, 'never_reviewed']);
+    for (const body of [{ interval_seconds: 30, question: 'q', collectors: ['sockets.listening'] }, { interval_seconds: 3600, question: 'q', collectors: ['files.metadata'] }, { interval_seconds: 3600, question: 'q', collectors: [] }, { interval_seconds: 3600, question: '', collectors: ['sockets.listening'] }]) {
+      assert.equal((await post(port, '/api/admin/hosts/edge-vm-03/review-schedule', body)).status, 400, JSON.stringify(body));
+    }
+    const set = await post(port, '/api/admin/hosts/edge-vm-03/review-schedule', { interval_seconds: 7200, question: 'Still a web host?', collectors: ['sockets.listening', 'packages.inventory'], route: 'host-review' });
+    assert.equal(set.status, 200, set.text);
+    assert.deepEqual(set.json.schedule.collectors, ['packages.inventory', 'sockets.listening']);
+    assert.equal((await get(port, '/api/hosts/edge-vm-03/review')).json.freshness.state, 'awaiting_first_review');
+    assert.equal((await post(port, '/api/admin/hosts/edge-vm-03/review-schedule/cancel', {})).json.cancelled, true);
+    assert.equal((await get(port, '/api/hosts/edge-vm-03/review')).json.schedule, null);
+  });
+
+  test('P14: follow-up questions carry the fresh observation and recorded interpretation', async () => {
+    const r = (await get(port, '/api/incidents/inc-2026-0042/followups')).json;
+    assert.equal(r.available, true);
+    for (const f of r.followups) assert.deepEqual(Object.keys(f).sort(), FOLLOWUP_KEYS);
+    const by = Object.fromEntries(r.followups.map((f) => [f.proposal_id, f]));
+    assert.deepEqual([by[71].status, by[71].interpretation], ['answered', 'supports']);
+    assert.deepEqual([by[72].status, by[72].interpretation], ['answered', 'unresolved']);
+    assert.deepEqual([by[76].status, by[76].observation_id, by[76].interpretation], ['awaiting_evidence', null, null]);
+    const ctx = (await get(port, '/api/incidents/inc-2026-0042')).json;
+    assert.ok(ctx.findings.some((f) => f.finding_id === by[71].finding_id && f.finding.interpretation === 'supports'), 'the answer is an ordinary cited finding');
+    const r39 = (await get(port, '/api/incidents/inc-2026-0039/followups')).json.followups;
+    assert.deepEqual(r39.map((f) => [f.status, f.interpretation]), [['expired', null], ['answered', 'contradicts']]);
+    clock += 30 * 60_000;
+    assert.equal((await get(port, '/api/incidents/inc-2026-0042/followups')).json.followups.find((f) => f.proposal_id === 76).status, 'expired');
+    clock -= 30 * 60_000;
+    assert.equal((await get(port, '/api/incidents/nope/followups')).status, 404);
+  });
+
+  test('P18: receipt, observed outcome and reconciliation stay separate records', async () => {
+    await post(port, '/api/demo/reset', {});
+    const { actions } = (await get(port, '/api/actions')).json;
+    const rolled = actions.find((a) => a.status === 'rolled_back');
+    const executed = actions.find((a) => a.status === 'executed');
+    const expired = actions.find((a) => a.status === 'expired');
+    const stop = actions.find((a) => a.verb.verb === 'systemd_stop_unit' && a.status === 'pending_approval');
+
+    const v1 = (await get(port, `/api/admin/actions/${rolled.intent_id}/verification`)).json;
+    assert.deepEqual(Object.keys(v1).sort(), VERIFICATION_KEYS);
+    for (const c of v1.receipt_checks) assert.deepEqual(Object.keys(c).sort(), CHECK_KEYS);
+    assert.deepEqual(v1.receipt_checks.map((c) => c.result), ['indeterminate', 'indeterminate'], 'an nft receipt has no effect sensor: never "verified" from a success bit');
+    assert.equal(v1.operator_reconciliations.length, 1);
+    assert.equal(v1.reconcile.allowed, false);
+
+    const vx = (await get(port, `/api/admin/actions/${expired.intent_id}/verification`)).json;
+    assert.equal(vx.reconcile.allowed, false);
+    assert.match(vx.reconcile.reason, /expired/);
+
+    const v2 = (await get(port, `/api/admin/actions/${executed.intent_id}/verification`)).json;
+    assert.equal(v2.reconcile.allowed, true);
+    const body = { expected_receipt_id: v2.latest_receipt_id, evidence_ref: 'nft list ruleset shows handle 23', rationale: 'checked from the jump host' };
+    assert.equal((await post(port, `/api/admin/actions/${executed.intent_id}/reconcile`, { ...body, expected_receipt_id: v2.latest_receipt_id - 1 })).status, 403, 'only the latest receipt');
+    assert.equal((await post(port, `/api/admin/actions/${executed.intent_id}/reconcile`, { ...body, evidence_ref: '' })).status, 400);
+    const rec = await post(port, `/api/admin/actions/${executed.intent_id}/reconcile`, body);
+    assert.equal(rec.status, 200, rec.text);
+    assert.equal(rec.json.operator_reconciliations.length, 1);
+    assert.equal(rec.json.outcome, 'indeterminate', 'a reconciliation never rewrites the observed outcome');
+    assert.equal((await post(port, `/api/admin/actions/${executed.intent_id}/reconcile`, body)).status, 200, 'identical replay is idempotent');
+    assert.equal((await post(port, `/api/admin/actions/${executed.intent_id}/reconcile`, { ...body, rationale: 'different' })).status, 400);
+    assert.equal((await post(port, `/api/admin/actions/${stop.intent_id}/reconcile`, { expected_receipt_id: null, evidence_ref: 'x', rationale: 'y' })).status, 403, 'nothing to reconcile before execution');
+
+    // Approve the stop; the executor reports, then a fresh sample verifies it.
+    assert.equal((await get(port, `/api/admin/actions/${stop.intent_id}/verification`)).json.outcome, 'no_receipt');
+    assert.equal((await post(port, `/api/admin/actions/${stop.intent_id}/approve`, { approver: 'j.rivera' })).status, 200);
+    clock += 5_000;
+    const awaiting = (await get(port, `/api/admin/actions/${stop.intent_id}/verification`)).json;
+    assert.deepEqual([awaiting.outcome, awaiting.receipt_checks[0].expected_state], ['awaiting_evidence', 'inactive']);
+    assert.ok(awaiting.precondition_observation_id);
+    clock += 8_000;
+    const verified = (await get(port, `/api/admin/actions/${stop.intent_id}/verification`)).json;
+    assert.equal(verified.outcome, 'verified');
+    assert.ok(verified.receipt_checks[0].observation_id > awaiting.precondition_observation_id);
+    assert.deepEqual(verified.concurrent_service_changes.map((c) => c.watch_id), ['mon-resolved-service']);
+    assert.match(verified.collateral_coverage, /Causation unassessed/);
+    const audit = (await get(port, '/api/admin/audit?limit=500')).json;
+    assert.ok(audit.entries.some((e) => e.event_type === 'action_effect_observed' && e.payload.result === 'verified'));
+    assert.ok(audit.entries.some((e) => e.event_type === 'action_outcome_reconciled'));
+    assert.equal(audit.independent.valid, true);
+    assert.equal((await get(port, `/api/admin/actions/${crypto.randomUUID()}/verification`)).status, 404);
+  });
+
+  test('P18 gate: a service stop cites a current active sample of its unit; an unresolved target blocks a duplicate', async () => {
+    await post(port, '/api/demo/reset', {});
+    const INC = 'inc-2026-0042';
+    assert.equal((await post(port, `/api/incidents/${INC}/runs`, {})).status, 200);
+    const unitObs = (await get(port, '/api/hosts/edge-vm-07/observations?watch_id=ephem-0042-helper-unit&limit=50')).json.observations.sort((a, b) => b.observation_id - a.observation_id);
+    const current = unitObs[0];
+    const stale = unitObs.at(-1);
+    assert.ok(Date.parse(current.observed_at) > clock - 5 * 60_000 && Date.parse(stale.observed_at) < clock - 5 * 60_000);
+    const sock = (await get(port, '/api/hosts/edge-vm-07/observations?watch_id=base-sockets-listening&limit=1')).json.observations[0].observation_id;
+    const propose = (verb, ids, key) => post(port, `/api/incidents/${INC}/actions`, { verb, evidence_observation_ids: ids, expected_effect: 'e', blast_radius: 'b', rollback_plan: 'r', idempotency_key: key });
+    const stopVerb = { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 600 };
+
+    // An executed nft block with an unverified outcome and no reconciliation is outstanding.
+    const dup = await propose({ verb: 'nft_block_ip', ip: '203.0.113.47', direction: 'outbound', ttl_seconds: 600 }, [sock], 'dup-nft');
+    assert.deepEqual([dup.json.decision.rule_id, dup.json.status, dup.json.intent_id], ['action.awaiting_reconciliation', 'rejected', null]);
+
+    for (const [ids, key] of [[[sock], 'no-unit'], [[stale.observation_id], 'stale-unit']]) {
+      const r = await propose(stopVerb, ids, key);
+      assert.equal(r.status, 200, r.text);
+      assert.deepEqual([r.json.decision.rule_id, r.json.intent_id], ['action.missing_service_precondition', null], key);
+    }
+    const ok = await propose(stopVerb, [sock, current.observation_id], 'current-unit');
+    assert.equal(ok.json.decision.allowed, true, ok.text);
+    const v = (await get(port, `/api/admin/actions/${ok.json.intent_id}/verification`)).json;
+    assert.equal(v.precondition_observation_id, current.observation_id, 'the precondition is the cited pre-dispatch sample');
+
+    // Every recorded stop precondition predates its intent's issuance, never a later sample.
+    for (const a of (await get(port, '/api/actions')).json.actions.filter((x) => x.verb.verb === 'systemd_stop_unit')) {
+      const detail = (await get(port, `/api/admin/actions/${a.intent_id}`)).json;
+      const pre = (await get(port, `/api/admin/actions/${a.intent_id}/verification`)).json.precondition_observation_id;
+      assert.ok(pre, `${a.intent_id} has a precondition`);
+      const o = unitObs.find((x) => x.observation_id === pre);
+      assert.ok(o && Date.parse(o.observed_at) <= Date.parse(detail.payload.issued_at), 'precondition observed before issuance');
+    }
+
+    // The new stop is authorized and unverified, so the fixture stop of the same unit cannot be approved.
+    const pending = (await get(port, '/api/actions')).json.actions.find((a) => a.verb.verb === 'systemd_stop_unit' && a.status === 'pending_approval');
+    const denied = await post(port, `/api/admin/actions/${pending.intent_id}/approve`, { approver: 'j.rivera' });
+    assert.equal(denied.status, 403);
+    assert.match(denied.json.error.message, /needs reconciliation/);
+    await post(port, '/api/demo/reset', {});
+  });
+
+  test('roles: observers read the deep-dive but every adaptive mutation is admin-only; read-only demo degrades', async () => {
+    const auth = createAuth({ mode: 'proxy-header', proxyRoleHeader: 'x-forwarded-groups', proxyAdminGroup: 'defsec-admins' });
+    const gated = await startConsole(createDemoBackend(), { auth });
+    const ro = await startConsole(createDemoBackend({ enableAdmin: false }));
+    const obs = { headers: { 'X-Forwarded-User': 'bob', 'X-Forwarded-Groups': 'viewers' } };
+    const adm = { headers: { 'X-Forwarded-User': 'alice', 'X-Forwarded-Groups': 'defsec-admins' } };
+    const mutations = [
+      ['/api/admin/hosts/edge-vm-12/discovery/advance', {}],
+      ['/api/admin/hosts/edge-vm-12/monitoring/grant', { principal_id: 'p', max_watches: 1 }],
+      ['/api/admin/monitoring/candidates/13/corroborate', { rationale: 'r' }],
+      ['/api/admin/hosts/edge-vm-12/monitoring/mon-cron-service/rollback', { expected_baseline: 36, rationale: 'r' }],
+      ['/api/admin/hosts/edge-vm-12/review-schedule', { interval_seconds: 3600, question: 'q', collectors: ['sockets.listening'] }],
+      ['/api/admin/hosts/edge-vm-12/review-schedule/cancel', {}],
+      ['/api/admin/actions/x/reconcile', { evidence_ref: 'e', rationale: 'r' }],
+    ];
+    try {
+      for (const p of ['/api/hosts/edge-vm-12/profile', '/api/hosts/edge-vm-12/discovery', '/api/hosts/edge-vm-12/monitoring', '/api/hosts/edge-vm-12/review', '/api/incidents/inc-2026-0042/followups']) {
+        const r = await get(gated.port, p, obs);
+        assert.equal(r.status, 200, `${p}: ${r.text}`);
+        assert.ok(!TOKENISH.test(r.text), `${p} leaks a token-like key`);
+      }
+      for (const [p, body] of mutations) {
+        const r = await post(gated.port, p, body, obs);
+        assert.equal(r.status, 403, p);
+        assert.equal(r.json.error.code, 'admin_role_required', p);
+        assert.equal((await post(gated.port, p, body, { headers: { ...adm.headers, Origin: 'http://evil.example' } })).status, 403, `${p} cross-origin`);
+        const off = await post(ro.port, p, body);
+        assert.equal(off.status, 403, p);
+        assert.equal(off.json.error.code, 'admin_disabled', p);
+      }
+      assert.equal((await get(gated.port, '/api/admin/actions/x/verification', obs)).json.error.code, 'admin_role_required');
+      const before = (await get(gated.port, '/api/hosts/edge-vm-12/monitoring', adm)).json.candidates.find((c) => c.candidate_id === 13).state;
+      assert.equal(before, 'provisional', 'refused observer mutations changed nothing');
+      assert.equal((await post(gated.port, '/api/admin/monitoring/candidates/13/corroborate', { rationale: 'ok' }, adm)).json.allowed, true);
+      for (const p of ['/api/hosts/edge-vm-12/monitoring', '/api/hosts/edge-vm-12/review']) {
+        const r = (await get(ro.port, p)).json;
+        assert.deepEqual([r.available, r.reason], [false, 'admin_disabled'], p);
+      }
+      assert.equal((await get(ro.port, '/api/hosts/edge-vm-12/discovery')).json.available, true, 'discovery reads the investigation interface');
+    } finally {
+      await gated.app.close();
+      await ro.app.close();
+    }
+  });
+});
+
+describe('adaptive investigator over a mock control-d', () => {
+  const HOST = 'quiet-01';
+  const now = () => new Date().toISOString();
+  const hashOf = (c) => sha256Hex(c);
+  const assessment = (version) => ({
+    host_id: HOST,
+    version,
+    deadline: now(),
+    collectors: [
+      { collector: 'sockets.listening', evidence: { watch_id: 'discovery-a', spec_version: 1, observation_id: 11, state_hash: hashOf('s'), status: 'ok' }, gap: null },
+      { collector: 'packages.inventory', evidence: null, gap: 'agent_unsupported' },
+    ],
+    interpretations: [{ source_ids: [11], proposal: { purpose: 'p', dependencies: [], uncertainty: 'u', visibility_gaps: ['g'], proposed_watch: { collector: 'sockets.listening', rationale: 'r' }, citations: [11] } }],
+  });
+  const policyEntry = (seq, actor, intent, decision) => ({ seq_no: seq, timestamp: now(), prev_hash: '0'.repeat(64), event_type: 'policy_decision', actor, request_id: `r${seq}`, payload: { policy_version: 1, intent, decision }, entry_hash: '0'.repeat(64) });
+
+  test('exact P11–P18 frames, token isolation, and no token in any response', async () => {
+    const dir = shortTmp('dsp-');
+    const inv = path.join(dir, 'iv.sock');
+    const adm = path.join(dir, 'ad.sock');
+    const seen = [];
+    const MINTED = 'minted-discovery-SECRET-token';
+    const invSrv = await mockUdsServer(inv, (frame) => {
+      seen.push({ sock: 'inv', token: frame.capability_token, request: frame.request, keys: Object.keys(frame).sort() });
+      const r = frame.request;
+      switch (r.op) {
+        case 'list_hosts':
+          return { result: 'hosts', hosts: [{ host_id: HOST, agent_version: '0.2.0+host-discovery-v1', liveness_status: 'online', active_bundle_version: 2, last_heartbeat_at: now(), host_profile: { host_tags: ['edge'], expected_services: [], enabled_collectors: ['packages.inventory', 'sockets.listening'] } }] };
+        case 'list_collector_capabilities':
+          return { result: 'capabilities', capabilities: [{ collector_type: 'sockets.listening', schema_version: 1, is_stream: false, sensitivity: 'metadata_sensitive', min_interval_seconds: 15, description: 'd', declared_privileges: [] }] };
+        case 'list_active_watches':
+          return { result: 'watches', watches: [] };
+        case 'query_observations':
+          return { result: 'observations', observations: [] };
+        case 'get_host_baseline_summary':
+          return { result: 'baseline_summary', host_id: HOST, baselines: [] };
+        case 'get_host_assessment':
+          return { result: 'host_assessment', assessment: assessment(r.version ?? 3) };
+        case 'get_host_discovery_samples':
+          return { result: 'host_discovery_samples', samples: [{ collector: 'sockets.listening', evidence: assessment(3).collectors[0].evidence, sample: { count: 1, partial_attribution: false, sockets: [{ socket_key: 'tcp:0.0.0.0:22', protocol: 'tcp', local_addr: '0.0.0.0', local_port: 22, uid: 0, inode: 1, pid: 1, comm: 'sshd', systemd_unit: 'ssh.service' }] }, omitted_entries: 0 }] };
+        case 'list_host_interpretation_attempts':
+          return { result: 'host_interpretation_attempts', attempts: [{ status: 'saved', lease_until: now(), retry_at: now(), usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 0, reasoning_tokens: 1, cache_creation_input_tokens: 0 }, error: null, assessment_version: 3, lease_token: 'LEASE-LEAK' }] };
+        case 'advance_host_discovery':
+          return { result: 'host_discovery_advanced', host_id: HOST, bundle_version: 4 };
+        case 'list_watch_followups':
+          return { result: 'watch_followups', followups: [{ proposal_id: 5, origin_run: 'run-1', watch_id: 'ephem-1', spec_version: 1, question: 'q?', status: 'answered', deadline: now(), observation_id: 12, finding_id: 9, run_token: 'RUN-LEAK' }] };
+        case 'get_incident_context':
+          return { result: 'incident_context', incident: { incident_id: 'inc-1', host_id: HOST }, active_watches: [], recent_observations: [], findings: [{ finding_id: 9, finding: { kind: 'hypothesis', severity: 'info', summary: 'yes', interpretation: 'supports', evidence_observation_ids: [12] } }] };
+        default:
+          return { result: 'error', code: 'invalid_request', message: `unexpected ${r.op}` };
+      }
+    });
+    const audit = [
+      policyEntry(1, 'operator', { admin_op: 'set_monitoring_grant', host_id: HOST, principal_id: 'inv-1', max_watches: 2, allow_promotion: true }, { allowed: true }),
+      policyEntry(2, 'inv-1', { host_id: HOST, watch_id: 'mon-a', change: { operation: 'apply', spec: { version: 1, collector: { type: 'systemd.unit_state', parameters: { unit: 'cron.service' } }, schedule: { interval_seconds: 60 } }, expected_revision: 0, purpose: 'p', expected_signal: 's', evidence: [11], review_at: now() } }, { allowed: true, revision: 1 }),
+      policyEntry(3, 'inv-1', { host_id: HOST, watch_id: 'mon-a', change: { operation: 'provisional', observations: [20, 21], rationale: 'stable' } }, { allowed: true, candidate_id: 7 }),
+      policyEntry(4, 'operator', { admin_op: 'set_monitoring_grant', host_id: 'other-host', principal_id: 'x', max_watches: 1, allow_promotion: false }, { allowed: true }),
+    ];
+    const admSrv = await mockUdsServer(adm, (frame) => {
+      seen.push({ sock: 'adm', request: frame });
+      switch (frame.admin_op) {
+        case 'mint_capability_token':
+          return { admin_result: 'token_minted', token: MINTED, expires_at: now() };
+        case 'list_audit_entries':
+          return { admin_result: 'audit_entries', entries: audit };
+        case 'set_monitoring_grant':
+        case 'corroborate_monitoring':
+          return { admin_result: 'monitoring', result: { allowed: true } };
+        case 'rollback_monitoring':
+          return { admin_result: 'monitoring', result: { allowed: false, reason: 'expected managed baseline is no longer current' } };
+        case 'get_latest_host_review':
+          return { admin_result: 'latest_host_review', review: { review_id: 'rv-1', question: 'q', assessment_version: 2, completed_at: now(), interpretation: 'unresolved', summary: 's', citations: [11] } };
+        case 'set_host_review_schedule':
+        case 'cancel_host_review_schedule':
+          return { admin_result: 'host_review_schedule_updated' };
+        case 'get_action_verification':
+        case 'reconcile_action_outcome':
+          return { admin_result: 'action_verification', detail: { intent_id: 'i-1', precondition_observation_id: 30, expected_effect: 'e', recovery_plan: 'r', receipt_checks: [{ receipt_id: 4, receipt_status: 'executed', expected_state: 'inactive', result: 'contradicted', reason: 'Observed service state', deadline: now(), observation_id: 31, state_hash: hashOf('x') }], concurrent_service_changes: [{ receipt_id: 4, before: 28, after: 32, watch_id: 'w2', state_hash: hashOf('y') }], collateral_coverage: 'Up to 20 transitions on other monitored units. Causation unassessed.', operator_reconciliations: frame.admin_op === 'reconcile_action_outcome' ? [{ receipt_id: 4, evidence_ref: frame.evidence_ref, rationale: frame.rationale, recorded_at: now() }] : [], capability_token: 'CAP-LEAK' } };
+        case 'get_action_intent':
+          return { admin_result: 'action_intent_detail', payload: { intent_id: 'i-1', expires_at: new Date(Date.now() + 60_000).toISOString() }, authorized_intent: null, status: 'executed' };
+        default:
+          return { admin_result: 'error', code: 'invalid_request', message: `unexpected ${frame.admin_op}` };
+      }
+    });
+    const { app, port } = await startConsole(createLiveBackend({ investigateSock: inv, token: 'browse-token', adminSock: adm, enableAdmin: true }));
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    const frame = (pred) => seen.filter(pred).map((x) => x.request);
+    try {
+      const prof = track(await get(port, `/api/hosts/${HOST}/profile`));
+      assert.equal(prof.status, 200, prof.text);
+      assert.equal(prof.json.coverage.find((c) => c.collector === 'packages.inventory').state, 'unavailable', 'enabled by profile but not advertised to this scope');
+      assert.deepEqual(frame((x) => x.request.op === 'query_observations').at(-1), { op: 'query_observations', host_id: HOST, limit: 200 });
+
+      const disc = track(await get(port, `/api/hosts/${HOST}/discovery`));
+      assert.equal(disc.status, 200, disc.text);
+      assert.deepEqual(frame((x) => x.request.op === 'get_host_assessment').at(-1), { op: 'get_host_assessment', host_id: HOST }, 'no version key for the latest');
+      assert.deepEqual(frame((x) => x.request.op === 'get_host_discovery_samples').at(-1), { op: 'get_host_discovery_samples', host_id: HOST });
+      assert.deepEqual(frame((x) => x.request.op === 'list_host_interpretation_attempts').at(-1), { op: 'list_host_interpretation_attempts', host_id: HOST, source_ids: [11] });
+      assert.equal(disc.json.attempts[0].attempts[0].usage.input_tokens, 10);
+      track(await get(port, `/api/hosts/${HOST}/discovery?version=2`));
+      assert.deepEqual(frame((x) => x.request.op === 'get_host_assessment').at(-1), { op: 'get_host_assessment', host_id: HOST, version: 2 });
+
+      const adv = track(await post(port, `/api/admin/hosts/${HOST}/discovery/advance`, {}));
+      assert.equal(adv.status, 200, adv.text);
+      assert.deepEqual(adv.json, { host_id: HOST, bundle_version: 4, assessment_version: 3 });
+      assert.deepEqual(frame((x) => x.sock === 'adm' && x.request.admin_op === 'mint_capability_token').at(-1), {
+        admin_op: 'mint_capability_token', principal_id: 'console-discovery', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ['sockets.listening', 'packages.inventory'], allowed_purposes: ['host_discovery'], ttl_seconds: 300,
+      });
+      const advFrames = seen.filter((x) => x.request.op === 'advance_host_discovery');
+      assert.deepEqual(advFrames.map((x) => [x.token, x.request]), [[MINTED, { op: 'advance_host_discovery', host_id: HOST }]], 'only the minted host-scoped token advances discovery');
+      assert.ok(seen.filter((x) => x.sock === 'inv').every((x) => x.keys.join() === 'capability_token,request,request_id'));
+
+      const mon = track(await get(port, `/api/hosts/${HOST}/monitoring`));
+      assert.equal(mon.status, 200, mon.text);
+      assert.deepEqual(frame((x) => x.sock === 'adm' && x.request.admin_op === 'list_audit_entries').at(-1), { admin_op: 'list_audit_entries', limit: 500 });
+      assert.deepEqual(mon.json.grants.map((g) => g.principal_id), ['inv-1'], 'other hosts are not mixed in');
+      assert.deepEqual(mon.json.watches.map((w) => [w.watch_id, w.revision, w.target, w.baseline_state]), [['mon-a', 1, 'cron.service', 'provisional']]);
+      assert.deepEqual(mon.json.candidates.map((c) => [c.candidate_id, c.observations, c.state]), [[7, [20, 21], 'provisional']]);
+
+      track(await post(port, `/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: ' inv-1 ', max_watches: 3, allow_promotion: true, extra: 'dropped' }));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'set_monitoring_grant').at(-1), { admin_op: 'set_monitoring_grant', host_id: HOST, principal_id: 'inv-1', max_watches: 3, allow_promotion: true });
+      track(await post(port, '/api/admin/monitoring/candidates/7/corroborate', { rationale: 'CHG-1' }));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'corroborate_monitoring').at(-1), { admin_op: 'corroborate_monitoring', candidate_id: 7, rationale: 'CHG-1' });
+      const rb = track(await post(port, `/api/admin/hosts/${HOST}/monitoring/mon-a/rollback`, { expected_baseline: '41', rationale: 'r' }));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'rollback_monitoring').at(-1), { admin_op: 'rollback_monitoring', host_id: HOST, watch_id: 'mon-a', expected_baseline: 41, rationale: 'r' });
+      assert.deepEqual([rb.json.allowed, rb.json.reason], [false, 'expected managed baseline is no longer current'], 'a denial is a 200 decision');
+
+      const rev = track(await get(port, `/api/hosts/${HOST}/review`));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'get_latest_host_review').at(-1), { admin_op: 'get_latest_host_review', host_id: HOST });
+      assert.deepEqual([rev.json.freshness.state, rev.json.schedule, rev.json.schedule_visible], ['assessment_advanced', null, false]);
+      track(await post(port, `/api/admin/hosts/${HOST}/review-schedule`, { interval_seconds: 86400, question: 'changed?', collectors: ['sockets.listening', 'packages.inventory', 'sockets.listening'], route: 'host-review' }));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'set_host_review_schedule').at(-1), { admin_op: 'set_host_review_schedule', schedule: { host_id: HOST, interval_seconds: 86400, question: 'changed?', collectors: ['packages.inventory', 'sockets.listening'], route: 'host-review' } });
+      assert.equal(track(await get(port, `/api/hosts/${HOST}/review`)).json.schedule.source, 'console', 'the console remembers what it set; control-d has no read');
+      track(await post(port, `/api/admin/hosts/${HOST}/review-schedule/cancel`, {}));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'cancel_host_review_schedule').at(-1), { admin_op: 'cancel_host_review_schedule', host_id: HOST });
+      assert.equal(track(await get(port, `/api/hosts/${HOST}/review`)).json.schedule, null);
+
+      const fu = track(await get(port, '/api/incidents/inc-1/followups'));
+      assert.deepEqual(frame((x) => x.request.op === 'list_watch_followups').at(-1), { op: 'list_watch_followups', incident_id: 'inc-1' });
+      assert.deepEqual([fu.json.followups[0].interpretation, fu.json.followups[0].summary, fu.json.followups[0].observation_id], ['supports', 'yes', 12]);
+
+      const ver = track(await get(port, '/api/admin/actions/i-1/verification'));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'get_action_verification').at(-1), { admin_op: 'get_action_verification', intent_id: 'i-1' });
+      assert.deepEqual([ver.json.outcome, ver.json.latest_receipt_id, ver.json.reconcile.allowed, ver.json.concurrent_service_changes.length], ['contradicted', 4, true, 1]);
+      const rc = track(await post(port, '/api/admin/actions/i-1/reconcile', { expected_receipt_id: 4, evidence_ref: 'ticket-9', rationale: 'restarted by hand' }));
+      assert.deepEqual(frame((x) => x.request.admin_op === 'reconcile_action_outcome').at(-1), { admin_op: 'reconcile_action_outcome', intent_id: 'i-1', expected_receipt_id: 4, evidence_ref: 'ticket-9', rationale: 'restarted by hand' });
+      assert.deepEqual([rc.json.outcome, rc.json.operator_reconciliations.length, rc.json.reconcile.allowed], ['contradicted', 1, false], 'three records: the attestation does not overwrite the outcome');
+      track(await post(port, '/api/admin/actions/i-1/reconcile', { evidence_ref: 'e', rationale: 'r' }));
+      assert.equal(frame((x) => x.request.admin_op === 'reconcile_action_outcome').at(-1).expected_receipt_id, null, 'null is sent explicitly');
+
+      // Invalid bodies never reach control-d.
+      const count = seen.length;
+      for (const [p, body] of [
+        [`/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: 'p', max_watches: 33 }],
+        [`/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: '', max_watches: 1 }],
+        [`/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: 'p', max_watches: 1, allow_promotion: 'true' }],
+        [`/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: 'p', max_watches: 1, allow_promotion: 1 }],
+        ['/api/admin/monitoring/candidates/abc/corroborate', { rationale: 'r' }],
+        [`/api/admin/hosts/${HOST}/monitoring/mon-a/rollback`, { expected_baseline: 1.5, rationale: 'r' }],
+        [`/api/admin/hosts/${HOST}/review-schedule`, { interval_seconds: 2_592_001, question: 'q', collectors: ['sockets.listening'] }],
+        [`/api/admin/hosts/${HOST}/review-schedule`, { interval_seconds: 3600, question: 'q', collectors: ['journal.unit_events'] }],
+        ['/api/admin/actions/i-1/reconcile', { expected_receipt_id: 'x', evidence_ref: 'e', rationale: 'r' }],
+        ['/api/admin/actions/i-1/reconcile', { evidence_ref: 'e'.repeat(513), rationale: 'r' }],
+      ]) {
+        assert.equal((await post(port, p, body)).status, 400, `${p} ${JSON.stringify(body)}`);
+      }
+      assert.equal(seen.length, count, 'no frame for an invalid body');
+      for (const text of bodies) {
+        for (const secret of ['browse-token', MINTED, 'LEASE-LEAK', 'RUN-LEAK', 'CAP-LEAK']) assert.ok(!text.includes(secret), `${secret} leaked`);
+        assert.ok(!TOKENISH.test(text), `token-like key in ${text.slice(0, 120)}`);
+      }
+    } finally {
+      await app.close();
+      invSrv.close();
+      admSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('admin-fetched monitoring and review data stay behind the browse token\'s host scope', async () => {
+    const dir = shortTmp('dsp-');
+    const inv = path.join(dir, 'iv.sock');
+    const adm = path.join(dir, 'ad.sock');
+    const OUT = 'secret-host';
+    const seen = [];
+    const scoped = (r, ok) => (r.host_id === OUT ? { result: 'error', code: 'forbidden', message: `host '${OUT}' is outside capability scope` } : ok);
+    const invSrv = await mockUdsServer(inv, (frame) => {
+      const r = frame.request;
+      seen.push({ sock: 'inv', request: r });
+      switch (r.op) {
+        case 'list_active_watches':
+          return scoped(r, { result: 'watches', watches: [] });
+        case 'get_host_baseline_summary':
+          return scoped(r, { result: 'baseline_summary', host_id: r.host_id, baselines: [] });
+        case 'get_host_assessment':
+          return scoped(r, { result: 'host_assessment', assessment: assessment(3) });
+        case 'advance_host_discovery':
+          return { result: 'host_discovery_advanced', host_id: HOST, bundle_version: 5 };
+        default:
+          return { result: 'error', code: 'invalid_request', message: `unexpected ${r.op}` };
+      }
+    });
+    let mints = 0;
+    const admSrv = await mockUdsServer(adm, (frame) => {
+      seen.push({ sock: 'adm', request: frame });
+      switch (frame.admin_op) {
+        case 'list_audit_entries':
+          return { admin_result: 'audit_entries', entries: [policyEntry(1, 'operator', { admin_op: 'set_monitoring_grant', host_id: OUT, principal_id: 'hidden-principal', max_watches: 2, allow_promotion: true }, { allowed: true })] };
+        case 'get_latest_host_review':
+          return { admin_result: 'latest_host_review', review: { review_id: 'rv-HIDDEN', question: 'q', assessment_version: 2, completed_at: now(), interpretation: 'contradicts', summary: 'hidden summary', citations: [] } };
+        case 'mint_capability_token':
+          mints += 1;
+          // A control-d from before purpose-scoped tokens rejects the field.
+          if ('allowed_purposes' in frame) return { admin_result: 'error', code: 'invalid_request', message: 'unknown field `allowed_purposes`, expected one of `principal_id`, `role`' };
+          return { admin_result: 'token_minted', token: 'legacy-minted', expires_at: now() };
+        default:
+          return { admin_result: 'error', code: 'invalid_request', message: `unexpected ${frame.admin_op}` };
+      }
+    });
+    const { app, port } = await startConsole(createLiveBackend({ investigateSock: inv, token: 'browse-token', adminSock: adm, enableAdmin: true }));
+    try {
+      for (const p of [`/api/hosts/${OUT}/monitoring`, `/api/hosts/${OUT}/review`]) {
+        const before = seen.filter((x) => x.sock === 'adm').length;
+        const r = await get(port, p);
+        assert.equal(r.status, 403, `${p}: ${r.text}`);
+        assert.equal(r.json.error.code, 'forbidden', p);
+        assert.ok(!/hidden|rv-HIDDEN/.test(r.text), `${p} leaked admin data`);
+        assert.equal(seen.filter((x) => x.sock === 'adm').length, before, `${p}: no admin read before visibility is established`);
+      }
+      const mon = await get(port, `/api/hosts/${HOST}/monitoring`);
+      assert.equal(mon.status, 200, mon.text);
+      assert.deepEqual(mon.json.grants, [], 'other hosts are not mixed in');
+      assert.equal((await get(port, `/api/hosts/${HOST}/review`)).status, 200);
+
+      const adv = await post(port, `/api/admin/hosts/${HOST}/discovery/advance`, {});
+      assert.equal(adv.status, 200, adv.text);
+      const minted = seen.filter((x) => x.sock === 'adm' && x.request.admin_op === 'mint_capability_token').map((x) => x.request);
+      assert.equal(mints, 2);
+      assert.deepEqual(minted[0].allowed_purposes, ['host_discovery'], 'purpose-scoped first');
+      assert.ok(!('allowed_purposes' in minted[1]), 'legacy fallback only after the field is rejected');
+      assert.deepEqual(minted[1], { admin_op: 'mint_capability_token', principal_id: 'console-discovery', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: ['sockets.listening', 'packages.inventory'], ttl_seconds: 300 });
+    } finally {
+      await app.close();
+      invSrv.close();
+      admSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a control-d before P11–P18 degrades every adaptive read to "not available"', async () => {
+    const dir = shortTmp('dsp-');
+    const old = path.join(dir, 'old.sock');
+    const oldAdm = path.join(dir, 'oa.sock');
+    // Pre-P11 control-d: only the Phase 1–10 ops deserialize; anything newer closes the connection.
+    const known = new Set(['list_hosts', 'list_active_watches', 'query_observations', 'get_incident_context']);
+    const oldSrv = await mockUdsServer(old, (f) => {
+      if (!known.has(f.request.op)) return undefined;
+      if (f.request.op === 'list_hosts') return { result: 'hosts', hosts: [{ host_id: HOST, agent_version: '0.1.0', liveness_status: 'online', active_bundle_version: 1, last_heartbeat_at: null }] };
+      if (f.request.op === 'list_active_watches') return { result: 'watches', watches: [] };
+      if (f.request.op === 'query_observations') return { result: 'observations', observations: [] };
+      return { result: 'incident_context', incident: { incident_id: 'inc-1', host_id: HOST }, active_watches: [], recent_observations: [], findings: [] };
+    });
+    const oldAdmSrv = await mockUdsServer(oldAdm, (f) => (f.admin_op === 'list_audit_entries' ? { admin_result: 'audit_entries', entries: [] } : f.admin_op === 'get_action_verification' ? { admin_result: 'error', code: 'invalid_request', message: 'unknown variant `get_action_verification`' } : undefined));
+    const a = await startConsole(createLiveBackend({ investigateSock: old, token: 't', adminSock: oldAdm, enableAdmin: true }));
+    try {
+      for (const p of [`/api/hosts/${HOST}/capabilities`, `/api/hosts/${HOST}/baselines`, `/api/hosts/${HOST}/discovery`, `/api/hosts/${HOST}/review`, '/api/incidents/inc-1/followups', '/api/admin/actions/i-1/verification']) {
+        const r = await get(a.port, p);
+        assert.equal(r.status, 200, `${p}: ${r.text}`);
+        assert.equal(r.json.available, false, p);
+        assert.equal(r.json.reason, 'unsupported', p);
+      }
+      const caps = (await get(a.port, `/api/hosts/${HOST}/capabilities`)).json;
+      assert.deepEqual(caps.capabilities, [], 'older control-d: empty capability list, not an error');
+      assert.deepEqual((await get(a.port, `/api/hosts/${HOST}/baselines`)).json.three_state, []);
+      const prof = (await get(a.port, `/api/hosts/${HOST}/profile`)).json;
+      assert.deepEqual([prof.available, prof.host_profile, prof.capabilities_available], [true, null, false], 'an agent without a profile: support unknown');
+      const mon = (await get(a.port, `/api/hosts/${HOST}/monitoring`)).json;
+      assert.deepEqual([mon.available, mon.grants], [true, []], 'an empty audit window is a valid empty state');
+      assert.equal((await get(a.port, '/api/status')).status, 200);
+    } finally {
+      await a.app.close();
+      oldSrv.close();
+      oldAdmSrv.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('adaptive investigator with target/debug/control-d', { skip: !fs.existsSync(CONTROL_D) && 'control-d binary not built (cargo build -p control-d)' }, () => {
+  const HOST = 'quiet-01';
+  let dir;
+  let child;
+  let adminSock;
+  let invSock;
+  let agentSock;
+  let agent;
+  let browseToken;
+  let stderr = '';
+  const unitSnap = (unit, active, pid) => ({ kind: 'snapshot', data: { unit, load_state: 'loaded', active_state: active, sub_state: active === 'active' ? 'running' : 'dead', unit_file_state: 'enabled', main_pid: pid, main_pid_start_time_ticks: null, exec_start_hash: null, unit_files: [] } });
+
+  class DiscoveryAgent extends FakeAgent {
+    async register() {
+      this.sock.write(encodeFrame({
+        msg: 'register', protocol_version: 1, host_id: this.hostId, agent_version: 'fake-0.0.1+host-discovery-v1',
+        boot_id: 'boot-fake', session_id: this.session, active_bundle_version: 0, active_bundle_digest: null, sent_at: new Date().toISOString(),
+        host_profile: { host_tags: ['edge'], expected_services: [], enabled_collectors: [...EVERY_COLLECTOR].sort() },
+      }));
+      const ack = await this.waitFrame((f) => f.msg === 'register_ack');
+      assert.equal(ack.accepted, true, JSON.stringify(ack));
+    }
+  }
+
+  before(async () => {
+    dir = shortTmp('dsq-');
+    adminSock = path.join(dir, 'ad.sock');
+    invSock = path.join(dir, 'iv.sock');
+    agentSock = path.join(dir, 'ag.sock');
+    child = spawn(CONTROL_D, ['--data-dir', path.join(dir, 'data'), '--agent-sock', agentSock, '--admin-sock', adminSock, '--investigate-sock', invSock], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'warn' } });
+    child.stderr.on('data', (c) => {
+      stderr += c;
+    });
+    assert.ok(await waitFor(() => fs.existsSync(adminSock) && fs.existsSync(invSock) && fs.existsSync(agentSock)), `control-d did not start:\n${stderr}`);
+    const admin = new AdminClient({ socketPath: adminSock });
+    assert.equal((await admin.call({ admin_op: 'enroll_host', host_id: HOST, agent_public_key_hex: null })).admin_result, 'host_enrolled');
+    const spec = {
+      id: 'base-sockets', version: 1, host_id: HOST, class: 'baseline', incident_id: null,
+      collector: { type: 'sockets.listening', parameters: { include_tcp: true, include_udp: true, include_ipv6: true, resolve_process: true } },
+      schedule: { interval_seconds: 60, timeout_seconds: 10 }, trigger: { type: 'set_diff', compare_against: 'last_observed', set_field: 'sockets', identity_key: 'socket_key' },
+      wake_policy: { cooldown_seconds: 60, max_wakeups_per_hour: 30 }, lifecycle: { enabled: true, expires_at: null, max_runs: null },
+    };
+    assert.equal((await admin.call({ admin_op: 'apply_baseline_watch', spec, actor: 'it-operator', rationale: 'fixture' })).admin_result, 'watch_applied');
+    agent = new DiscoveryAgent(agentSock, HOST);
+    await agent.connect();
+    await agent.register();
+    await agent.push('base-sockets', 'sockets.listening', sockSnapshot([liveSocket(22, 'sshd', 'ssh.service', 101)]));
+    browseToken = (await admin.call({ admin_op: 'mint_capability_token', principal_id: 'console-browse', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: EVERY_COLLECTOR, ttl_seconds: 900 })).token;
+    assert.ok(browseToken);
+  });
+
+  after(async () => {
+    agent?.close();
+    await stopChild(child);
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('quiet host: profile, discovery, delegated monitoring, reviews, follow-ups and verification against real control-d', async () => {
+    const backend = createLiveBackend({ investigateSock: invSock, token: browseToken, adminSock, enableAdmin: true });
+    const { app, port } = await startConsole(backend);
+    const bodies = [];
+    const track = (r) => (bodies.push(r.text), r);
+    const admin = new AdminClient({ socketPath: adminSock });
+    const tokens = [browseToken];
+    try {
+      // P11
+      const prof = track(await get(port, `/api/hosts/${HOST}/profile`));
+      assert.equal(prof.status, 200, prof.text);
+      assert.deepEqual(prof.json.host_profile, { host_tags: ['edge'], expected_services: [], enabled_collectors: prof.json.host_profile.enabled_collectors });
+      assert.equal(prof.json.host_profile.enabled_collectors.length, 6);
+      assert.equal(prof.json.discovery_support, true);
+      assert.equal(prof.json.coverage.find((c) => c.collector === 'sockets.listening').state, 'covered');
+      assert.equal(track(await get(port, `/api/hosts/${HOST}/capabilities`)).json.capabilities.length, 6, 'all six collectors advertised to this scope');
+
+      // P15: enrollment queued discovery; the console advances it with a one-call grant.
+      const d1 = track(await get(port, `/api/hosts/${HOST}/discovery`)).json;
+      assert.equal(d1.available, true, JSON.stringify(d1));
+      assert.deepEqual(d1.assessment.collectors.map((c) => c.gap), ['awaiting_agent', 'awaiting_agent']);
+      const adv = track(await post(port, `/api/admin/hosts/${HOST}/discovery/advance`, {}));
+      assert.equal(adv.status, 200, adv.text);
+      assert.equal(adv.json.host_id, HOST);
+      assert.equal(typeof adv.json.bundle_version, 'number', 'discovery watches were issued in a signed bundle');
+      const watches = track(await get(port, `/api/hosts/${HOST}/watches`)).json.watches.filter((w) => w.id.startsWith('discovery-'));
+      assert.deepEqual(watches.map((w) => w.collector.type).sort(), ['packages.inventory', 'sockets.listening']);
+      for (const w of watches) {
+        const payload = w.collector.type === 'sockets.listening'
+          ? sockSnapshot([liveSocket(22, 'sshd', 'ssh.service', 101)])
+          : { kind: 'snapshot', data: { packages: [{ package_key: 'cron:amd64', name: 'cron', arch: 'amd64', version: '3.0pl1-184' }, { package_key: 'openssh-server:amd64', name: 'openssh-server', arch: 'amd64', version: '1:9.7p1-7' }], total_packages: 2, status_file_sha256: sha256Hex('dpkg'), malformed_stanzas: 0 } };
+        await agent.push(w.id, w.collector.type, payload);
+      }
+      const adv2 = track(await post(port, `/api/admin/hosts/${HOST}/discovery/advance`, {}));
+      assert.equal(adv2.status, 200, adv2.text);
+      const d2 = track(await get(port, `/api/hosts/${HOST}/discovery`)).json;
+      assert.ok(d2.assessment.collectors.every((c) => c.evidence && c.gap === null), JSON.stringify(d2.assessment));
+      assert.deepEqual(d2.samples.map((s) => s.collector).sort(), ['packages.inventory', 'sockets.listening']);
+      assert.equal(d2.samples.find((s) => s.collector === 'packages.inventory').entries[0].name, 'cron');
+      assert.equal(d2.source_ids.length, 2);
+      assert.deepEqual(d2.attempts, [{ source_ids: d2.source_ids, attempts: [] }]);
+      const v1 = track(await get(port, `/api/hosts/${HOST}/discovery?version=1`)).json;
+      assert.equal(v1.assessment.version, 1, 'earlier revisions stay readable');
+      const audit0 = track(await get(port, '/api/admin/audit?limit=500')).json;
+      assert.ok(audit0.entries.some((e) => e.event_type === 'capability_minted' && JSON.stringify(e.payload).includes('console-discovery')));
+
+      // P16: grant, then a real investigator applies a watch and records a provisional expectation.
+      const grant = track(await post(port, `/api/admin/hosts/${HOST}/monitoring/grant`, { principal_id: 'it-investigator', max_watches: 2, allow_promotion: true }));
+      assert.equal(grant.json.allowed, true, grant.text);
+      const invToken = (await admin.call({ admin_op: 'mint_capability_token', principal_id: 'it-investigator', role: 'investigator', allowed_hosts: [HOST], allowed_collectors: EVERY_COLLECTOR, ttl_seconds: 600 })).token;
+      tokens.push(invToken);
+      const investigator = new InvestigationClient({ socketPath: invSock, token: invToken });
+      const evidence = track(await get(port, `/api/hosts/${HOST}/observations?watch_id=base-sockets`)).json.observations.map((o) => o.observation_id);
+      const mon = {
+        id: 'mon-cron', version: 1, host_id: HOST, class: 'baseline', incident_id: null,
+        collector: { type: 'systemd.unit_state', parameters: { unit: 'cron.service', hash_unit_files: false } },
+        schedule: { interval_seconds: 60, timeout_seconds: 10 }, trigger: { type: 'field_changed', compare_against: 'last_observed', fields: ['active_state'] },
+        wake_policy: { cooldown_seconds: 60, max_wakeups_per_hour: 6 }, lifecycle: { enabled: true, expires_at: null, max_runs: null },
+      };
+      const applied = await investigator.call({ op: 'monitoring', host_id: HOST, watch_id: 'mon-cron', change: { operation: 'apply', spec: mon, expected_revision: 0, purpose: 'quiet batch worker: watch its only scheduler', expected_signal: 'cron leaves active', evidence: evidence.slice(0, 1), review_at: new Date(Date.now() + 7 * 86_400_000).toISOString() } });
+      assert.equal(applied.result, 'monitoring', JSON.stringify(applied));
+      assert.equal(applied.detail.allowed, true, JSON.stringify(applied));
+      await agent.push('mon-cron', 'systemd.unit_state', unitSnap('cron.service', 'active', 702), { observedAt: new Date(Date.now() - 20_000) });
+      await agent.push('mon-cron', 'systemd.unit_state', unitSnap('cron.service', 'active', 702));
+      const pair = track(await get(port, `/api/hosts/${HOST}/observations?watch_id=mon-cron`)).json.observations.map((o) => o.observation_id).sort((a, b) => a - b);
+      const prov = await investigator.call({ op: 'monitoring', host_id: HOST, watch_id: 'mon-cron', change: { operation: 'provisional', observations: pair.slice(-2), rationale: 'stable for twenty seconds' } });
+      assert.equal(prov.detail.allowed, true, JSON.stringify(prov));
+      const candidate = prov.detail.candidate_id;
+      let m = track(await get(port, `/api/hosts/${HOST}/monitoring`)).json;
+      assert.deepEqual(m.grants.map((g) => [g.principal_id, g.max_watches, g.allow_promotion]), [['it-investigator', 2, true]]);
+      assert.deepEqual(m.watches.map((w) => [w.watch_id, w.revision, w.principal_id, w.target, w.baseline_state]), [['mon-cron', 1, 'it-investigator', 'cron.service', 'provisional']]);
+      assert.deepEqual(m.candidates.map((c) => [c.candidate_id, c.state]), [[candidate, 'provisional']]);
+      const early = await investigator.call({ op: 'monitoring', host_id: HOST, watch_id: 'mon-cron', change: { operation: 'promote', candidate_id: candidate, expected_baseline: null } });
+      assert.equal(early.detail.allowed, false, 'promotion needs operator corroboration first');
+      const corr = track(await post(port, `/api/admin/monitoring/candidates/${candidate}/corroborate`, { rationale: 'matches the golden image' }));
+      assert.equal(corr.json.allowed, true, corr.text);
+      assert.equal(track(await post(port, `/api/admin/monitoring/candidates/${candidate}/corroborate`, { rationale: 'again' })).json.allowed, false);
+      const promoted = await investigator.call({ op: 'monitoring', host_id: HOST, watch_id: 'mon-cron', change: { operation: 'promote', candidate_id: candidate, expected_baseline: null } });
+      assert.equal(promoted.detail.allowed, true, JSON.stringify(promoted));
+      const revision = promoted.detail.baseline;
+      m = track(await get(port, `/api/hosts/${HOST}/monitoring`)).json;
+      assert.deepEqual([m.watches[0].baseline_state, m.watches[0].baseline_revision, m.candidates[0].state], ['trusted', revision, 'trusted']);
+      const rb = track(await post(port, `/api/admin/hosts/${HOST}/monitoring/mon-cron/rollback`, { expected_baseline: revision, rationale: 'recapture after upgrade' }));
+      assert.deepEqual([rb.json.allowed, rb.json.baseline, rb.json.rolled_back], [true, null, revision], rb.text);
+      const again = track(await post(port, `/api/admin/hosts/${HOST}/monitoring/mon-cron/rollback`, { expected_baseline: revision, rationale: 'twice' }));
+      assert.deepEqual([again.status, again.json.allowed], [200, false]);
+      assert.equal(track(await get(port, `/api/hosts/${HOST}/monitoring`)).json.candidates[0].state, 'rolled_back');
+
+      // P17
+      const r0 = track(await get(port, `/api/hosts/${HOST}/review`)).json;
+      assert.deepEqual([r0.available, r0.review, r0.freshness.state], [true, null, 'never_reviewed']);
+      assert.equal(track(await post(port, `/api/admin/hosts/${HOST}/review-schedule`, { interval_seconds: 3600, question: 'Has the role changed?', collectors: ['sockets.listening', 'packages.inventory'], route: 'host-review' })).status, 200);
+      const r1 = track(await get(port, `/api/hosts/${HOST}/review`)).json;
+      assert.deepEqual([r1.schedule.source, r1.freshness.state], ['console', 'awaiting_first_review']);
+      assert.equal(track(await post(port, `/api/admin/hosts/${HOST}/review-schedule/cancel`, {})).status, 200);
+      assert.equal(track(await post(port, '/api/admin/hosts/nope-9/review-schedule', { interval_seconds: 3600, question: 'q', collectors: ['sockets.listening'] })).status, 404);
+
+      // P14 + P18: a drift opens an incident; an operator session proposes a dual-signed stop.
+      await agent.push('base-sockets', 'sockets.listening', sockSnapshot([liveSocket(22, 'sshd', 'ssh.service', 101), liveSocket(4444, 'helperd', 'custom-helper.service', 202)]));
+      let incident = null;
+      assert.ok(await waitFor(async () => {
+        incident = (await get(port, '/api/incidents')).json.incidents.find((i) => i.host_id === HOST && i.status === 'open');
+        return Boolean(incident);
+      }), `no incident opened:\n${stderr}`);
+      const fu = track(await get(port, `/api/incidents/${incident.incident_id}/followups`)).json;
+      assert.deepEqual([fu.available, fu.followups], [true, []]);
+      assert.equal(track(await post(port, `/api/incidents/${incident.incident_id}/runs`, {})).status, 200);
+      const ctx = track(await get(port, `/api/incidents/${incident.incident_id}`)).json;
+      const ev = ctx.recent_observations.filter((o) => o.watch_id === 'base-sockets').map((o) => o.observation_id);
+      const stop = (unit, ids) => post(port, `/api/incidents/${incident.incident_id}/actions`, { verb: { verb: 'systemd_stop_unit', unit, ttl_seconds: 600 }, evidence_observation_ids: ids, expected_effect: `${unit} stops`, blast_radius: 'one unit', rollback_plan: 'restart on TTL' });
+      // P18 precondition: a stop must cite a current active sample of the target unit.
+      const blind = track(await stop('custom-helper.service', ev.slice(0, 1)));
+      assert.deepEqual([blind.json.decision.allowed, blind.json.decision.rule_id, blind.json.intent_id], [false, 'action.missing_service_precondition', null]);
+      const precondition = pair.at(-1);
+      const proposed = track(await stop('cron.service', [precondition]));
+      assert.equal(proposed.status, 200, proposed.text);
+      assert.ok(proposed.json.intent_id, proposed.text);
+      const ver = track(await get(port, `/api/admin/actions/${proposed.json.intent_id}/verification`));
+      assert.equal(ver.status, 200, ver.text);
+      assert.deepEqual(Object.keys(ver.json).sort(), VERIFICATION_KEYS);
+      assert.deepEqual([ver.json.outcome, ver.json.receipt_checks, ver.json.operator_reconciliations, ver.json.reconcile.allowed], ['no_receipt', [], [], false]);
+      assert.equal(ver.json.precondition_observation_id, precondition, 'control-d bound the pre-dispatch service sample to the intent');
+      assert.equal(ver.json.expected_effect, 'cron.service stops');
+      const refused = track(await post(port, `/api/admin/actions/${proposed.json.intent_id}/reconcile`, { expected_receipt_id: null, evidence_ref: 'ticket', rationale: 'nothing ran' }));
+      assert.equal(refused.status, 403, refused.text);
+      assert.match(refused.json.error.message, /latest receipt or expired unreceipted authorization required/);
+      assert.equal(track(await get(port, `/api/admin/actions/${crypto.randomUUID()}/verification`)).status, 404);
+
+      const audit = track(await get(port, '/api/admin/audit?limit=500')).json;
+      assert.equal(audit.chain.valid, true);
+      assert.equal(audit.independent.valid, true, 'the console recomputes the same chain head as Rust');
+      for (const op of ['set_monitoring_grant', 'corroborate_monitoring', 'rollback_monitoring']) {
+        assert.ok(audit.entries.some((e) => e.event_type === 'policy_decision' && e.payload?.intent?.admin_op === op), op);
+      }
+      for (const text of bodies) {
+        for (const t of tokens) assert.ok(!text.includes(t), 'a capability token leaked');
+        assert.ok(!TOKENISH.test(text), `token-like key in ${text.slice(0, 160)}`);
+      }
+    } finally {
+      await app.close();
     }
   });
 });
