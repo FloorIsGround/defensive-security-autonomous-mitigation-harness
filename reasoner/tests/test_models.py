@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import threading
+import time
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -17,6 +19,8 @@ import unittest  # noqa: E402
 
 from defsec_reasoner.models import (  # noqa: E402
     AnthropicAdapter,
+    BudgetExhausted,
+    TurnBudget,
     ModelTurnResult,
     OpenAICompatibleAdapter,
     ProviderError,
@@ -50,6 +54,7 @@ class _StubHTTPServer(ThreadingHTTPServer):
     def __init__(self) -> None:
         self.replies: list[tuple[int, str]] = []
         self.requests: list[dict] = []
+        self.redirect_target: str | None = None
         super().__init__(("127.0.0.1", 0), _StubHandler)
 
     @property
@@ -66,9 +71,15 @@ class _StubHandler(BaseHTTPRequestHandler):
         payload = body.encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if server.redirect_target:
+            self.send_header("Location", server.redirect_target)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.server.requests.append(dict(self.headers))
+        self.send_error(400)
 
     def log_message(self, *_args: object) -> None:  # silence
         return
@@ -223,6 +234,47 @@ class TestOpenAICompatibleAdapter(unittest.TestCase):
             self.adapter.chat(MESSAGES, TOOLS)
         self.assertFalse(ctx.exception.retryable)
 
+    def test_provider_error_only_keeps_status_and_recognized_machine_code(self) -> None:
+        errors = [
+            ({"code": "rate_limit_exceeded", "message": "sensitive telemetry"}, "provider HTTP 429 (rate_limit_exceeded)"),
+            ({"type": "sensitive_telemetry", "message": "sensitive telemetry"}, "provider HTTP 429"),
+        ]
+        for error, expected in errors:
+            with self.subTest(expected=expected):
+                self.server.replies.append((429, json.dumps({"error": error})))
+                with self.assertRaises(ProviderError) as ctx:
+                    self.adapter.chat(MESSAGES, TOOLS)
+                self.assertEqual(str(ctx.exception), expected)
+                self.assertTrue(ctx.exception.retryable)
+
+    def test_provider_rejects_responses_over_eight_mib(self) -> None:
+        from io import BytesIO
+
+        with patch("urllib.request.build_opener") as opener:
+            response = BytesIO(b" " * (8 * 1024 * 1024 + 1))
+            opener.return_value.open.return_value = response
+            with self.assertRaisesRegex(ProviderError, "response exceeds size limit"):
+                self.adapter.chat(MESSAGES, TOOLS)
+
+    def test_both_providers_reject_redirects_without_using_ambient_proxies(self) -> None:
+        with _StubHTTPServer() as destination:
+            thread = threading.Thread(target=destination.serve_forever, daemon=True)
+            thread.start()
+            self.server.redirect_target = destination.url + "/collect"
+            anthropic = AnthropicAdapter(base_url=self.server.url, model_id="test-model")
+            try:
+                with patch.dict(os.environ, DEFSEC_OPENAI_API_KEY="synthetic", DEFSEC_ANTHROPIC_API_KEY="synthetic"), \
+                        patch("urllib.request.getproxies", side_effect=AssertionError("ambient proxy lookup")):
+                    for adapter in (self.adapter, anthropic):
+                        for status in (302, 307, 308):
+                            with self.subTest(adapter=type(adapter).__name__, status=status):
+                                self.server.replies.append((status, ""))
+                                with self.assertRaisesRegex(ProviderError, f"HTTP {status}"):
+                                    adapter.chat(MESSAGES, TOOLS)
+                self.assertEqual(destination.requests, [])
+            finally:
+                destination.shutdown()
+
     def test_connection_refused_is_retryable(self) -> None:
         dead = OpenAICompatibleAdapter(base_url="http://127.0.0.1:9/v1", model_id="m", timeout=2.0)
         with self.assertRaises(ProviderError) as ctx:
@@ -284,6 +336,52 @@ class TestAnthropicAdapter(unittest.TestCase):
             adapter.chat(MESSAGES, TOOLS)
         self.assertFalse(ctx.exception.retryable)
 
+
+class TestBudgetedRequests(unittest.TestCase):
+    def test_preflight_counts_tools_and_history(self) -> None:
+        adapters = [OpenAICompatibleAdapter(), AnthropicAdapter()]
+        with patch("defsec_reasoner.models._http_json") as request:
+            for adapter in adapters:
+                with self.subTest(adapter=type(adapter).__name__):
+                    budget = TurnBudget(500, time.monotonic() + 10)
+                    for messages, tools in [
+                        ([{"role": "user", "content": "x" * 3000}], []),
+                        ([], [{"name": "lookup", "description": "x" * 3000}]),
+                    ]:
+                        with self.assertRaisesRegex(BudgetExhausted, "max_total_tokens"):
+                            adapter.chat_with_budget(messages, tools, budget)
+            request.assert_not_called()
+
+    def test_completion_and_timeout_are_bounded_and_usage_is_retained(self) -> None:
+        cases = [
+            (
+                OpenAICompatibleAdapter(), "max_completion_tokens",
+                {"prompt_tokens": 900, "completion_tokens": 40,
+                 "prompt_tokens_details": {"cached_tokens": 700},
+                 "completion_tokens_details": {"reasoning_tokens": 25}},
+                (900, 40, 700, 25, 0),
+            ),
+            (
+                AnthropicAdapter(), "max_tokens",
+                {"input_tokens": 100, "output_tokens": 40,
+                 "cache_read_input_tokens": 700, "cache_creation_input_tokens": 100},
+                (900, 40, 700, 0, 100),
+            ),
+        ]
+        for adapter, cap_field, usage, expected in cases:
+            with self.subTest(cap_field=cap_field), patch.object(adapter, "_headers", return_value={}):
+                with patch("defsec_reasoner.models._http_json", return_value={"usage": usage}) as request:
+                    result = adapter.chat_with_budget(MESSAGES, TOOLS, TurnBudget(500, time.monotonic() + 5))
+                    _, body, _, timeout = request.call_args.args
+                    cap = body.pop(cap_field)
+                    self.assertEqual(cap, 500 - (len(json.dumps(body).encode("utf-8")) + 3) // 4)
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, 5)
+                self.assertEqual(
+                    (result.input_tokens, result.output_tokens, result.cached_input_tokens,
+                     result.reasoning_tokens, result.cache_creation_input_tokens),
+                    expected,
+                )
 
 if __name__ == "__main__":
     unittest.main()

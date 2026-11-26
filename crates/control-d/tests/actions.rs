@@ -111,6 +111,7 @@ impl Fixture {
             principal_id: "tester".into(),
             role,
             allowed_hosts: vec!["edge".into(), "foreign".into()],
+            allowed_purposes: None,
             allowed_collectors: vec![CollectorType::SocketsListening],
             incident_id: incident.map(str::to_owned),
             ttl_seconds: 3600,
@@ -218,7 +219,7 @@ fn migrates_v1_without_rewriting_existing_records() {
         let version: i32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, control_d::ledger::SCHEMA_VERSION);
         let agent: String = db
             .query_row(
                 "SELECT agent_version FROM hosts WHERE host_id='legacy'",
@@ -597,6 +598,21 @@ fn isolation_requires_an_independent_operator_signature_and_records_receipts() {
             .unwrap(),
         2
     );
+    let details = f.service.handle_admin_request(AdminRequest::GetActionVerification { intent_id: intent_id.clone() });
+    let AdminResponse::ActionVerification { detail } = details else { panic!("missing verification") };
+    assert_eq!(detail["receipt_checks"][0]["result"], "indeterminate");
+    assert_eq!(detail["receipt_checks"][1]["result"], "indeterminate");
+    let reconcile = |id| f.service.handle_admin_request(AdminRequest::ReconcileActionOutcome {
+        intent_id: intent_id.clone(), expected_receipt_id: Some(id),
+        evidence_ref: "fixture-console-report-1".into(), rationale: "Independent fixture check confirmed restoration".into()
+    });
+    let latest = detail["receipt_checks"][1]["receipt_id"].as_i64().unwrap();
+    assert!(matches!(reconcile(latest - 1), AdminResponse::Error { .. }));
+    for _ in 0..2 {
+        let AdminResponse::ActionVerification { detail } = reconcile(latest) else { panic!("reconciliation") };
+        assert_eq!(detail["operator_reconciliations"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["receipt_checks"][1]["result"], "indeterminate");
+    }
     f.verify_audit(&[
         AuditEventType::ActionProposed,
         AuditEventType::ActionApproved,
@@ -683,4 +699,15 @@ fn proposals_require_the_investigator_role_and_active_matching_run() {
             .unwrap(),
         0
     );
+}
+
+
+#[test]
+fn service_stop_requires_a_fresh_active_sample_of_the_named_unit() {
+    let f = Fixture::new(ActionSafetyConfig::default());
+    let response = f.call(f.proposal("missing-service-evidence", ActionVerb::SystemdStopUnit {
+        unit: "disposable-demo.service".into(), ttl_seconds: Some(60),
+    }, vec![1]));
+    assert!(matches!(response, InvestigationResponse::ActionProposalEvaluated { decision, intent_id: None, .. }
+        if !decision.allowed && decision.rule_id == "action.missing_service_precondition"));
 }

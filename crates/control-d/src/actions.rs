@@ -125,6 +125,25 @@ impl ControlService {
                 "observation evidence is missing or outside incident scope".into();
         }
 
+        if evaluation.decision.allowed && crate::verification::outstanding(db, host, &proposal.verb)? {
+            evaluation.auth_mode = None;
+            evaluation.decision.allowed = false;
+            evaluation.decision.rule_id = "action.awaiting_reconciliation".into();
+            evaluation.decision.reason = "A previous action against this target has an unresolved outcome".into();
+        }
+
+        let mut precondition = None;
+        if evaluation.decision.allowed && let ActionVerb::SystemdStopUnit { unit, .. } = &proposal.verb {
+            precondition = crate::verification::active_service_precondition(
+                db, host, unit, &proposal.evidence_observation_ids, proposal.now,
+            )?;
+            if precondition.is_none() {
+                evaluation.auth_mode = None;
+                evaluation.decision.allowed = false;
+                evaluation.decision.rule_id = "action.missing_service_precondition".into();
+                evaluation.decision.reason = "A service stop must cite a current active sample of the target unit".into();
+            }
+        }
         let decision_json = to_string(&evaluation.decision)?;
         let auth_mode_json = evaluation.auth_mode.as_ref().map(to_string).transpose()?;
         db.execute(
@@ -180,6 +199,7 @@ impl ControlService {
                     to_string(&initial_status)?, to_string(&payload)?, to_string(&control_envelope)?,
                     stamp(proposal.now)],
             )?;
+            crate::verification::prepare(db, &payload, precondition)?;
             if initial_status == ActionIntentStatus::Authorized {
                 authorized_intent = Some(AuthorizedActionIntent {
                     control_envelope,
@@ -270,6 +290,14 @@ impl ControlService {
                 &operator_approval,
             )
             .map_err(|error| ControlError::denied(format!("invalid operator approval: {error}")))?;
+        }
+        if matches!(intent.payload.verb, ActionVerb::SystemdStopUnit { .. })
+            && !crate::verification::precondition_still_active(db, intent_id, now)?
+        {
+            return Err(ControlError::denied("the signed service precondition is no longer current"));
+        }
+        if crate::verification::outstanding(db, &intent.payload.host_id, &intent.payload.verb)? {
+            return Err(ControlError::denied("a previous action against this target needs reconciliation"));
         }
         let recent = recent_actions(db, &intent.payload.host_id, now, true)?;
         let cfg = &self.0.action_safety;
@@ -447,7 +475,8 @@ pub(super) fn record_receipt(db: &Connection, receipt: ActionReceipt) -> Result<
             | (Executed | DryRunSimulated | VerificationFailed, RolledBack) => {}
             _ => return Err(ControlError::denied("invalid receipt status transition")),
         }
-        let now = stamp(Utc::now());
+        let recorded_at = Utc::now();
+        let now = stamp(recorded_at);
         let status_json = to_string(&receipt.status)?;
         db.execute(
             "INSERT INTO action_receipts (intent_id,host_id,status_json,receipt_json,recorded_at)
@@ -460,6 +489,7 @@ pub(super) fn record_receipt(db: &Connection, receipt: ActionReceipt) -> Result<
                 now
             ],
         )?;
+        crate::verification::open_check(db, db.last_insert_rowid(), &receipt, &intent.payload, recorded_at)?;
         db.execute(
             "UPDATE action_intents SET status_json=?2,updated_at=?3 WHERE intent_id=?1",
             params![receipt.intent_id, status_json, now],

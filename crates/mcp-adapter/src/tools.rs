@@ -52,6 +52,49 @@ pub(crate) fn is_run_tool(name: &str) -> bool {
 
 const READ_TOOLS: &[Tool] = &[
     Tool {
+        name: "correlate_package_snapshots",
+        description: "Compare package presence in the latest recorded discovery snapshots from two selected hosts, with citations and visibility gaps.",
+        schema: || {
+            object(
+                [
+                    (
+                        "host_ids",
+                        json!({"type":"array","items":string(),"minItems":2,"maxItems":2,"uniqueItems":true}),
+                    ),
+                    (
+                        "package_name",
+                        json!({"type":"string","minLength":1,"maxLength":256}),
+                    ),
+                    (
+                        "max_age_seconds",
+                        json!({"type":"integer","minimum":1,"maximum":u32::MAX}),
+                    ),
+                ],
+                [],
+            )
+        },
+    },
+    Tool {
+        name: "get_host_discovery_samples",
+        description: "Read bounded one-shot discovery samples within the host and collector grant.",
+        schema: || object([("host_id", string())], []),
+    },
+    Tool {
+        name: "list_host_interpretation_attempts",
+        description: "Inspect model attempt status, retry deadlines and reported usage for an exact set of host discovery samples.",
+        schema: || object([("host_id", string()), ("source_ids", array(signed()))], []),
+    },
+    Tool {
+        name: "get_host_assessment",
+        description: "Get versioned host discovery coverage and proposed interpretations with evidence citations.",
+        schema: || {
+            object(
+                [("host_id", string())],
+                [("version", nullable(unsigned(u32::MAX.into())))],
+            )
+        },
+    },
+    Tool {
         name: "list_hosts",
         description: "List enrolled hosts in the capability scope, optionally filtered by host tag.",
         schema: || {
@@ -86,6 +129,11 @@ const READ_TOOLS: &[Tool] = &[
         name: "list_collector_capabilities",
         description: "List typed collectors available for a host within scope.",
         schema: host_schema,
+    },
+    Tool {
+        name: "list_watch_followups",
+        description: "Read recent evidence questions and their status for one incident.",
+        schema: || object([("incident_id", string())], []),
     },
     Tool {
         name: "get_incident_context",
@@ -148,6 +196,11 @@ const READ_TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "get_action_verification",
+        description: "Read the scoped service-state evidence for an action receipt and its recovery.",
+        schema: || object([("intent_id", string())], []),
+    },
+    Tool {
         name: "list_actions",
         description: "List mitigation action intents within the capability scope.",
         schema: || {
@@ -182,23 +235,71 @@ const READ_TOOLS: &[Tool] = &[
     },
 ];
 
-const INVESTIGATOR_TOOLS: &[Tool] = &[Tool {
-    name: "start_investigation_run",
-    description: "Start a scoped investigation run for an incident.",
-    schema: || {
-        object(
-            [
-                ("incident_id", string()),
-                ("backend_id", string()),
-                ("model_id", string()),
-                ("prompt_schema_version", string()),
-            ],
-            [],
-        )
+const ADVANCE_HOST_DISCOVERY: Tool = Tool {
+    name: "advance_host_discovery",
+    description: "Advance the enrolled host's bounded socket and package discovery objective.",
+    schema: host_schema,
+};
+
+const INVESTIGATOR_TOOLS: &[Tool] = &[
+    ADVANCE_HOST_DISCOVERY,
+    Tool {
+        name: "start_investigation_run",
+        description: "Start a scoped investigation run for an incident.",
+        schema: || {
+            object(
+                [
+                    ("incident_id", string()),
+                    ("backend_id", string()),
+                    ("model_id", string()),
+                    ("prompt_schema_version", string()),
+                ],
+                [],
+            )
+        },
     },
-}];
+    Tool {
+        name: "monitoring",
+        description: "Inspect, validate, install or renew a durable service watch, or record and promote a baseline candidate within an explicit host monitoring grant.",
+        schema: || {
+            let operation = |name, fields: Vec<(&'static str, Value)>| {
+                object(
+                    [("operation", json!({"const":name}))]
+                        .into_iter()
+                        .chain(fields),
+                    [],
+                )
+            };
+            object(
+                [
+                    ("host_id", string()),
+                    ("watch_id", string()),
+                    (
+                        "change",
+                        json!({"oneOf":[
+                            operation("inspect", vec![]),
+                            operation("test", vec![("spec", watch_schema())]),
+                            operation("apply", vec![
+                                ("spec", watch_schema()), ("expected_revision", unsigned(u32::MAX.into())),
+                                ("purpose", string()), ("expected_signal", string()), ("evidence", array(signed())),
+                                ("review_at", timestamp()),
+                            ]),
+                            operation("provisional", vec![
+                                ("observations", json!({"type":"array","items":signed(),"minItems":2,"maxItems":2})),
+                                ("rationale", string()),
+                            ]),
+                            operation("promote", vec![("candidate_id", signed()), ("expected_baseline", nullable(signed()))]),
+                        ]}),
+                    ),
+                ],
+                [],
+            )
+        },
+    },
+];
 
 const OPERATOR_TOOLS: &[Tool] = &[
+    ADVANCE_HOST_DISCOVERY,
     Tool {
         name: "start_investigation",
         description: "Start a delegated investigation for an open incident.",
@@ -280,8 +381,13 @@ const RUN_TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "activate_expectation_rule",
+        description: "Evaluate a proposed rule for delegated activation using operator-corroborated maintenance and a fresh scoped backtest.",
+        schema: || object([("rule_id", string())], []),
+    },
+    Tool {
         name: "propose_expectation_rule",
-        description: "Submit a typed expectation rule. Accepted proposals include a backtest and require operator approval.",
+        description: "Submit a typed expectation rule. Accepted proposals include a backtest and remain pending until approved or activated under delegated maintenance policy.",
         schema: || object([("idempotency_key", string()), ("rule", rule_schema())], []),
     },
 ];

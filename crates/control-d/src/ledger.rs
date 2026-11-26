@@ -17,7 +17,20 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema_v5.sql"),
     include_str!("schema_v6.sql"),
     include_str!("schema_v7.sql"),
+    include_str!("schema_v8.sql"),
+    include_str!("schema_v9.sql"),
+    include_str!("schema_v10.sql"),
+    include_str!("schema_v11.sql"),
+    include_str!("schema_v12.sql"),
+    include_str!("schema_v13.sql"),
+    include_str!("schema_v14.sql"),
+    include_str!("schema_v15.sql"),
+    include_str!("schema_v16.sql"),
+    include_str!("schema_v17.sql"),
+    include_str!("schema_v18.sql"),
 ];
+
+pub const SCHEMA_VERSION: i32 = MIGRATIONS.len() as i32;
 
 /// Opens the local writer and applies pending migrations atomically.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
@@ -34,6 +47,19 @@ pub fn open(path: impl AsRef<Path>) -> Result<Connection> {
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(version) {
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", index + 1)?;
+    }
+    if version < 11 {
+        let legacy = rows(&tx, "SELECT host_id FROM hosts WHERE host_id NOT IN (SELECT host_id FROM host_discovery)", [], |r| r.get::<_,String>(0))?;
+        for host in legacy {
+            crate::discovery::enqueue(&tx, &host, Utc::now())?;
+        }
+    }
+    if version < 13 {
+        let legacy = rows(&tx, "SELECT payload_json FROM action_intents i WHERE NOT EXISTS
+            (SELECT 1 FROM action_verification_plans p WHERE p.intent_id=i.intent_id)", [], |r| json_column(r,0))?;
+        for intent in legacy {
+            crate::verification::register_legacy(&tx, &intent)?;
+        }
     }
     tx.commit()?;
     Ok(db)

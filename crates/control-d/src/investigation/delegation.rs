@@ -8,6 +8,8 @@ pub(super) struct Start {
     pub model_id: String,
     pub prompt_schema_version: String,
     pub ttl_seconds: Option<u64>,
+    pub trigger_event_id: Option<i64>,
+    pub lease_token: Option<String>,
 }
 
 pub(super) fn start(
@@ -29,6 +31,8 @@ pub(super) fn start(
         model_id,
         prompt_schema_version,
         ttl_seconds,
+        trigger_event_id,
+        lease_token,
     } = start;
     let incident = authorize_incident(db, parent, &incident_id)?;
     require_open(&incident)?;
@@ -39,6 +43,23 @@ pub(super) fn start(
     if ttl == 0 {
         return Err(ControlError::invalid("delegated run TTL must be positive"));
     }
+    let expires_at = parent.expires_at.min(now + Duration::seconds(ttl as i64));
+    let expires_at = match (trigger_event_id, lease_token.as_deref()) {
+        (None, None) => expires_at,
+        (Some(event), Some(token)) => {
+            require_text(token, "lease_token", 128)?;
+            let lease = active_trigger_lease(db, parent, event, token, now)?;
+            if lease.incident_id != incident_id || lease.host_id != incident.host_id {
+                return Err(lease_fenced());
+            }
+            expires_at.min(lease.expires_at)
+        }
+        _ => {
+            return Err(ControlError::invalid(
+                "trigger_event_id and lease_token must be provided together",
+            ));
+        }
+    };
     let active: u32 = db.query_row(
         "SELECT COUNT(*) FROM agent_runs
          WHERE principal_id=?1 AND delegated=1 AND status='active' AND expires_at>?2",
@@ -52,7 +73,6 @@ pub(super) fn start(
         });
     }
     let run_id = uuid();
-    let expires_at = parent.expires_at.min(now + Duration::seconds(ttl as i64));
     let child = ScopedCapability {
         principal_id: parent.principal_id.clone(),
         role: PrincipalRole::Investigator,
@@ -60,14 +80,15 @@ pub(super) fn start(
         incident_id: Some(incident_id.clone()),
         may_spawn_runs: false,
         allowed_hosts: vec![incident.host_id],
+        allowed_purposes: parent.allowed_purposes.clone(),
         allowed_collectors: parent.allowed_collectors.clone(),
         expires_at,
     };
     let (run_token, child_hash) = store_capability_token(db, &child)?;
     db.execute(
         "INSERT INTO agent_runs (run_id,incident_id,token_hash,principal_id,backend_id,
-            model_id,prompt_schema_version,started_at,expires_at,delegated)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1)",
+            model_id,prompt_schema_version,started_at,expires_at,delegated,trigger_event_id,trigger_lease_token)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?11)",
         params![
             run_id,
             incident_id,
@@ -77,7 +98,9 @@ pub(super) fn start(
             model_id,
             prompt_schema_version,
             stamp(now),
-            stamp(expires_at)
+            stamp(expires_at),
+            trigger_event_id,
+            lease_token,
         ],
     )?;
     audit(
@@ -87,7 +110,7 @@ pub(super) fn start(
         request_id,
         json!({"run_id":run_id,"incident_id":incident_id,"backend_id":backend_id,
             "model_id":model_id,"prompt_schema_version":prompt_schema_version,
-            "expires_at":expires_at,"delegated":true}),
+            "expires_at":expires_at,"delegated":true,"trigger_event_id":trigger_event_id}),
     )?;
     Ok(InvestigationResponse::DelegatedRunStarted {
         run_id,
@@ -108,15 +131,38 @@ pub(super) fn cancel(
 ) -> Result<InvestigationResponse> {
     require_investigator(capability)?;
     require_text(reason, "reason", 2048)?;
+    let has_purpose = |purpose| {
+        capability
+            .allowed_purposes
+            .as_ref()
+            .is_none_or(|purposes| purposes.contains(&purpose))
+    };
+    let can_cancel_reactive = capability.run_id.is_none()
+        && capability.may_spawn_runs
+        && has_purpose(defsec_protocol::rpc::CapabilityPurpose::ReactiveIncident);
+    let can_cancel_followup = capability.run_id.is_none()
+        && capability.may_spawn_runs
+        && has_purpose(defsec_protocol::rpc::CapabilityPurpose::WatchFollowup);
     let (incident_id, child_hash, status) = db
         .query_row(
-            "SELECT incident_id,token_hash,status FROM agent_runs WHERE run_id=?1
-         AND (token_hash=?2 OR (delegated=1 AND principal_id=?3 AND ?4))",
+            "SELECT r.incident_id,r.token_hash,r.status FROM agent_runs r WHERE r.run_id=?1
+         AND (
+            r.token_hash=?2
+            OR (
+                r.delegated=1
+                AND r.principal_id=?3
+                AND CASE
+                    WHEN EXISTS (SELECT 1 FROM followup_attempts f WHERE f.run_id = r.run_id) THEN ?5
+                    ELSE ?4
+                END
+            )
+         )",
             params![
                 run_id,
                 hash,
                 capability.principal_id,
-                capability.run_id.is_none() && capability.may_spawn_runs
+                can_cancel_reactive,
+                can_cancel_followup
             ],
             |row| {
                 Ok((

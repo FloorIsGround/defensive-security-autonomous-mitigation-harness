@@ -1,6 +1,8 @@
 # Adaptive Defensive Monitoring Harness — System Design Document
 
-**Status:** Revised Draft for Review (v0.2)  
+**Design history.** This is the v0.2 specification for the original monitoring and reactive investigation milestones. For subsequent development, the [product charter](design/DSAMH_Adaptive_Autonomous_Investigator_Development_Direction.md) takes precedence on investigator autonomy, baseline administration and effectiveness evaluation. Use the [current implementation priorities](design/adaptive-investigator.md) for the transition from incident-driven reasoning to discovery and adaptive monitoring.
+
+**Original status:** Revised Draft for Review (v0.2)
 **Scope:** Read-only defensive monitoring MVP with interactive and automated reasoning (Phases 1–5), fleet hardening (Phase 6), and deferred specialized integrations and gated remediation (Phases 7–8)  
 **Target Environments:** Resource-constrained edge VMs (e.g., dense VMware/ESXi deployments), standard Linux servers, and standalone single-host installs  
 

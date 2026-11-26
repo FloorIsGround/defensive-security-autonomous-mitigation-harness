@@ -199,6 +199,7 @@ impl Fixture {
             principal_id: "worker".into(),
             role,
             allowed_hosts: vec!["edge".into()],
+            allowed_purposes: None,
             allowed_collectors: vec![CollectorType::SocketsListening],
             incident_id,
             ttl_seconds: 300,
@@ -818,7 +819,7 @@ fn migration_from_v4_preserves_data_and_adds_rule_storage() {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            i64::from(control_d::ledger::SCHEMA_VERSION)
         );
         assert_eq!(
             db.query_row("SELECT host_id FROM hosts", [], |r| r.get::<_, String>(0))
@@ -1172,6 +1173,7 @@ fn incident_context_reports_scoped_suppression_with_full_counts_and_capped_keys(
         principal_id: "other-collector-observer".into(),
         role: PrincipalRole::Observer,
         allowed_hosts: vec!["edge".into()],
+        allowed_purposes: None,
         allowed_collectors: vec![CollectorType::FilesMetadata],
         incident_id: None,
         ttl_seconds: 300,
@@ -1211,4 +1213,242 @@ fn incident_context_reports_scoped_suppression_with_full_counts_and_capped_keys(
             ..
         }
     ));
+}
+
+#[test]
+fn delegated_maintenance_needs_its_own_grant_and_preserves_unexplained_drift() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let listener = |unit, port| {
+        let mut item = socket(unit, port);
+        item["socket_key"] = json!(format!("tcp:127.0.0.5:{port}:uid=1000"));
+        item
+    };
+    let maintenance = listener("maintenance.service", 4001);
+    let drift = listener("unexplained.service", 4101);
+    f.put(1, vec![]);
+    f.put(2, vec![drift.clone()]);
+    let incident = f.incident();
+
+    // Adapt the fixture's watch to incident-local coverage.
+    f.db()
+        .execute(
+            "UPDATE watch_specs SET incident_id=?1,
+            spec_json=json_set(spec_json,'$.class','ephemeral','$.incident_id',?1)
+         WHERE host_id='edge' AND watch_id='sockets'",
+            [&incident],
+        )
+        .unwrap();
+    let before = f.put(3, vec![]);
+    let after = f.put(4, vec![maintenance.clone(), drift.clone()]);
+    let (token, run) = f.run(&incident);
+    let mut rule = allow("maintenance.service");
+    rule.expires_at = Some(Utc::now() + Duration::minutes(10));
+    rule.matches = serde_json::from_value(json!([
+        {"op":"eq","field":"protocol","value":"tcp"},
+        {"op":"eq","field":"local_addr","value":"127.0.0.5"},
+        {"op":"eq","field":"local_port","value":4001},
+        {"op":"eq","field":"uid","value":1000},
+        {"op":"eq","field":"systemd_unit","value":"maintenance.service"}
+    ]))
+    .unwrap();
+    let (id, _) = proposal_result(f.propose(&token, &run, "maintenance", rule));
+    let activate = || {
+        f.investigate(
+            &token,
+            InvestigationRequest::ActivateExpectationRule {
+                run_id: run.clone(),
+                rule_id: id.clone(),
+            },
+        )
+    };
+    let grant = |enabled| {
+        f.admin(AdminRequest::SetRuleActivationGrant {
+            host_id: "edge".into(),
+            collector: CollectorType::SocketsListening,
+            principal_id: "worker".into(),
+            enabled,
+            rationale: "maintenance fixture".into(),
+        })
+    };
+    assert!(matches!(
+        f.admin(AdminRequest::SetMonitoringGrant {
+            host_id: "edge".into(),
+            principal_id: "worker".into(),
+            max_watches: 1,
+            allow_promotion: true,
+        }),
+        AdminResponse::Monitoring { .. }
+    ));
+    assert!(matches!(
+        activate(),
+        InvestigationResponse::RuleActivationEvaluated {
+            decision: PolicyDecision { allowed: false, .. },
+            backtest: None,
+        }
+    ));
+    assert!(matches!(
+        grant(true),
+        AdminResponse::RuleMaintenanceEvaluated {
+            decision: PolicyDecision { allowed: true, .. },
+        }
+    ));
+    assert!(matches!(
+        activate(),
+        InvestigationResponse::RuleActivationEvaluated {
+            decision: PolicyDecision { allowed: false, .. },
+            backtest: None,
+        }
+    ));
+    let corroborate = |before_id, after_id| {
+        assert!(matches!(
+            f.admin(AdminRequest::CorroborateRuleMaintenance {
+                rule_id: id.clone(),
+                watch_version: 1,
+                before_id,
+                after_id,
+                rationale: "confirmed maintenance.service listener addition only".into(),
+            }),
+            AdminResponse::RuleMaintenanceEvaluated {
+                decision: PolicyDecision { allowed: true, .. },
+            }
+        ));
+    };
+    corroborate(before, after);
+    let fresh_before = f.put(5, vec![]);
+    let fresh_after = f.put(6, vec![maintenance.clone(), drift.clone()]);
+    assert!(matches!(
+        activate(),
+        InvestigationResponse::RuleActivationEvaluated {
+            decision: PolicyDecision { allowed: false, .. },
+            backtest: None,
+        }
+    ));
+    corroborate(fresh_before, fresh_after);
+    let (first, second) = std::thread::scope(|scope| {
+        let competing = scope.spawn(activate);
+        (activate(), competing.join().unwrap())
+    });
+    let (activation, loser) = if matches!(
+        &first,
+        InvestigationResponse::RuleActivationEvaluated {
+            decision: PolicyDecision { allowed: true, .. },
+            ..
+        }
+    ) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(
+        matches!(
+            loser,
+            InvestigationResponse::RuleActivationEvaluated {
+                decision: PolicyDecision { allowed: false, .. },
+                backtest: None,
+            }
+        ),
+        "{loser:?}"
+    );
+    assert!(
+        matches!(
+            activation,
+            InvestigationResponse::RuleActivationEvaluated {
+                decision: PolicyDecision { allowed: true, .. },
+                backtest: Some(RuleBacktest {
+                    triggered_before: 1,
+                    triggered_after: 1,
+                    items_matched: 1,
+                    ..
+                }),
+            }
+        ),
+        "{activation:?}"
+    );
+
+    f.put(7, vec![]);
+    f.put(8, vec![maintenance.clone(), drift.clone()]);
+    let outcome = f.outcome();
+    assert_eq!(
+        outcome["details"]["added"],
+        json!([drift["socket_key"]]),
+        "{outcome}"
+    );
+    assert_eq!(
+        outcome["details"]["suppressed_by_rules"][&id],
+        json!([maintenance["socket_key"]])
+    );
+    grant(false);
+    f.put(9, vec![]);
+    f.put(10, vec![maintenance, drift]);
+    assert_eq!(f.outcome()["details"]["added"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn incident_rule_pages_filter_collectors_and_other_incidents_before_limit() {
+    let f = Fixture::new(CompareTarget::LastObserved);
+    let host_rule = f.create(allow("host.service"));
+    f.put_snapshot(1, json!({"sockets": []}));
+    f.put_snapshot(2, json!({"sockets": [socket("unexpected.service", 9999)]}));
+    let incident = f.incident();
+    let (token, run) = f.run(&incident);
+    let mut proposed = allow("own.service");
+    proposed.expires_at = Some(Utc::now() + Duration::days(1));
+    let (own_rule, _) = proposal_result(f.propose(&token, &run, "own", proposed));
+    let db = f.db();
+    db.execute_batch("
+        INSERT INTO incidents (incident_id,host_id,status,priority_json,summary,created_at,updated_at)
+        VALUES ('other','edge','open','\"medium\"','unrelated','now','now');
+    ").unwrap();
+    // Clone a genuine proposal and its backtest under each excluded scope.
+    for (id, status, collector, incident_id) in [
+        (
+            "other-proposed",
+            "proposed",
+            "sockets.listening",
+            Some("other"),
+        ),
+        (
+            "other-rejected",
+            "rejected",
+            "sockets.listening",
+            Some("other"),
+        ),
+        ("other-collector", "active", "files.metadata", None),
+    ] {
+        db.execute(
+            "INSERT INTO expectation_rules (rule_id,host_id,collector_type,watch_id,spec_json,status,origin,
+              proposed_by,incident_id,backtest_json,created_at)
+             SELECT ?1,host_id,?2,watch_id,spec_json,?3,origin,proposed_by,?4,backtest_json,'2099-01-01T00:00:00Z'
+             FROM expectation_rules WHERE rule_id=?5",
+            params![id, collector, status, incident_id, own_rule],
+        ).unwrap();
+    }
+    let page = |before| {
+        f.investigate(
+            &token,
+            InvestigationRequest::ListExpectationRules {
+                host_id: Some("edge".into()),
+                statuses: None,
+                limit: Some(1),
+                before,
+            },
+        )
+    };
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: Some(cursor),
+    } = page(None)
+    else {
+        panic!("expected the first visible rule and a continuation");
+    };
+    assert_eq!(rules[0].rule_id, own_rule);
+    assert!(rules[0].backtest.is_some());
+    let InvestigationResponse::ExpectationRules {
+        rules,
+        next_before: None,
+    } = page(Some(cursor))
+    else {
+        panic!("expected the final visible rule");
+    };
+    assert_eq!(rules[0].rule_id, host_rule);
 }

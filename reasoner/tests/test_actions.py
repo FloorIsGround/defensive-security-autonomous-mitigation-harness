@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +34,7 @@ from defsec_reasoner.worker import (  # noqa: E402
     RunBudgets,
 )
 
-from support import FakeControlServer  # noqa: E402
+from support import FakeControlServer, temporary_socket_path  # noqa: E402
 
 TOKEN = "action-test-token"
 
@@ -88,7 +87,7 @@ def tool_results(worker: ReasonerWorker) -> list[Any]:
 
 class ActionTestBase(unittest.TestCase):
     def setUp(self) -> None:
-        self.sock_path = str(Path(tempfile.mkdtemp(prefix="action-t-")) / "i.sock")
+        self.sock_path = temporary_socket_path(self, "action-t-")
         self.server = FakeControlServer(self.sock_path).start()
         self.client = ControlRpcClient(self.sock_path, TOKEN)
 

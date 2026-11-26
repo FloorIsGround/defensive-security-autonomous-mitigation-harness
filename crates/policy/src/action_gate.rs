@@ -513,6 +513,7 @@ mod tests {
             run_id: Some("run-1".into()),
             incident_id: Some("inc-1".into()),
             allowed_hosts: vec!["edge-01".into()],
+            allowed_purposes: None,
             allowed_collectors: vec![CollectorType::SocketsListening],
             expires_at: now + Duration::minutes(15),
         }

@@ -58,6 +58,7 @@ logger = logging.getLogger("defsec.reasoner.harness")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WIRE_PROTOCOL_VERSION = 1
+_MAX_SOCKET_PATH_BYTES = 90
 
 #: The closed collector catalog.
 COLLECTORS = [
@@ -101,6 +102,23 @@ def parse_rfc3339(value: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
+def _socket_path_fits(directory: Path) -> bool:
+    return len(os.fsencode(directory.resolve() / "i.sock")) <= _MAX_SOCKET_PATH_BYTES
+
+
+def make_socket_temp_dir(prefix: str) -> Path:
+    """Create a private temporary directory with room for a short socket name."""
+    directory = Path(tempfile.mkdtemp(prefix=prefix))
+    if _socket_path_fits(directory):
+        return directory
+    directory.rmdir()
+    short_in_tmp = Path(tempfile.mkdtemp(prefix="d"))
+    if _socket_path_fits(short_in_tmp):
+        return short_in_tmp
+    short_in_tmp.rmdir()
+    return Path(tempfile.mkdtemp(prefix="ds-", dir="/tmp"))
+
+
 class ControlDaemon:
     """A real ``control-d`` subprocess with isolated temp state and sockets."""
 
@@ -119,33 +137,37 @@ class ControlDaemon:
         self.startup_timeout = startup_timeout
         self.key_id = key_id
         self.policy_version = policy_version
-        root = Path(base_dir) if base_dir else Path(tempfile.mkdtemp(prefix="dsam-"))
+        root = Path(base_dir) if base_dir else make_socket_temp_dir("dsam-")
         self.base_dir = root
         self.data_dir = root / "data"
-        self.agent_sock = root / "a.sock"
-        self.admin_sock = root / "m.sock"
-        self.investigate_sock = root / "i.sock"
+        socket_dir = root if _socket_path_fits(root) else make_socket_temp_dir("d")
+        self._separate_socket_dir = socket_dir if socket_dir != root else None
+        self._recreate_socket_dir = False
+        self.agent_sock = socket_dir / "a.sock"
+        self.admin_sock = socket_dir / "m.sock"
+        self.investigate_sock = socket_dir / "i.sock"
         self.log_path = root / "control-d.log"
         self._proc: subprocess.Popen[bytes] | None = None
 
     def start(self) -> "ControlDaemon":
         sockets = [self.agent_sock, self.admin_sock, self.investigate_sock]
-        for path in sockets:
-            if len(str(path).encode()) > 100:
-                raise ValueError(f"socket path too long for sun_path: {path}")
-        self._proc = subprocess.Popen(
-            [
-                self.binary,
-                "--data-dir", str(self.data_dir),
-                "--agent-sock", str(self.agent_sock),
-                "--admin-sock", str(self.admin_sock),
-                "--investigate-sock", str(self.investigate_sock),
-                "--key-id", self.key_id,
-                "--policy-version", str(self.policy_version),
-            ],
-            stdout=open(self.log_path, "wb"),
-            stderr=subprocess.STDOUT,
-        )
+        if self._separate_socket_dir is not None and self._recreate_socket_dir:
+            self._separate_socket_dir.mkdir(mode=0o700)
+            self._recreate_socket_dir = False
+        with self.log_path.open("wb") as log:
+            self._proc = subprocess.Popen(
+                [
+                    self.binary,
+                    "--data-dir", str(self.data_dir),
+                    "--agent-sock", str(self.agent_sock),
+                    "--admin-sock", str(self.admin_sock),
+                    "--investigate-sock", str(self.investigate_sock),
+                    "--key-id", self.key_id,
+                    "--policy-version", str(self.policy_version),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
         deadline = time.monotonic() + self.startup_timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
@@ -160,9 +182,7 @@ class ControlDaemon:
 
     def stop(self, timeout: float = 5.0) -> None:
         proc = self._proc
-        if proc is None:
-            return
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=timeout)
@@ -170,6 +190,9 @@ class ControlDaemon:
                 proc.kill()
                 proc.wait(timeout=timeout)
         self._proc = None
+        if self._separate_socket_dir is not None and not self._recreate_socket_dir:
+            shutil.rmtree(self._separate_socket_dir, ignore_errors=True)
+            self._recreate_socket_dir = True
         if not self.keep_data:
             shutil.rmtree(self.base_dir, ignore_errors=True)
 

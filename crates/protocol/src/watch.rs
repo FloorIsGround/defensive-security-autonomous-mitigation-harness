@@ -4,6 +4,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub const HOST_DISCOVERY_AGENT_SUFFIX: &str = "+host-discovery-v1";
+
 pub const WATCH_BUNDLE_SCHEMA_VERSION: u32 = 1;
 
 /// Baseline watches are admin-owned and immutable to reasoning identities.

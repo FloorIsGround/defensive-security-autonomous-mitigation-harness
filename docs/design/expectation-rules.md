@@ -2,6 +2,8 @@
 
 Status: frozen contract for Phase 10 implementation lanes.
 
+P10 introduced operator approval for rule activation. The opt-in maintenance path implements narrow, evidence-backed delegation from the [adaptive investigator design](adaptive-investigator.md).
+
 ## Problem
 
 Set-based watches (`set_diff`, used for `sockets.listening` and, from Phase 11, `connections.outbound` and `packages.inventory`) compare the current set against the accepted baseline (or last observation) exactly. On desktops and dynamic servers this produces constant noise:
@@ -16,7 +18,7 @@ Operators want to say "this service may listen on these ports — whether or not
 
 * No query language, regexes or scripting. Rules are a closed typed schema.
 * Rules never affect collector errors, staleness, liveness or non-set predicates. They are applied only inside `set_diff` evaluation of a *valid* sample.
-* A model can never activate a rule. Model and MCP proposals are inert until an operator approves them on the admin interface.
+* Model and MCP proposals remain inert until operator approval or successful evaluation under the delegated maintenance policy.
 
 ## Schema (`crates/protocol/src/rules.rs`)
 
@@ -214,3 +216,31 @@ Backtests order observations by ledger receipt order and use the watch revision 
 * **mcp-adapter**: `list_expectation_rules` in both modes. `propose_expectation_rule` in investigator (and later operator) mode.
 * **reasoner-d**: a `propose_expectation_rule` tool. Proposals are inert, so it is enabled by default, capped at 3 per run, and the system prompt explains when to use it: benign recurring noise with a clear service anchor, not suspicious activity.
 * **Console**: a Rules view (active, pending with backtest and Approve/Reject, history). The incident diff gains inline "Allow for this service" actions that prefill a rule (unit, comm, uid, protocol, port, loopback scope) and show the backtest before creation.
+
+### Delegated maintenance activation
+
+An admin socket peer can set a grant with `SetRuleActivationGrant` for one
+principal, host, and collector. Monitoring and baseline promotion permissions
+do not confer this grant. A peer corroborates a pending proposal using
+`CorroborateRuleMaintenance`, identifying its watch version, two observation
+IDs, and the basis for treating the listener addition as legitimate
+maintenance. The control plane records the authenticated Unix UID and the
+rationale. Investigators invoke `activate_expectation_rule` through their
+current MCP run. The investigation RPC returns the policy decision and, on
+success, the scoped backtest.
+
+The delegated path supports exact, non-root, high-port loopback listener
+additions on incident-local ephemeral watches. It uses the current watch
+revision and a complete, consecutive observation pair from the same agent
+session, with evidence at most 15 minutes old. The backtest must suppress
+exactly one added listener. Other changes in the same observation remain
+eligible to trigger. Open host incidents outside the rule's incident and
+existing active rules in scope block delegated activation.
+
+At evaluation time the rule applies only to an exact recurrence of the
+corroborated snapshot pair, on the same watch revision, for up to one hour.
+A change in attribution, listener identity, or any other snapshot content can
+cause the recurrence to alert normally. Grant revocation revokes active
+delegated rules, and closing the incident ends their effect. Delegated
+activation uses its own exact-pair backtest. The general historical rule
+backtest reconstructs comparisons and omits these evidence-bound rules.

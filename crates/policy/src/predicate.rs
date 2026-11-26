@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use defsec_protocol::canonical::value_to_canonical_json;
+use defsec_protocol::canonical::{sha256_hex, value_to_canonical_json};
 use defsec_protocol::observation::ObservationStatus;
 use defsec_protocol::watch::{CompareTarget, ThresholdOp, TriggerPredicate};
 use serde::{Deserialize, Serialize};
@@ -177,8 +177,8 @@ pub fn evaluate_predicate(
                     changed.insert(
                         field.clone(),
                         serde_json::json!({
-                            "before": prev_val.cloned().unwrap_or(Value::Null),
-                            "after": cur_val.cloned().unwrap_or(Value::Null),
+                            "before": bounded_diff_value(prev_val),
+                            "after": bounded_diff_value(cur_val),
                         }),
                     );
                 }
@@ -187,9 +187,19 @@ pub fn evaluate_predicate(
             if changed.is_empty() {
                 PredicateOutcome::NotTriggered
             } else {
+                let count = changed.len();
+                let mut details = Value::Object(changed);
+                let encoded = details.to_string();
+                if encoded.len() > 64 * 1024 {
+                    details = serde_json::json!({
+                        "truncated": true,
+                        "changed_fields": count,
+                        "sha256": sha256_hex(encoded.as_bytes()),
+                    });
+                }
                 PredicateOutcome::Triggered {
-                    reason: format!("{} watched field(s) changed", changed.len()),
-                    details: Value::Object(changed),
+                    reason: format!("{count} watched field(s) changed"),
+                    details,
                 }
             }
         }
@@ -316,6 +326,23 @@ pub fn evaluate_predicate(
             }
         }
     }
+}
+
+// Full values stay with the evidence observations.
+fn bounded_diff_value(value: Option<&Value>) -> Value {
+    let Some(value) = value else {
+        return Value::Null;
+    };
+    let canonical = value_to_canonical_json(value).unwrap_or_else(|_| value.to_string());
+    if canonical.len() <= 4096 && value.to_string().len() <= 4096 {
+        return value.clone();
+    }
+    serde_json::json!({
+        "truncated": true,
+        "bytes": canonical.len(),
+        "sha256": sha256_hex(canonical.as_bytes()),
+        "preview": &canonical[..canonical.floor_char_boundary(256)],
+    })
 }
 
 pub fn lookup_field<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -541,5 +568,59 @@ mod tests {
             }
             other => panic!("expected Triggered, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod field_change_limits {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn field_changes_bound_each_value_and_total_serialized_details() {
+        let old = json!({"field": "界".repeat(1700), "small": 1});
+        let new = json!({"field": "\u{0001}".repeat(900), "small": 2});
+        let evaluate = |fields, before: &Value, after: &Value| {
+            let predicate = TriggerPredicate::FieldChanged {
+                compare_against: CompareTarget::LastObserved,
+                fields,
+            };
+            let PredicateOutcome::Triggered { details, .. } = evaluate_predicate(
+                &predicate,
+                ObservationStatus::Ok,
+                Some(after),
+                Some(before),
+                None,
+                None,
+                0,
+                0,
+            ) else {
+                panic!("expected a field change");
+            };
+            details
+        };
+        let details = evaluate(vec!["field".into(), "small".into()], &old, &new);
+        for (side, input) in [("before", &old["field"]), ("after", &new["field"])] {
+            let canonical = value_to_canonical_json(input).unwrap();
+            let truncated = &details["field"][side];
+            assert_eq!(truncated["truncated"], true);
+            assert_eq!(truncated["bytes"], canonical.len());
+            assert_eq!(truncated["sha256"], sha256_hex(canonical.as_bytes()));
+            assert!(truncated["preview"].as_str().unwrap().len() <= 256);
+            assert!(truncated.to_string().len() <= 4096);
+        }
+        assert_eq!(details["small"], json!({"before":1,"after":2}));
+
+        let many: serde_json::Map<String, Value> = (0..40)
+            .map(|i| (format!("field_{i}"), json!("x".repeat(4000))))
+            .collect();
+        let details = evaluate(
+            many.keys().cloned().collect(),
+            &json!({}),
+            &Value::Object(many),
+        );
+        assert_eq!(details["truncated"], true);
+        assert_eq!(details["changed_fields"], 40);
+        assert!(details.to_string().len() <= 64 * 1024);
     }
 }

@@ -13,7 +13,7 @@ flowchart LR
     C[control-d + SQLite]
   end
   subgraph Clients[Reasoning and operator domain]
-    R[reasoner-d]
+    R[Codex investigator and companion workers]
     M[mcp-adapter]
     W[Operator Console]
   end
@@ -24,6 +24,10 @@ flowchart LR
   R & M & W <-->|scoped local UDS| C
   C -. signed intent .-> E
 ```
+
+Run the custom model-adapter worker with `defsec-reasoner worker --socket /path/to/investigate.sock`. It defaults to the mock backend. Use `defsec-reasoner codex-worker --socket /path/to/investigate.sock` for the signed-in Codex CLI investigator. Codex sessions are ephemeral by default. Pass `--persist-sessions` or `--session-dir PATH` to enable session resumption. The controller retains the evidence and run history. Discovery, evidence reassessment and scheduled reviews can use independently configured model workers. [Setup and session lifecycle](docs/operator-agent.md#autonomous-worker)
+
+The next product milestone is blind onboarding. An investigator should be able to learn an enrolled host’s role, document gaps in visibility and design appropriate monitoring before an incident opens. The [development charter](docs/design/DSAMH_Adaptive_Autonomous_Investigator_Development_Direction.md) sets the priorities. The [adaptive investigator design](docs/design/adaptive-investigator.md) maps them to current code and defines the first end-to-end test.
 
 ## Status
 
@@ -68,3 +72,41 @@ cargo build --release --workspace
 Replace the placeholder with the public key returned by enrollment; omit the angle brackets. Socket permissions and peer UID policy must also permit the agent. See the [operator guide](docs/operations-and-deployment.md) for watches and lifecycle operations.
 
 Read the [architecture](docs/architecture.md), [security model](docs/security-model.md), and [design document](docs/adaptive_defensive_monitoring_harness_design_v0.2.md). See [security reporting](SECURITY.md) and [contributing](CONTRIBUTING.md).
+
+### Quiet-host discovery
+
+When no incident trigger is queued, the reasoner advances discovery for enrolled
+hosts within its Investigation capability. Supported agents collect one-shot
+socket and package samples. The reasoner uses bounded excerpts to propose a
+host purpose, dependencies, uncertainty, visibility gaps, and a monitoring
+watch. Control validates the observation citations before saving a versioned
+assessment. Host-scoped investigators and observers can read assessments and samples
+through `get_host_assessment` and `get_host_discovery_samples` over Investigation
+RPC or MCP. A proposed watch is assessment data and requires a separate policy
+workflow to take effect.
+
+Use `correlate_package_snapshots` over Investigation RPC or MCP to compare an
+exact package name across two explicitly selected hosts. Supply two distinct
+`host_ids`, a `package_name`, and a positive `max_age_seconds`. The caller needs
+a host-scoped grant covering both hosts and `packages.inventory`. The tool checks
+each host's latest recorded discovery observation and returns presence, citation
+IDs and hashes, observation and receipt times, and any evidence gap.
+`both_present` is null when either snapshot is incomparable. Shared presence
+does not establish connectivity or causation.
+
+Discovery evidence goes to in-process or loopback models by default. To allow
+export, set `DEFSEC_DISCOVERY_EXPORT_GRANTS` on the reasoner to a JSON array of
+grants. Each grant names one exact HTTPS provider base URL, one enrolled host,
+and the collectors permitted for export. A single grant must cover every
+sample in the interpretation, and the Investigation capability must separately
+authorize access. Discovery requests disable HTTP redirects and environment proxies.
+
+```json
+[
+  {
+    "endpoint": "https://provider.example/v1",
+    "host_id": "node-01",
+    "collectors": ["sockets.listening", "packages.inventory"]
+  }
+]
+```

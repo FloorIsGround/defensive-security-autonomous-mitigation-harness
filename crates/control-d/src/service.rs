@@ -18,6 +18,7 @@ use defsec_protocol::{
         IncidentOpened, PolicyDecision as PolicyDecisionAudited, RunCompleted,
     },
     canonical::sha256_hex,
+    profile::HostProfileSummary,
     rpc::*,
     signing::{DOMAIN_WATCH_BUNDLE_V1, SignedEnvelope, SigningKeyPair, VerifyingKeyStore},
     watch::*,
@@ -156,6 +157,11 @@ impl ControlService {
                 "ledger must be a private regular file owned by control-d",
             ));
         }
+        // Close the verification fd *before* SQLite opens the ledger: on POSIX,
+        // closing any fd referring to the same inode releases all fcntl locks
+        // held by this process, which would drop SQLite's WAL locks and allow
+        // another process closing the database to unlink -wal/-shm under us.
+        drop(ledger_file);
         let db = ledger::open(ledger_path)?;
         Ok(Self(Arc::new(State {
             db: Mutex::new(db),
@@ -324,7 +330,11 @@ impl ControlService {
     }
 
     pub fn handle_admin_request(&self, req: AdminRequest) -> AdminResponse {
-        match self.transaction(|db| self.admin(db, req)) {
+        self.handle_admin_request_as(req, "local-admin")
+    }
+
+    pub(crate) fn handle_admin_request_as(&self, req: AdminRequest, actor: &str) -> AdminResponse {
+        match self.transaction(|db| self.admin(db, req, actor)) {
             Ok(response) => {
                 if matches!(
                     response,
@@ -345,7 +355,12 @@ impl ControlService {
         }
     }
 
-    fn admin(&self, db: &Connection, req: AdminRequest) -> Result<AdminResponse> {
+    fn admin(
+        &self,
+        db: &Connection,
+        req: AdminRequest,
+        admin_actor: &str,
+    ) -> Result<AdminResponse> {
         let now = Utc::now();
         let request = uuid();
         let rule_store = RuleStore {
@@ -355,6 +370,31 @@ impl ControlService {
             policy_version: self.policy().policy_version,
         };
         match req {
+            req @ (AdminRequest::SetRuleActivationGrant { .. }
+            | AdminRequest::CorroborateRuleMaintenance { .. }) => {
+                rule_store.maintenance_admin(req, admin_actor)
+            }
+            req @ (AdminRequest::SetMonitoringGrant { .. }
+            | AdminRequest::CorroborateMonitoring { .. }
+            | AdminRequest::RollbackMonitoring { .. }) => {
+                let result = crate::investigation::monitoring::Monitoring {
+                    service: self,
+                    db,
+                    now,
+                    request: &request,
+                }
+                .admin(req, admin_actor)?;
+                Ok(AdminResponse::Monitoring { result })
+            }
+            AdminRequest::GetLatestHostReview { host_id } => {
+                crate::host_reviews::latest(db, &host_id)
+            }
+            AdminRequest::SetHostReviewSchedule { schedule } => {
+                crate::host_reviews::configure(db, schedule, now)
+            }
+            AdminRequest::CancelHostReviewSchedule { host_id } => {
+                crate::host_reviews::cancel(db, &host_id)
+            }
             AdminRequest::CreateExpectationRule { rule, actor } => rule_store.create(&rule, &actor),
             AdminRequest::DecideExpectationRule {
                 rule_id,
@@ -420,6 +460,7 @@ impl ControlService {
                         ));
                     }
                 }
+                crate::discovery::enqueue(db, &host_id, now)?;
                 Ok(AdminResponse::HostEnrolled {
                     host_id,
                     control_signing_key_id: self.0.key.key_id().into(),
@@ -456,6 +497,7 @@ impl ControlService {
                     run_id: None,
                     incident_id: None,
                     allowed_hosts: vec![],
+                    allowed_purposes: None,
                     allowed_collectors: vec![],
                     expires_at: now + Duration::seconds(1),
                 };
@@ -504,6 +546,15 @@ impl ControlService {
                 let spec = latest_spec(db, &host_id, &watch_id)?
                     .filter(|s| s.class == WatchClass::Baseline)
                     .ok_or_else(|| ControlError::missing("baseline watch does not exist"))?;
+                let managed: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM monitoring_watches WHERE host_id=?1 AND watch_id=?2 AND spec_version=?3)",
+                    params![host_id, watch_id, spec.version], |r| r.get(0),
+                )?;
+                if managed {
+                    return Err(ControlError::denied(
+                        "managed baseline requires a corroborated monitoring candidate",
+                    ));
+                }
                 let (state_hash, sample): (String, String) = db.query_row(
                     "SELECT state_hash,sample_json FROM observations WHERE host_id=?1 AND watch_id=?2 AND spec_version=?3 AND observation_id=?4 AND sample_json IS NOT NULL",
                     params![host_id,watch_id,spec.version,observation_id], |r| Ok((r.get(0)?,r.get(1)?))
@@ -534,6 +585,7 @@ impl ControlService {
                 role,
                 allowed_hosts,
                 allowed_collectors,
+                allowed_purposes,
                 incident_id,
                 ttl_seconds,
             } => {
@@ -570,6 +622,7 @@ impl ControlService {
                     incident_id,
                     allowed_hosts,
                     allowed_collectors,
+                    allowed_purposes,
                     expires_at: ttl,
                 };
                 let (token, hash) = store_capability_token(db, &capability)?;
@@ -671,6 +724,9 @@ impl ControlService {
                 }
                 Ok(response)
             }
+            AdminRequest::ReconcileActionOutcome { intent_id, expected_receipt_id, evidence_ref, rationale } =>
+                crate::verification::reconcile(db, &intent_id, expected_receipt_id, &evidence_ref, &rationale, now),
+            AdminRequest::GetActionVerification { intent_id } => crate::verification::detail(db, &intent_id),
             AdminRequest::GetActionIntent { intent_id } => {
                 actions::get_action_intent(db, &intent_id)
             }
@@ -817,6 +873,49 @@ pub(crate) fn active_watches(
         .into_iter()
         .filter(|w| w.lifecycle.enabled && w.lifecycle.expires_at.is_none_or(|expiry| expiry > now))
         .collect())
+}
+
+/// Preflight delegated changes against every collector in the resulting bundle.
+pub(crate) fn bundle_collector_denial(
+    db: &Connection,
+    host: &str,
+    collectors: impl IntoIterator<Item = CollectorType>,
+) -> Result<Option<(&'static str, String)>> {
+    let (version, profile): (String, Option<HostProfileSummary>) = db.query_row(
+        "SELECT agent_version,profile_json FROM hosts WHERE host_id=?1",
+        [host],
+        |r| Ok((r.get(0)?, optional_json(r, 1)?)),
+    )?;
+    for collector in collectors {
+        if profile
+            .as_ref()
+            .is_some_and(|p| !p.enabled_collectors.contains(&collector))
+        {
+            return Ok(Some((
+                "collector_disabled_by_host_profile",
+                format!(
+                    "collector '{}' is disabled in the reported host profile",
+                    collector.as_str()
+                ),
+            )));
+        }
+        // The package version stayed at 0.1.0 across the collector rollout.
+        // Require the registration marker that confirms support for both newer collectors.
+        if matches!(
+            collector,
+            CollectorType::ConnectionsOutbound | CollectorType::PackagesInventory
+        ) && !version.ends_with(HOST_DISCOVERY_AGENT_SUFFIX)
+        {
+            return Ok(Some((
+                "bundle_incompatible",
+                format!(
+                    "agent has not advertised support for collector '{}'",
+                    collector.as_str()
+                ),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn latest_spec(db: &Connection, host: &str, watch: &str) -> Result<Option<WatchSpec>> {

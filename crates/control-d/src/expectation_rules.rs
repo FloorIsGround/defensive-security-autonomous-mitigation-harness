@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use defsec_policy::{
     edge_floor::is_valid_identifier,
     predicate::{PredicateOutcome, evaluate_predicate},
@@ -12,11 +12,11 @@ use defsec_protocol::{
     canonical::{sha256_hex, to_canonical_json_bytes},
     observation::ObservationStatus,
     rpc::{
-        AdminResponse, ExpectationRuleRecord, IncidentSummary, InvestigationResponse,
+        AdminRequest, AdminResponse, ExpectationRuleRecord, IncidentSummary, InvestigationResponse,
         PolicyDecision, RuleBacktest, ScopedCapability,
     },
-    rules::{ActiveRule, ExpectationRuleSpec, RuleOrigin},
-    watch::{CollectorType, CompareTarget, TriggerPredicate, WatchSpec},
+    rules::{ActiveRule, ExpectationRuleSpec, MatchClause, RuleEffect, RuleOrigin},
+    watch::{CollectorType, CompareTarget, TriggerPredicate, WatchClass, WatchSpec},
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::{Value, json};
@@ -246,7 +246,7 @@ impl RuleStore<'_> {
     pub fn list(
         &self,
         host: Option<&str>,
-        allowed_hosts: Option<&[String]>,
+        capability: Option<&ScopedCapability>,
         statuses: Option<&[String]>,
         limit: Option<u32>,
         before: Option<&str>,
@@ -282,14 +282,18 @@ impl RuleStore<'_> {
                  SELECT *, CASE WHEN status IN ('proposed','active') AND expires_at<=?4 THEN 'expired' ELSE status END AS effective_status
                  FROM expectation_rules WHERE (?1 IS NULL OR host_id=?1)
                    AND (?2 IS NULL OR host_id IN (SELECT value FROM json_each(?2)))
+                   AND (?8 IS NULL OR collector_type IN (SELECT value FROM json_each(?8)))
+                   AND (?9 IS NULL OR incident_id IS NULL OR incident_id=?9)
              )
              WHERE (?3 IS NULL OR effective_status IN (SELECT value FROM json_each(?3)))
                AND (?6 IS NULL OR created_at<?6 OR (created_at=?6 AND rule_id>?7))
              ORDER BY created_at DESC, rule_id
              LIMIT ?5",
-            params![host, allowed_hosts.map(serde_json::to_string).transpose()?,
+            params![host, capability.map(|cap| serde_json::to_string(&cap.allowed_hosts)).transpose()?,
                 statuses.map(serde_json::to_string).transpose()?, stamp(self.now),
-                limit + 1, before_time, before_id],
+                limit + 1, before_time, before_id,
+                capability.map(|cap| serde_json::to_string(&cap.allowed_collectors)).transpose()?,
+                capability.and_then(|cap| cap.incident_id.as_deref())],
             |r| Ok(ExpectationRuleRecord {
                 rule_id: r.get(0)?, status: r.get(1)?, origin: r.get(2)?, proposed_by: r.get(3)?,
                 run_id: r.get(4)?, incident_id: r.get(5)?, spec: json_column(r, 6)?,
@@ -521,6 +525,8 @@ pub(crate) fn active_rules(
         "SELECT rule_id,spec_json FROM expectation_rules
         WHERE host_id=?1 AND collector_type=?2 AND status='active'
           AND (watch_id IS NULL OR watch_id=?3) AND (expires_at IS NULL OR expires_at>?4)
+          AND NOT EXISTS (SELECT 1 FROM rule_maintenance_evidence e
+                          WHERE e.rule_id=expectation_rules.rule_id AND e.activated=1)
         ORDER BY rule_id",
         params![host, collector.as_str(), watch, stamp(now)],
         |r| {
@@ -568,4 +574,404 @@ fn decided(rule_id: String, status: &str) -> AdminResponse {
         rule_id,
         status: status.into(),
     }
+}
+
+impl RuleStore<'_> {
+    fn maintenance_decision(&self, allowed: bool, reason: &str) -> PolicyDecision {
+        PolicyDecision {
+            allowed,
+            rule_id: "rule-gate/delegated-maintenance".into(),
+            reason: reason.into(),
+            policy_version: self.policy_version,
+        }
+    }
+
+    pub fn maintenance_admin(&self, request: AdminRequest, actor: &str) -> Result<AdminResponse> {
+        let context = serde_json::to_value(&request)?;
+        let changed = match request {
+            AdminRequest::SetRuleActivationGrant {
+                host_id,
+                collector,
+                principal_id,
+                enabled,
+                rationale,
+            } => {
+                require_host(self.db, &host_id)?;
+                require_text(&principal_id, "principal_id", 128)?;
+                require_text(&rationale, "rationale", 1024)?;
+                if enabled {
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO rule_activation_grants VALUES (?1,?2,?3)",
+                        params![host_id, collector.as_str(), principal_id],
+                    )?;
+                } else {
+                    self.db.execute(
+                        "DELETE FROM rule_activation_grants WHERE host_id=?1 AND collector_type=?2 AND principal_id=?3",
+                        params![host_id, collector.as_str(), principal_id],
+                    )?;
+                    let revoked = rows(self.db,
+                        "SELECT r.rule_id FROM expectation_rules r JOIN rule_maintenance_evidence e USING(rule_id)
+                         WHERE e.activated=1 AND r.status='active' AND r.host_id=?1
+                           AND r.collector_type=?2 AND r.proposed_by=?3",
+                        params![host_id, collector.as_str(), principal_id], |r| r.get::<_, String>(0))?;
+                    for id in revoked {
+                        self.revoke(id, actor, &rationale)?;
+                    }
+                    self.db.execute(
+                        "DELETE FROM rule_maintenance_evidence WHERE activated=0 AND rule_id IN (
+                            SELECT rule_id FROM expectation_rules WHERE host_id=?1 AND collector_type=?2 AND proposed_by=?3)",
+                        params![host_id, collector.as_str(), principal_id],
+                    )?;
+                }
+                true
+            }
+            AdminRequest::CorroborateRuleMaintenance {
+                rule_id,
+                watch_version,
+                before_id,
+                after_id,
+                rationale,
+            } => {
+                require_text(&rationale, "rationale", 1024)?;
+                self.db.execute(
+                    "INSERT INTO rule_maintenance_evidence
+                     SELECT r.rule_id, ?2, ?3, ?4, ?5, ?6, ?7, 0
+                     FROM expectation_rules r
+                     JOIN observations b ON b.observation_id=?3
+                     JOIN observations a ON a.observation_id=?4
+                     WHERE r.rule_id=?1 AND r.origin='investigator' AND r.status='proposed'
+                       AND r.expires_at>?7 AND a.observation_id>b.observation_id
+                       AND a.host_id=r.host_id AND b.host_id=r.host_id
+                       AND a.watch_id=r.watch_id AND b.watch_id=r.watch_id
+                       AND a.spec_version=?2 AND b.spec_version=?2
+                     ON CONFLICT(rule_id) DO UPDATE SET watch_version=excluded.watch_version,
+                       before_id=excluded.before_id, after_id=excluded.after_id,
+                       corroborated_by=excluded.corroborated_by, rationale=excluded.rationale,
+                       corroborated_at=excluded.corroborated_at",
+                    params![
+                        rule_id,
+                        watch_version,
+                        before_id,
+                        after_id,
+                        actor,
+                        rationale,
+                        stamp(self.now)
+                    ],
+                )? == 1
+            }
+            _ => unreachable!("maintenance admin dispatch"),
+        };
+        let decision = self.maintenance_decision(
+            changed,
+            if changed {
+                "maintenance administration recorded"
+            } else {
+                "corroboration requires a pending proposal and a distinct scoped evidence pair"
+            },
+        );
+        self.record(actor, &decision, context)?;
+        Ok(AdminResponse::RuleMaintenanceEvaluated { decision })
+    }
+
+    pub fn activate(
+        &self,
+        cap: &ScopedCapability,
+        run: &str,
+        id: &str,
+    ) -> Result<InvestigationResponse> {
+        let outcome = self.check_activation(cap, run, id)?;
+        let (decision, backtest) = match outcome {
+            Ok((spec, backtest)) => {
+                let note = "fresh scoped backtest passed on corroborated maintenance transition";
+                self.set_status(id, "active", &cap.principal_id, Some(note))?;
+                self.db.execute(
+                    "UPDATE rule_maintenance_evidence SET activated=1 WHERE rule_id=?1",
+                    [id],
+                )?;
+                self.db.execute(
+                    "UPDATE expectation_rules SET backtest_json=?2 WHERE rule_id=?1",
+                    params![id, serde_json::to_string(&backtest)?],
+                )?;
+                self.audit_activation(id, &cap.principal_id, &spec, Some(note))?;
+                (self.maintenance_decision(true, note), Some(backtest))
+            }
+            Err(reason) => (self.maintenance_decision(false, reason), None),
+        };
+        self.record(
+            &cap.principal_id,
+            &decision,
+            json!({
+                "operation":"activate", "rule_id":id, "run_id":run, "backtest":backtest
+            }),
+        )?;
+        Ok(InvestigationResponse::RuleActivationEvaluated { decision, backtest })
+    }
+
+    fn check_activation(
+        &self,
+        cap: &ScopedCapability,
+        run: &str,
+        id: &str,
+    ) -> Result<std::result::Result<(String, RuleBacktest), &'static str>> {
+        if cap.role != defsec_protocol::rpc::PrincipalRole::Investigator
+            || cap.run_id.as_deref() != Some(run)
+        {
+            return Ok(Err(
+                "activation requires the authenticated investigator run",
+            ));
+        }
+        let proposal = self.db.query_row(
+            "SELECT r.spec_json FROM expectation_rules r
+             JOIN incidents i ON i.incident_id=r.incident_id
+             JOIN rule_activation_grants g ON g.host_id=r.host_id AND g.collector_type=r.collector_type
+                 AND g.principal_id=r.proposed_by
+             WHERE r.rule_id=?1 AND r.run_id=?2 AND r.proposed_by=?3 AND r.incident_id=?4
+               AND r.status='proposed' AND r.origin='investigator' AND i.status='open'",
+            params![id, run, cap.principal_id, cap.incident_id], |r| r.get::<_, String>(0),
+        ).optional()?;
+        let Some(encoded) = proposal else {
+            return Ok(Err(
+                "activation requires a pending own-run proposal and an explicit host and collector grant",
+            ));
+        };
+        let rule: ExpectationRuleSpec = serde_json::from_str(&encoded)?;
+        let Some(watch) = rule.scope.watch_id.as_deref() else {
+            return Ok(Err("activation requires an explicit watch"));
+        };
+        let anchored = |name: &str| {
+            rule.matches
+                .iter()
+                .any(|clause| matches!(clause, MatchClause::Eq { field, .. } if field == name))
+        };
+        if !cap.allowed_hosts.contains(&rule.scope.host_id)
+            || !cap.allowed_collectors.contains(&rule.scope.collector)
+            || rule.scope.collector != CollectorType::SocketsListening
+            || rule.rationale.trim().is_empty()
+            || rule.effect != RuleEffect::AllowOptional
+            || !rule
+                .matches
+                .iter()
+                .all(|clause| matches!(clause, MatchClause::Eq { .. }))
+            || ![
+                "protocol",
+                "local_addr",
+                "local_port",
+                "uid",
+                "systemd_unit",
+            ]
+            .into_iter()
+            .all(anchored)
+            || !self
+                .validate(&rule, RuleOrigin::Investigator, &self.gate_config())?
+                .allowed
+            || rule
+                .expires_at
+                .is_none_or(|expiry| expiry > self.now + Duration::hours(1))
+        {
+            return Ok(Err(
+                "activation requires an in-scope exact listener rule expiring within one hour",
+            ));
+        }
+        let Some(spec) = crate::service::active_watches(self.db, &rule.scope.host_id, self.now)?
+            .into_iter()
+            .find(|spec| spec.id == watch)
+        else {
+            return Ok(Err("watch is no longer active"));
+        };
+        if spec.class != WatchClass::Ephemeral
+            || spec.incident_id != cap.incident_id
+            || spec.collector.collector_type() != rule.scope.collector
+            || !matches!(
+                spec.trigger,
+                TriggerPredicate::SetDiff {
+                    compare_against: CompareTarget::LastObserved,
+                    ..
+                }
+            )
+        {
+            return Ok(Err(
+                "protected coverage or an incompatible watch is outside delegated activation",
+            ));
+        }
+        let conflict: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM incidents WHERE host_id=?1 AND status='open' AND incident_id<>?2)
+                 OR EXISTS(SELECT 1 FROM expectation_rules WHERE host_id=?1 AND collector_type=?3
+                     AND status='active' AND (watch_id IS NULL OR watch_id=?4)
+                     AND (expires_at IS NULL OR expires_at>?5))",
+            params![rule.scope.host_id, cap.incident_id, rule.scope.collector.as_str(), watch, stamp(self.now)],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Ok(Err(
+                "conflicting incident or active rule requires operator review",
+            ));
+        }
+        let pair = self.db.query_row(
+            "SELECT b.sample_json,a.sample_json FROM rule_maintenance_evidence e
+             JOIN observations b ON b.observation_id=e.before_id
+             JOIN observations a ON a.observation_id=e.after_id
+             JOIN watch_state s ON s.host_id=a.host_id AND s.watch_id=a.watch_id AND s.spec_version=a.spec_version
+             JOIN hosts h ON h.host_id=a.host_id AND h.session_id=a.session_id
+             WHERE e.rule_id=?1 AND e.watch_version=?2 AND e.activated=0
+               AND s.retired=0 AND s.last_observation_id=a.observation_id AND s.last_success_id=a.observation_id
+               AND b.session_id=a.session_id AND a.seq_no>b.seq_no
+               AND json_extract(b.record_json,'$.is_reconciliation') IS NOT 1
+               AND json_extract(a.record_json,'$.is_reconciliation') IS NOT 1
+               AND coalesce(json_array_length(b.record_json,'$.partial_reasons'),0)=0
+               AND coalesce(json_array_length(a.record_json,'$.partial_reasons'),0)=0
+               AND b.status_json=?3 AND a.status_json=?3
+               AND a.collector_type=?6 AND b.collector_type=?6
+               AND b.received_at>=?4 AND b.observed_at>=?4 AND a.observed_at>b.observed_at
+               AND a.observed_at<=?5 AND e.corroborated_at>=a.received_at
+               AND NOT EXISTS (SELECT 1 FROM observations p WHERE p.host_id=a.host_id AND p.watch_id=a.watch_id
+                   AND p.spec_version=a.spec_version AND p.observation_id>b.observation_id AND p.observation_id<a.observation_id)",
+            params![id, spec.version, serde_json::to_string(&ObservationStatus::Ok)?,
+                stamp(self.now - Duration::minutes(15)), stamp(self.now), rule.scope.collector.as_str()],
+            |r| Ok((optional_json::<Value>(r, 0)?, optional_json::<Value>(r, 1)?)),
+        ).optional()?;
+        let Some((Some(before), Some(after))) = pair else {
+            return Ok(Err(
+                "fresh corroborated evidence for the current watch checkpoint is required",
+            ));
+        };
+        let Some(backtest) = maintenance_backtest(id, &rule, &spec, &before, &after) else {
+            return Ok(Err(
+                "scoped backtest must suppress exactly one corroborated loopback listener addition",
+            ));
+        };
+        Ok(Ok((encoded, backtest)))
+    }
+}
+
+fn maintenance_backtest(
+    id: &str,
+    rule: &ExpectationRuleSpec,
+    spec: &WatchSpec,
+    before: &Value,
+    after: &Value,
+) -> Option<RuleBacktest> {
+    for snapshot in [before, after] {
+        let decoded: defsec_protocol::observation::SocketsListeningSnapshot =
+            serde_json::from_value(snapshot.clone()).ok()?;
+        if decoded.partial_attribution || decoded.count != decoded.sockets.len() {
+            return None;
+        }
+        let mut keys = BTreeSet::new();
+        for item in decoded.sockets {
+            let address: std::net::IpAddr = item.local_addr.parse().ok()?;
+            let address = match address {
+                std::net::IpAddr::V4(_) => item.local_addr,
+                std::net::IpAddr::V6(_) => format!("[{}]", item.local_addr),
+            };
+            let expected = format!(
+                "{}:{address}:{}:uid={}",
+                item.protocol, item.local_port, item.uid
+            );
+            if item.socket_key != expected || !keys.insert(item.socket_key) {
+                return None;
+            }
+        }
+    }
+    let keys = matching_rule_keys(&spec.trigger, rule, after);
+    let [key] = keys.as_slice() else { return None };
+    if !matching_rule_keys(&spec.trigger, rule, before).is_empty() {
+        return None;
+    }
+    let item = after["sockets"]
+        .as_array()?
+        .iter()
+        .find(|item| item["socket_key"] == *key)?;
+    let address = item["local_addr"]
+        .as_str()?
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    let unit = item["systemd_unit"].as_str()?;
+    if !address.is_loopback()
+        || !(1024..=65535).contains(&item["local_port"].as_u64()?)
+        || item["uid"].as_u64()? == 0
+        || !unit.ends_with(".service")
+        || defsec_policy::action_gate::ActionSafetyConfig::default()
+            .protected_units
+            .contains(unit)
+        || !matches!(item["protocol"].as_str()?, "tcp" | "udp" | "tcp6" | "udp6")
+    {
+        return None;
+    }
+    let raw = evaluate_predicate(
+        &spec.trigger,
+        ObservationStatus::Ok,
+        Some(after),
+        Some(before),
+        None,
+        None,
+        0,
+        0,
+    );
+    let PredicateOutcome::Triggered { details, .. } = &raw else {
+        return None;
+    };
+    if !details["added"]
+        .as_array()?
+        .iter()
+        .any(|added| added == key)
+    {
+        return None;
+    }
+    let evaluation = apply_expectation_rules(
+        &spec.trigger,
+        rule.scope.collector,
+        raw,
+        ObservationStatus::Ok,
+        Some(after),
+        Some(before),
+        &[ActiveRule {
+            rule_id: id.into(),
+            spec: rule.clone(),
+        }],
+    );
+    if evaluation.suppressed_counts.get(id) != Some(&1) {
+        return None;
+    }
+    Some(RuleBacktest {
+        observations_scanned: 1,
+        triggered_before: 1,
+        triggered_after: u32::from(matches!(
+            evaluation.outcome,
+            PredicateOutcome::Triggered { .. }
+        )),
+        items_matched: 1,
+        sample_keys: keys,
+        currently_matching: 1,
+    })
+}
+
+pub(crate) fn maintenance_rules(
+    db: &Connection,
+    spec: &WatchSpec,
+    before: &Value,
+    after: &Value,
+    now: DateTime<Utc>,
+) -> Result<Vec<ActiveRule>> {
+    let candidates = rows(db,
+        "SELECT r.rule_id,r.spec_json,b.sample_json,a.sample_json
+         FROM expectation_rules r JOIN rule_maintenance_evidence e USING(rule_id)
+         JOIN observations b ON b.observation_id=e.before_id
+         JOIN observations a ON a.observation_id=e.after_id
+         JOIN incidents i ON i.incident_id=r.incident_id
+         JOIN rule_activation_grants g ON g.host_id=r.host_id AND g.collector_type=r.collector_type
+             AND g.principal_id=r.proposed_by
+         WHERE r.host_id=?1 AND r.watch_id=?2 AND e.watch_version=?3 AND r.expires_at>?4
+           AND r.status='active' AND e.activated=1 AND i.status='open'
+           AND NOT EXISTS (SELECT 1 FROM incidents c
+                           WHERE c.host_id=r.host_id AND c.status='open' AND c.incident_id<>r.incident_id)",
+        params![spec.host_id, spec.id, spec.version, stamp(now)],
+        |r| Ok((ActiveRule { rule_id: r.get(0)?, spec: json_column(r,1)? },
+            json_column::<Value>(r,2)?, json_column::<Value>(r,3)?)),
+    )?;
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(rule, expected_before, expected_after)| {
+            (before == &expected_before && after == &expected_after).then_some(rule)
+        })
+        .collect())
 }

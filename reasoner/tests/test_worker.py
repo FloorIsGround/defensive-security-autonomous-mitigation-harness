@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -18,13 +17,13 @@ if str(TESTS_ROOT) not in sys.path:
 
 import unittest  # noqa: E402
 
-from defsec_reasoner.models import ProviderError, ScriptedMockAdapter  # noqa: E402
+from defsec_reasoner.models import ModelTurnResult, ProviderError, ScriptedMockAdapter, ToolCall  # noqa: E402
 from defsec_reasoner.canonical import canonical_json, sha256_hex  # noqa: E402
 from defsec_reasoner.provenance import envelope_contents
 from defsec_reasoner.rpc_client import ControlRpcClient, RpcTransportError  # noqa: E402
 from defsec_reasoner.worker import ReasonerWorker, RunBudgets  # noqa: E402
 
-from support import FakeControlServer  # noqa: E402
+from support import FakeControlServer, temporary_socket_path  # noqa: E402
 
 TOKEN = "worker-test-token"
 
@@ -46,7 +45,7 @@ def _spec(incident: str = "inc-1", unit: str = "ghost.service") -> dict:
 
 class WorkerTestBase(unittest.TestCase):
     def setUp(self) -> None:
-        self.sock_path = str(Path(tempfile.mkdtemp(prefix="worker-t-")) / "i.sock")
+        self.sock_path = temporary_socket_path(self, "worker-t-")
         self.server = FakeControlServer(self.sock_path).start()
 
     def tearDown(self) -> None:
@@ -67,10 +66,14 @@ class WorkerTestBase(unittest.TestCase):
 
 
 class TestWorkerHappyPath(WorkerTestBase):
-    def test_dormant_when_no_trigger(self) -> None:
+    def test_advances_host_discovery_when_no_incident_trigger(self) -> None:
         self.server.triggers[0]["status"] = "done"
         worker = self.make_worker([{"final_text": "nothing to do"}])
         self.assertIsNone(worker.run_once())
+        self.assertEqual(
+            [req["op"] for req in self.server.requests],
+            ["lease_next_trigger", "advance_host_discovery"],
+        )
 
     def test_full_investigation_completes_lease(self) -> None:
         script = [
@@ -287,9 +290,27 @@ class TestWorkerBudgets(WorkerTestBase):
         outcome = worker.run_once()
         self.assertEqual(outcome.status, "completed")
         self.assertEqual(outcome.budget_stop_reason, "max_total_tokens")
-        self.assertEqual(outcome.turns, 1)
+        self.assertEqual(outcome.turns, 0)
         self.assertEqual(self.server.runs[0]["outcome"]["status"], "budget_exhausted")
         self.assertIn("budget_warning", [req.get("kind") for req in self.server.requests])
+
+    def test_last_turn_overage_preserves_usage_and_blocks_tools(self) -> None:
+        class OverBudgetAdapter(ScriptedMockAdapter):
+            def chat(self, messages, tools):
+                return ModelTurnResult(
+                    [ToolCall("finish", {"summary": "should not run"})],
+                    None, 5100, 90, 0.0, "tool_calls",
+                    cached_input_tokens=4000, reasoning_tokens=80,
+                )
+
+        worker = self.make_worker([], budgets=RunBudgets(max_turns=1, max_total_tokens=5000))
+        worker.adapter = OverBudgetAdapter([])
+        outcome = worker.run_once()
+        self.assertEqual(outcome.turns, 1)
+        self.assertEqual(outcome.tool_calls, 0)
+        self.assertEqual(outcome.budget_stop_reason, "max_total_tokens")
+        self.assertEqual((outcome.input_tokens, outcome.output_tokens), (5100, 90))
+        self.assertEqual((outcome.cached_input_tokens, outcome.reasoning_tokens), (4000, 80))
 
     def test_cost_budget_stops_loop(self) -> None:
         script = [{"tool_calls": [{"name": "query_observations", "arguments": {"host_id": "edge-01"}}]}]

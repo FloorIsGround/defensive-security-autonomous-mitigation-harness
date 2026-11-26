@@ -34,6 +34,8 @@ pub enum AuditEventType {
     ActionApproved,
     ActionReceiptRecorded,
     ActionRolledBack,
+    ActionEffectObserved,
+    ActionOutcomeReconciled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

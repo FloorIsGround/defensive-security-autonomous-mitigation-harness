@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -31,6 +33,8 @@ __all__ = [
     "ModelTurnResult",
     "ToolCall",
     "ProviderError",
+    "TurnBudget",
+    "BudgetExhausted",
     "OpenAICompatibleAdapter",
     "AnthropicAdapter",
     "ScriptedMockAdapter",
@@ -57,6 +61,10 @@ class ModelTurnResult:
     estimated_cost_usd: float
     finish_reason: str  # "tool_calls" | "stop" | "length" | "script_exhausted" | ...
     reasoning_content: str | None = None
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    response_items: list[dict[str, Any]] | None = None
 
 
 class ProviderError(Exception):
@@ -65,6 +73,37 @@ class ProviderError(Exception):
     def __init__(self, message: str, retryable: bool) -> None:
         self.retryable = retryable
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class TurnBudget:
+    remaining_tokens: int
+    deadline: float
+    max_completion_tokens: int = 4096
+    effort: str | None = None
+    session_id: str | None = None
+
+    def completion_limit(self, input_tokens: int) -> int:
+        remaining = self.remaining_tokens - input_tokens
+        if remaining <= 0:
+            raise BudgetExhausted("max_total_tokens")
+        if self.max_completion_tokens <= 0:
+            raise BudgetExhausted("max_completion_tokens")
+        return min(self.max_completion_tokens, remaining)
+
+    def request_timeout(self, timeout: float) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise BudgetExhausted("max_wall_seconds")
+        return min(timeout, remaining)
+
+
+class BudgetExhausted(Exception):
+    """The turn cannot start within the supplied budget."""
+
+
+def _estimate_payload(payload: Any) -> int:
+    return (len(json.dumps(payload).encode("utf-8")) + 3) // 4
 
 
 class ModelAdapter(ABC):
@@ -88,7 +127,49 @@ class ModelAdapter(ABC):
         """
 
 
+    def chat_with_budget(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], budget: TurnBudget
+    ) -> ModelTurnResult:
+        """Preflight legacy adapters; override to apply provider-side limits."""
+        budget.completion_limit(_estimate_payload({"messages": messages, "tools": tools}))
+        budget.request_timeout(float("inf"))
+        return self.chat(messages, tools)
+
+
 # --------------------------------------------------------------------- helpers
+
+
+_discovery_transport: ContextVar[bool] = ContextVar("discovery_transport", default=False)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Only recognized machine identifiers may appear in persisted errors. Providers
+# can echo arbitrary request data even in fields named "code" or "type".
+_SAFE_PROVIDER_ERRORS = frozenset({
+    "api_error", "authentication_error", "billing_error", "context_length_exceeded",
+    "insufficient_quota", "invalid_api_key", "invalid_request_error", "model_not_found",
+    "not_found_error", "overloaded_error", "permission_error", "rate_limit_error",
+    "rate_limit_exceeded", "request_too_large", "server_error", "temporarily_unavailable",
+})
+
+
+def _provider_error_code(exc: urllib.error.HTTPError) -> str | None:
+    try:
+        with exc:
+            reply = json.loads(exc.read(4096))
+        detail = reply.get("error") if isinstance(reply, dict) else None
+        if isinstance(detail, dict):
+            for field in ("code", "type"):
+                code = detail.get(field)
+                if isinstance(code, str) and code in _SAFE_PROVIDER_ERRORS:
+                    return code
+    except (OSError, ValueError, RecursionError):
+        pass
+    return None
 
 
 def _http_json(
@@ -102,25 +183,30 @@ def _http_json(
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST"
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    discovery = _discovery_transport.get()
+    limit = 256 * 1024 if discovery else 8 * 1024 * 1024
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        with opener.open(request, timeout=timeout) as response:
+            data = response.read(limit + 1)
+        if len(data) > limit:
+            scope = "discovery" if discovery else "provider"
+            raise ProviderError(f"{scope} response exceeds size limit", retryable=False)
+        reply = json.loads(data)
+        if not isinstance(reply, dict):
+            raise ProviderError("provider returned an invalid JSON response", retryable=False)
+        return reply
     except urllib.error.HTTPError as exc:
-        snippet = b""
-        try:
-            snippet = exc.read()[:512]
-        except Exception:  # pragma: no cover - body already consumed
-            pass
+        code = _provider_error_code(exc)
+        suffix = f" ({code})" if code else ""
         retryable = exc.code in (408, 409, 429) or 500 <= exc.code < 600
-        raise ProviderError(
-            f"provider HTTP {exc.code}: {snippet.decode('utf-8', 'replace')}", retryable=retryable
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise ProviderError(f"provider unreachable: {exc.reason}", retryable=True) from exc
-    except TimeoutError as exc:
-        raise ProviderError("provider request timed out", retryable=True) from exc
-    except json.JSONDecodeError as exc:
-        raise ProviderError(f"provider returned invalid JSON: {exc}", retryable=False) from exc
+        raise ProviderError(f"provider HTTP {exc.code}{suffix}", retryable=retryable) from None
+    except urllib.error.URLError:
+        raise ProviderError("provider unreachable", retryable=True) from None
+    except TimeoutError:
+        raise ProviderError("provider request timed out", retryable=True) from None
+    except (ValueError, RecursionError):
+        raise ProviderError("provider returned invalid JSON", retryable=False) from None
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -150,9 +236,13 @@ class OpenAICompatibleAdapter(ModelAdapter):
         api_key_env: str = "DEFSEC_OPENAI_API_KEY",
         fallback_key_env: str = "OPENAI_API_KEY",
         timeout: float = 60.0,
+        completion_token_field: str = "max_completion_tokens",
         price_per_mtok_input: float = float(os.environ.get("DEFSEC_OPENAI_PRICE_IN_MTOK", "0.0")),
         price_per_mtok_output: float = float(os.environ.get("DEFSEC_OPENAI_PRICE_OUT_MTOK", "0.0")),
     ) -> None:
+        if completion_token_field not in ("max_completion_tokens", "max_tokens"):
+            raise ValueError("unsupported OpenAI-compatible completion token field")
+        self.completion_token_field = completion_token_field
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
         self.timeout = timeout
@@ -161,11 +251,21 @@ class OpenAICompatibleAdapter(ModelAdapter):
         self._api_key_env = api_key_env
         self._fallback_key_env = fallback_key_env
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, budget: TurnBudget | None = None) -> dict[str, str]:
         key = os.environ.get(self._api_key_env) or os.environ.get(self._fallback_key_env)
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurnResult:
+        return self._chat(messages, tools, None)
+
+    def chat_with_budget(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], budget: TurnBudget
+    ) -> ModelTurnResult:
+        return self._chat(messages, tools, budget)
+
+    def _chat(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], budget: TurnBudget | None
+    ) -> ModelTurnResult:
         body: dict[str, Any] = {
             "model": self.model_id,
             "messages": [self._encode_message(m) for m in messages],
@@ -183,9 +283,15 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 for tool in tools
             ]
             body["tool_choice"] = "auto"
-        reply = _http_json(
-            f"{self.base_url}/chat/completions", body, self._headers(), self.timeout
-        )
+        effort = (budget.effort if budget else None) or getattr(self, "effort", None)
+        if effort:
+            body["reasoning_effort"] = effort
+        input_estimate = _estimate_payload(body)
+        if budget is not None:
+            body[self.completion_token_field] = budget.completion_limit(input_estimate)
+        headers = self._headers(budget)
+        timeout = self.timeout if budget is None else budget.request_timeout(self.timeout)
+        reply = _http_json(f"{self.base_url}/chat/completions", body, headers, timeout)
         choice = (reply.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         tool_calls: list[ToolCall] = []
@@ -200,8 +306,8 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 ToolCall(name=str(function.get("name", "")), arguments=arguments, id=call.get("id"))
             )
         usage = reply.get("usage") or {}
-        input_tokens = int(usage.get("prompt_tokens") or _estimate_tokens(messages))
-        output_tokens = int(usage.get("completion_tokens") or 0)
+        input_tokens = int(usage.get("prompt_tokens", input_estimate))
+        output_tokens = int(usage.get("completion_tokens", _estimate_payload(message)))
         cost = (input_tokens * self.price_in + output_tokens * self.price_out) / 1_000_000
         finish = str(choice.get("finish_reason") or ("tool_calls" if tool_calls else "stop"))
         return ModelTurnResult(
@@ -212,6 +318,8 @@ class OpenAICompatibleAdapter(ModelAdapter):
             estimated_cost_usd=cost,
             finish_reason=finish,
             reasoning_content=message.get("reasoning_content"),
+            cached_input_tokens=int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+            reasoning_tokens=int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
         )
 
     @staticmethod
@@ -273,10 +381,19 @@ class AnthropicAdapter(ModelAdapter):
         return {"x-api-key": key, "anthropic-version": "2023-06-01"}
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurnResult:
+        return self._chat(messages, tools, None)
+
+    def chat_with_budget(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], budget: TurnBudget
+    ) -> ModelTurnResult:
+        return self._chat(messages, tools, budget)
+
+    def _chat(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], budget: TurnBudget | None
+    ) -> ModelTurnResult:
         system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
         body: dict[str, Any] = {
             "model": self.model_id,
-            "max_tokens": 4096,
             "messages": self._encode_messages([m for m in messages if m.get("role") != "system"]),
         }
         if system:
@@ -290,9 +407,11 @@ class AnthropicAdapter(ModelAdapter):
                 }
                 for tool in tools
             ]
-        reply = _http_json(
-            f"{self.base_url}/v1/messages", body, self._headers(), self.timeout
-        )
+        input_estimate = _estimate_payload(body)
+        body["max_tokens"] = 4096 if budget is None else budget.completion_limit(input_estimate)
+        headers = self._headers()
+        timeout = self.timeout if budget is None else budget.request_timeout(self.timeout)
+        reply = _http_json(f"{self.base_url}/v1/messages", body, headers, timeout)
         tool_calls: list[ToolCall] = []
         texts: list[str] = []
         for block in reply.get("content") or []:
@@ -307,14 +426,20 @@ class AnthropicAdapter(ModelAdapter):
             elif block.get("type") == "text":
                 texts.append(str(block.get("text", "")))
         usage = reply.get("usage") or {}
-        input_tokens = int(usage.get("input_tokens") or _estimate_tokens(messages))
-        output_tokens = int(usage.get("output_tokens") or 0)
+        cached_input = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+        input_tokens = int(usage.get("input_tokens", input_estimate))
+        if "input_tokens" in usage:
+            input_tokens += cached_input + cache_creation
+        output_tokens = int(usage.get("output_tokens", _estimate_payload(reply.get("content") or [])))
         cost = (input_tokens * self.price_in + output_tokens * self.price_out) / 1_000_000
         stop = str(reply.get("stop_reason") or "")
-        finish = "tool_calls" if stop == "tool_use" or tool_calls else ("stop" if stop else "stop")
+        finish = "tool_calls" if stop == "tool_use" else stop or "stop"
         return ModelTurnResult(
             tool_calls=tool_calls,
             final_text="\n".join(texts) or None,
+            cached_input_tokens=cached_input,
+            cache_creation_input_tokens=cache_creation,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             estimated_cost_usd=cost,

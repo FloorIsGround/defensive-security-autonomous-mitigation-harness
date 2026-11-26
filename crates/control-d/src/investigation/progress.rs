@@ -323,13 +323,14 @@ pub(super) fn list_triggers(
     check_filters(db, capability, host_id, incident_id)?;
     rows(
         db,
-        "SELECT event_id,incident_id,host_id,watch_id,status,created_at,updated_at,lease_owner,
+        "SELECT event_id,t.incident_id,host_id,watch_id,status,t.created_at,updated_at,lease_owner,
                 lease_expires_at,retry_count,
-                CASE WHEN json_type(outcome_json, '$.reason')='text'
-                     THEN json_extract(outcome_json, '$.reason') END
-         FROM trigger_events
-         WHERE host_id IN (SELECT value FROM json_each(?1))
-           AND (?2 IS NULL OR incident_id=?2)
+                CASE WHEN json_type(t.outcome_json, '$.reason')='text'
+                     THEN json_extract(t.outcome_json, '$.reason') END
+         FROM trigger_events t JOIN watch_specs w USING (host_id,watch_id,spec_version)
+         WHERE json_extract(w.spec_json,'$.collector.type') IN (SELECT value FROM json_each(?6))
+           AND host_id IN (SELECT value FROM json_each(?1))
+           AND (?2 IS NULL OR t.incident_id=?2)
            AND (?3 IS NULL OR host_id=?3)
            AND status IN (SELECT value FROM json_each(?4))
          ORDER BY event_id DESC LIMIT ?5",
@@ -339,6 +340,7 @@ pub(super) fn list_triggers(
             host_id,
             statuses,
             bounded(limit),
+            collector_scope_json(capability)?,
         ],
         |r| {
             let reason = r.get::<_, Option<String>>(10)?.map(|mut reason| {

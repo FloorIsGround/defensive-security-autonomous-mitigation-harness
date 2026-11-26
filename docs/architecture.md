@@ -1,6 +1,8 @@
 # Architecture
 
-The Defensive Security Autonomous Mitigation Harness separates continuous deterministic monitoring from episodic model-assisted investigation. The model has typed investigation operations, not a shell or direct access to the database. Local IPC is the present deployment boundary.
+The Defensive Security Autonomous Mitigation Harness separates continuous deterministic monitoring from episodic model-assisted investigation. The model has typed investigation operations, not a shell or direct access to the database. Investigation clients connect over local IPC. Enrolled edge agents can also connect over fleet mTLS.
+
+The next milestone extends this architecture to discovery runs on quiet hosts, one-shot collection and durable host assessments. The [adaptive investigator design](design/adaptive-investigator.md) identifies the required protocol and storage changes and how to validate them.
 
 ## Components
 
@@ -20,7 +22,7 @@ The edge crate does not depend on SQLite; the action executor has no model or da
 
 ## Transport and identity
 
-The local Unix socket protocol uses a four-byte big-endian length followed by UTF-8 JSON, bounded to 2 MiB. Control checks peer credentials (`SO_PEERCRED`) and socket policy; investigation calls additionally use scoped capability tokens. Socket filesystem permissions and allowed UIDs must match the deployment. This is not a remote authenticated fleet transport.
+The local Unix socket protocol uses a four-byte big-endian length followed by UTF-8 JSON, bounded to 2 MiB. Control checks peer credentials (`SO_PEERCRED`) and socket policy; investigation calls additionally use scoped capability tokens. Socket filesystem permissions and allowed UIDs must match the deployment. Remote edge connections use TLS 1.3 mutual authentication and host-bound identities. Investigation and admin sockets remain local.
 
 Signed payloads use RFC 8785 canonical JSON and Ed25519 with distinct domains: `defsecautmit.watch_bundle.v1`, `defsecautmit.audit_entry.v1`, `defsecautmit.action_intent.v1`, and `defsecautmit.action_approval.v1`. Domains prevent a signature for one purpose from being accepted for another. Audit entries form a SHA-256 hash chain; verification detects changes to the examined chain, but does not independently prove that an entire ledger was not replaced or truncated.
 
