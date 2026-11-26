@@ -261,7 +261,7 @@ export function buildDemoActions({ now, iso, ids, signer }) {
   propose({
     proposal_id: 5, run: 'run-7f3a91c2', actor: R42, host: 'edge-vm-07', incident: 'inc-2026-0042', ago: 4 * MIN,
     verb: { verb: 'systemd_stop_unit', unit: 'custom-helper.service', ttl_seconds: 3600 },
-    evidence: ids('sock_new', 'unit_u1', 'units_f3'),
+    evidence: ids('sock_new', 'unit_u3', 'units_f3'),
     expected_effect: 'Stop custom-helper.service so helperd releases tcp/4444 and stops beaconing; the unit stays stopped for 1 h.',
     blast_radius: 'One non-protected unit on edge-vm-07; nginx and sshd keep running.',
     rollback_plan: 'action-exec-d restarts custom-helper.service when the 3600 s TTL elapses, unless the incident is resolved first.',
@@ -335,7 +335,7 @@ export function advanceDemoActions(S, nowMs, appendAudit) {
 }
 
 /** Mirror of ControlService::approve_action for the demo backend. */
-export function approveDemoAction(S, { intentId, body, signer, nowMs, incidentOpen, appendAudit }) {
+export function approveDemoAction(S, { intentId, body, signer, nowMs, incidentOpen, appendAudit, outstanding = () => false }) {
   requireIdent(intentId, 'intent_id');
   const approver = requireText(body?.approver, 'approver', 128);
   const rec = S.actions.intents.find((r) => r.payload.intent_id === intentId);
@@ -355,6 +355,9 @@ export function approveDemoAction(S, { intentId, body, signer, nowMs, incidentOp
     if (err) throw new ApiError(403, 'forbidden', `invalid operator approval: ${err}`);
   } else {
     approval = signer.signOperator(rec.payload);
+  }
+  if (outstanding(rec.payload.host_id, rec.payload.verb)) {
+    throw new ApiError(403, 'forbidden', 'a previous action against this target needs reconciliation');
   }
   const hourAgo = nowMs - HOUR;
   const acted = S.actions.intents.filter((r) => r.payload.host_id === rec.payload.host_id && r.status !== 'pending_approval');
@@ -481,7 +484,7 @@ export function evaluateDemoAction({ verb, evidenceCount, hostActionsLastHour, l
 }
 
 /** Mirror of ControlService::propose_action for the demo backend. */
-export function proposeDemoAction(S, { incident, run, actor, proposal, evidenceOk, signer, nowMs, appendAudit }) {
+export function proposeDemoAction(S, { incident, run, actor, proposal, evidenceOk, signer, nowMs, appendAudit, outstanding = () => false, servicePrecondition = () => null }) {
   const at = new Date(nowMs).toISOString();
   const hourAgo = nowMs - HOUR;
   const hostIntents = S.actions.intents.filter((r) => r.payload.host_id === incident.host_id);
@@ -505,6 +508,19 @@ export function proposeDemoAction(S, { incident, run, actor, proposal, evidenceO
         decision: { allowed: false, rule_id: 'action.evidence_out_of_scope', reason: 'observation evidence is missing or outside incident scope', policy_version: 1 },
         auth_mode: null,
       };
+  // P18 post-gate checks, in control-d's order (actions.rs propose_action).
+  if (ev.decision.allowed && outstanding(incident.host_id, proposal.verb)) {
+    ev.auth_mode = null;
+    ev.decision = { allowed: false, rule_id: 'action.awaiting_reconciliation', reason: 'A previous action against this target has an unresolved outcome', policy_version: 1 };
+  }
+  let precondition = null;
+  if (ev.decision.allowed && proposal.verb.verb === 'systemd_stop_unit') {
+    precondition = servicePrecondition(incident.host_id, proposal.verb.unit, proposal.evidence_observation_ids, nowMs);
+    if (precondition == null) {
+      ev.auth_mode = null;
+      ev.decision = { allowed: false, rule_id: 'action.missing_service_precondition', reason: 'A service stop must cite a current active sample of the target unit', policy_version: 1 };
+    }
+  }
   const proposal_id = S.actions.nextProposalId++;
   let status = 'rejected';
   let intent_id = null;
@@ -539,6 +555,7 @@ export function proposeDemoAction(S, { incident, run, actor, proposal, evidenceO
       updated_at: at,
       receipts: [],
       execute_at: status === 'authorized' ? nowMs + EXEC_DELAY_MS : null,
+      precondition_observation_id: proposal.verb.verb === 'systemd_stop_unit' ? precondition : undefined,
     });
   } else {
     S.actions.denied.push({

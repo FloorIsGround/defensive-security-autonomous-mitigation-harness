@@ -35,13 +35,14 @@ const state = {
   rq: { status: 'open', host: '', incident: '' }, // trigger queue / runs filters
   rules: { loaded: false, available: false, message: null, source: null, list: [] }, // active + proposed expectation rules (fleet glance, nav)
   rv: { tab: 'active', host: '' }, // rules view filters
+  hostTab: 'profile', // host deep-dive tab
   lastRefresh: null,
 };
 
 const FLOOR = { min_interval: 15, max_timeout: 30, max_ttl_min: 240, max_runs: 1000 };
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
 const VALID_OBS = new Set(['ok', 'partial']);
-const ALL_COLLECTORS = ['sockets.listening', 'systemd.unit_state', 'files.metadata', 'journal.unit_events'];
+const ALL_COLLECTORS = ['sockets.listening', 'systemd.unit_state', 'files.metadata', 'journal.unit_events', 'connections.outbound', 'packages.inventory'];
 
 // ----- per-viewer conveniences (browser storage may be unavailable) -----
 
@@ -460,8 +461,10 @@ function sevSummary(incidents) {
     .join(' · ');
 }
 
-async function renderFleet() {
+async function renderFleet(_arg, _stale, route) {
   const hosts = state.hosts;
+  const wanted = route?.query?.get('host');
+  if (wanted && !drawer().open && hosts.some((h) => h.host_id === wanted)) queueMicrotask(() => openHostDrawer(wanted, route.query.get('tab') || undefined));
   const open = state.incidents.filter((i) => i.status === 'open');
   const online = hosts.filter((h) => h.liveness_status === 'online').length;
   const degraded = hosts.filter((h) => h.liveness_status !== 'online');
@@ -566,7 +569,18 @@ function hostCard(h, incidents) {
   return el(
     'article',
     { class: ['card', 'host-card'] },
-    el('div', { class: 'host-top' }, el('div', { class: 'host-name' }, el('div', { class: 'host-id' }, h.host_id), h.placement ? el('div', { class: 'host-place' }, h.placement) : null), livenessBadge(h.liveness_status)),
+    el(
+      'div',
+      { class: 'host-top' },
+      el(
+        'div',
+        { class: 'host-name' },
+        el('button', { class: 'host-id host-open', type: 'button', title: `Open the ${h.host_id} deep-dive: profile, discovery, monitoring and reviews`, on: { click: () => openHostDrawer(h.host_id) } }, h.host_id),
+        h.placement ? el('div', { class: 'host-place' }, h.placement) : null,
+      ),
+      livenessBadge(h.liveness_status),
+    ),
+    hostTags(h),
     el(
       'div',
       { class: 'host-stats' },
@@ -597,6 +611,7 @@ function hostCard(h, incidents) {
           )
         : el('span', { class: 'muted' }, 'No open incidents'),
       el('span', { class: 'spacer' }),
+      el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: () => openHostDrawer(h.host_id) } }, 'Host details'),
       el('a', { class: 'btn btn-sm btn-ghost', href: `#/baselines/${encodeURIComponent(h.host_id)}` }, 'Telemetry', icon('arrow')),
     ),
   );
@@ -682,12 +697,14 @@ async function renderInvestigations(arg, _stale, route) {
 
 async function loadWorkspace(incidentId, container) {
   try {
-    const [ctx, changes, triggers] = await Promise.all([
+    const [ctx, changes, triggers, followups] = await Promise.all([
       api(`/api/incidents/${encodeURIComponent(incidentId)}`),
       api(`/api/incidents/${encodeURIComponent(incidentId)}/changes`).catch((error) => ({ error })),
       api(`/api/triggers?incident_id=${encodeURIComponent(incidentId)}&limit=50`).catch(() => null),
+      api(`/api/incidents/${encodeURIComponent(incidentId)}/followups`).catch(() => null),
     ]);
     ctx.changes = changes;
+    ctx.followups = followups;
     ctx.triggers = triggers?.available ? triggers.triggers : [];
     let caps = state.capabilities.get(ctx.incident.host_id);
     if (!caps) {
@@ -830,6 +847,7 @@ function workspaceView(ctx, caps) {
     'div',
     { class: 'ws-main' },
     reasonerCard(inc),
+    followupsCard(ctx.followups, obsMap),
     changesSlot,
     el('div', { class: 'assess' }, lane('Model hypotheses', 'hyp', hyps, 'Unverified model or operator assertions appear here.'), lane('Verified findings', 'ver', vers, 'Evidence-bound conclusions appear here.')),
     card(
@@ -891,6 +909,8 @@ function findingCard(f, cls, obsMap) {
       { class: 'row' },
       el('span', { class: 'kind' }, el('span', { class: ['dot', cls === 'hyp' ? 'warn' : 'ok'] }), cls === 'hyp' ? 'Hypothesis · unverified' : 'Verified finding · evidence-bound'),
       el('span', { class: 'spacer' }),
+      f.interpretation ? el('span', { class: 'muted small' }, 'follow-up') : null,
+      f.interpretation ? interpBadge(f.interpretation) : null,
       sevBadge(f.severity),
       f.escalation_requested ? el('span', { class: 'badge bad' }, 'escalation') : null,
     ),
@@ -934,6 +954,8 @@ function collectorOf(o, watchMap) {
   const d = o.payload?.data;
   if (o.payload?.kind === 'stream_batch') return 'journal.unit_events';
   if (Array.isArray(d?.sockets)) return 'sockets.listening';
+  if (Array.isArray(d?.flows)) return 'connections.outbound';
+  if (Array.isArray(d?.packages)) return 'packages.inventory';
   if (d?.active_state) return 'systemd.unit_state';
   if (Array.isArray(d?.files)) return 'files.metadata';
   return 'unknown';
@@ -944,6 +966,8 @@ function summarize(o) {
   if (p.kind === 'snapshot' || p.kind === 'delta') {
     const d = p.data ?? {};
     if (Array.isArray(d.sockets)) return `${d.count ?? d.sockets.length} listening sockets${d.partial_attribution ? ' · partial attribution' : ''}`;
+    if (Array.isArray(d.flows)) return `${d.total_flows ?? d.flows.length} outbound flow groups${d.attribution_partial ? ' · partial attribution' : ''}`;
+    if (Array.isArray(d.packages)) return `${d.total_packages ?? d.packages.length} installed packages${d.truncated ? ` · ${d.packages.length} kept` : ''}`;
     if (d.unit && d.active_state) return `${d.unit} ${d.active_state}/${d.sub_state}${d.main_pid ? ` · pid ${d.main_pid}` : ''}`;
     if (Array.isArray(d.files)) {
       const bad = d.files.filter((f) => f.status !== 'ok').length;
@@ -1222,7 +1246,10 @@ function watchTarget(w) {
     case 'files.metadata':
       return (p.paths ?? []).join(', ');
     case 'sockets.listening':
+    case 'connections.outbound':
       return [p.include_tcp && 'tcp', p.include_udp && 'udp', p.include_ipv6 && 'ipv6'].filter(Boolean).join(' + ');
+    case 'packages.inventory':
+      return p.max_packages ? `up to ${p.max_packages} packages` : 'installed packages';
     default:
       return '';
   }
@@ -1317,6 +1344,10 @@ function triggerDefaults(type) {
       return { type: 'field_changed', compare_against: 'last_observed', fields: 'active_state, sub_state, main_pid, exec_start_hash' };
     case 'files.metadata':
       return { type: 'set_diff', compare_against: 'last_observed', set_field: 'files', identity_key: 'path' };
+    case 'connections.outbound':
+      return { type: 'set_diff', compare_against: 'last_observed', set_field: 'flows', identity_key: 'flow_key' };
+    case 'packages.inventory':
+      return { type: 'set_diff', compare_against: 'last_observed', set_field: 'packages', identity_key: 'package_key' };
     default:
       return { type: 'collector_stale_or_error', max_stale_seconds: 300, consecutive_errors: 3 };
   }
@@ -1390,6 +1421,8 @@ const watchTargetText = (d) => {
   const p = d.parameters;
   if (d.collector_type === 'files.metadata') return String(p.paths ?? '').split(/[\n,]/).map((x) => x.trim()).filter(Boolean).join(', ');
   if (d.collector_type === 'sockets.listening') return 'listening sockets';
+  if (d.collector_type === 'connections.outbound') return 'outbound connections';
+  if (d.collector_type === 'packages.inventory') return 'installed packages';
   return String(p.unit ?? '').trim();
 };
 
@@ -1411,6 +1444,12 @@ function proposalComposer(inc, run, caps) {
         return el('div', { class: 'stack' }, field('Paths (one per line)', textArea(p, 'paths', { placeholder: '/etc/systemd/system/custom-helper.service', rows: 3, mono: true }), el('span', { class: 'hint' }, 'Approved roots: /etc/systemd/system, /etc/ssh, /etc/nginx, /etc/cron.d, /usr/lib/systemd/system')), el('div', { class: 'checks' }, check(p, 'compute_hash', 'Compute SHA-256')));
       case 'journal.unit_events':
         return el('div', { class: 'stack' }, field('Unit', textInput(p, 'unit', { placeholder: 'custom-helper.service', mono: true })), el('div', { class: 'grid-3' }, field('Min priority', numInput(p, 'min_priority', { min: 0, max: 7 })), field('Max events', numInput(p, 'max_events_per_batch', { min: 1 })), field('Max bytes', numInput(p, 'max_message_bytes', { min: 1 }))));
+      case 'connections.outbound':
+        p.include_udp ??= false;
+        p.exclude_loopback ??= true;
+        return el('div', { class: 'checks' }, check(p, 'include_tcp', 'TCP'), check(p, 'include_udp', 'Connected UDP'), check(p, 'include_ipv6', 'IPv6'), check(p, 'resolve_process', 'Resolve owning process'), check(p, 'exclude_loopback', 'Exclude loopback'));
+      case 'packages.inventory':
+        return el('p', { class: 'hint' }, 'Installed packages from the dpkg status file. The agent caps the entries it keeps and reports anything omitted.');
       default:
         return null;
     }
@@ -1473,6 +1512,8 @@ function proposalComposer(inc, run, caps) {
       'systemd.unit_state': { unit: p.unit, hash_unit_files: p.hash_unit_files },
       'files.metadata': { paths: String(p.paths ?? '').split('\n').map((s) => s.trim()).filter(Boolean), compute_hash: p.compute_hash },
       'journal.unit_events': { unit: p.unit, min_priority: p.min_priority, max_events_per_batch: p.max_events_per_batch, max_message_bytes: p.max_message_bytes },
+      'connections.outbound': { include_tcp: p.include_tcp, include_udp: p.include_udp ?? false, include_ipv6: p.include_ipv6, resolve_process: p.resolve_process, exclude_loopback: p.exclude_loopback ?? true },
+      'packages.inventory': {},
     }[d.collector_type];
     const t = { ...d.trigger };
     if (typeof t.fields === 'string') t.fields = t.fields.split(',').map((s) => s.trim()).filter(Boolean);
@@ -1550,7 +1591,7 @@ function proposalComposer(inc, run, caps) {
     const capButtons = el(
       'div',
       { class: 'cap-list' },
-      (caps.length ? caps : [{ collector_type: 'sockets.listening' }, { collector_type: 'systemd.unit_state' }, { collector_type: 'files.metadata' }, { collector_type: 'journal.unit_events' }]).map((c) =>
+      (caps.length ? caps : ALL_COLLECTORS.map((collector_type) => ({ collector_type }))).map((c) =>
         el(
           'button',
           {
@@ -3917,8 +3958,9 @@ function auditPanel(audit) {
 
 const drawer = () => document.getElementById('drawer');
 
-function openDrawer(title, sub, bodyNodes, footNodes) {
+function openDrawer(title, sub, bodyNodes, footNodes, { wide = false } = {}) {
   const d = drawer();
+  d.classList.toggle('drawer-wide', wide);
   const closeBtn = el('button', { class: 'btn btn-sm btn-ghost btn-icon', type: 'button', title: 'Close', attrs: { 'aria-label': 'Close' }, on: { click: () => d.close() } }, icon('close'));
   replace(
     d,
@@ -4832,15 +4874,978 @@ function openActionDrawer(a) {
       replace(statusSlot, actionStatusBadge(d.status, { ...a, status: d.status }));
       if (d.status === 'pending_approval' && !lapsed(a)) replace(approveSlot, approvalPanel(a, d));
       else if (d.status !== 'pending_approval') replace(approveSlot);
+      const receiptsSlot = el('div', null, receiptsView(d.receipts));
+      // Verification polls re-read the detail; keep the receipt list and status in step with it.
+      const onDetail = (nd) => {
+        if (!receiptsSlot.isConnected) return;
+        replace(receiptsSlot, receiptsView(nd.receipts));
+        replace(statusSlot, actionStatusBadge(nd.status, { ...a, status: nd.status }));
+      };
       replace(
         detailSlot,
         section('Evidence', evidenceBadges(d.payload.evidence_observation_ids, d.payload.incident_id)),
-        section('Execution receipts', receiptsView(d.receipts)),
+        section('Execution receipts', receiptsSlot),
+        verificationSection(a, onDetail),
         section('Signed intent', signaturesView(d)),
         el('details', { class: 'preview' }, el('summary', null, 'Canonical payload (RFC 8785)'), jsonBlock(d.payload)),
       );
     })
     .catch((err) => replace(detailSlot, errorBox(err)));
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive investigator (P11–P18): host deep-dive, follow-ups, verification
+// ---------------------------------------------------------------------------
+
+const COLLECTOR_NAME = {
+  'sockets.listening': 'Listening sockets',
+  'systemd.unit_state': 'Unit state',
+  'files.metadata': 'File metadata',
+  'journal.unit_events': 'Journal events',
+  'connections.outbound': 'Outbound connections',
+  'packages.inventory': 'Package inventory',
+};
+const collectorName = (c) => COLLECTOR_NAME[c] ?? String(c ?? 'unknown collector');
+const words = (v) => String(v ?? '').replace(/_/g, ' ');
+
+const COVERAGE_STATE = {
+  covered: ['ok', 'Covered'],
+  sampled: ['solid', 'Sampled, not watched'],
+  partial: ['warn', 'Partial attribution'],
+  error: ['bad', 'Collector error'],
+  awaiting_sample: ['warn', 'Awaiting first sample'],
+  idle: ['ghost', 'Not watched'],
+  disabled: ['ghost', 'Disabled by profile'],
+  unavailable: ['ghost', 'Not advertised'],
+};
+const GAP_TEXT = {
+  awaiting_agent: 'Waiting for the agent (offline or not yet connected)',
+  agent_unsupported: 'The agent predates host discovery',
+  collector_disabled: 'Disabled by the host profile',
+  awaiting_capacity: 'Waiting for watch capacity on this host',
+  awaiting_sample: 'Sample requested, not yet received',
+  sample_window_elapsed: 'Sample window elapsed without data',
+  deadline_elapsed: 'Discovery deadline elapsed',
+  incomplete_sample: 'The sample was partial or failed',
+};
+const INTERP = { supports: ['ok', 'Supports'], contradicts: ['bad', 'Contradicts'], unresolved: ['warn', 'Unresolved'] };
+const FOLLOWUP_STATUS = {
+  awaiting_evidence: ['warn', 'Awaiting fresh evidence'],
+  ready: ['accent', 'Evidence ready'],
+  leased: ['accent', 'Being interpreted'],
+  answered: ['ok', 'Answered'],
+  expired: ['ghost', 'Expired unanswered'],
+  cancelled: ['ghost', 'Cancelled'],
+  exhausted: ['bad', 'Attempts exhausted'],
+  policy_changed: ['warn', 'Policy changed'],
+};
+const CHECK_RESULT = {
+  verified: ['ok', 'Verified'],
+  contradicted: ['bad', 'Contradicted'],
+  awaiting_evidence: ['accent', 'Awaiting evidence'],
+  indeterminate: ['warn', 'Indeterminate'],
+  no_receipt: ['ghost', 'No receipt recorded yet'],
+};
+const ATTEMPT_STATUS = { saved: ['ok', 'Saved'], failed: ['bad', 'Failed'], leased: ['accent', 'In progress'], cancelled: ['ghost', 'Cancelled'] };
+const FRESHNESS = {
+  current: ['ok', 'Current'],
+  assessment_advanced: ['warn', 'Assessment changed'],
+  overdue: ['warn', 'Overdue'],
+  awaiting_first_review: ['accent', 'Awaiting first review'],
+  never_reviewed: ['ghost', 'Never reviewed'],
+};
+const BASELINE_STATE = { trusted: ['ok', 'Trusted'], corroborated: ['accent', 'Corroborated'], provisional: ['warn', 'Provisional'], rolled_back: ['ghost', 'Rolled back'], none: ['ghost', 'No baseline'] };
+
+function stateBadge(map, key, fallback = null) {
+  const [cls, label] = map[key] ?? ['ghost', fallback ?? cap(words(key)) ?? '—'];
+  return el('span', { class: ['badge', cls] }, label);
+}
+const interpBadge = (i) => stateBadge(INTERP, i, i ? cap(words(i)) : 'Not answered');
+const obsTag = (id, title = null) => (id == null ? el('span', { class: 'muted' }, '—') : el('span', { class: 'ev-badge static', title: title ?? `Observation ${id}` }, `obs ${id}`));
+const chipList = (list, empty) => (list?.length ? el('div', { class: 'chip-row' }, list.map((x) => el('span', { class: 'chip-static' }, x))) : el('span', { class: 'muted' }, empty));
+const subhead = (title, ...extra) => el('div', { class: 'subhead' }, el('h3', null, title), extra.length ? el('div', { class: 'row' }, extra) : null);
+
+/** Modal confirmation stacked above the drawer; resolves true only on an explicit confirm. */
+function confirmDialog({ title, body, confirm = 'Confirm', danger = false }) {
+  return new Promise((resolve) => {
+    const dlg = el('dialog', { class: 'confirm', attrs: { 'aria-labelledby': 'confirm-title' } });
+    const done = (value) => {
+      if (dlg.open) dlg.close();
+      dlg.remove();
+      resolve(value);
+    };
+    const ok = el('button', { class: ['btn', danger ? 'btn-danger' : 'btn-primary'], type: 'button', on: { click: () => done(true) } }, confirm);
+    append(
+      dlg,
+      el(
+        'div',
+        { class: 'confirm-inner' },
+        el('h2', { id: 'confirm-title' }, title),
+        el('div', { class: 'confirm-body' }, body),
+        el('div', { class: 'confirm-foot' }, el('button', { class: 'btn btn-ghost', type: 'button', on: { click: () => done(false) } }, 'Cancel'), ok),
+      ),
+    );
+    dlg.addEventListener('cancel', (e) => {
+      e.preventDefault();
+      done(false);
+    });
+    dlg.addEventListener('click', (e) => {
+      if (e.target === dlg) done(false);
+    });
+    document.body.append(dlg);
+    dlg.showModal();
+    ok.focus();
+  });
+}
+
+/**
+ * POST behind a confirmation; returns the response, or null when cancelled or
+ * failed (the error lands in errNode). `body` may be a function so fields typed
+ * into the dialog itself are read after it closes.
+ */
+async function confirmedPost(btn, errNode, path, body, dialog) {
+  if (!(await confirmDialog(dialog))) return null;
+  btn.disabled = true;
+  replace(errNode);
+  try {
+    return await api(path, { method: 'POST', body: typeof body === 'function' ? body() : body });
+  } catch (err) {
+    replace(errNode, errorBox(err));
+    return null;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function unavailableNotice(r, what) {
+  if (r?.error) return errorBox(r.error);
+  if (r?.reason === 'admin_disabled') return notice('', 'lock', [el('strong', null, `${what} not visible.`), el('span', null, r.message ?? 'This view needs the admin interface (--enable-admin).')]);
+  if (r?.reason === 'forbidden') return notice('', 'lock', [el('strong', null, `${what} not visible to this console token.`), el('span', null, r.message ?? '')]);
+  return notice('', 'alert', [el('strong', null, `${what} not available.`), el('span', null, `This control-d ${r?.message ?? 'predates the adaptive investigator contract'}.`)]);
+}
+
+function hostTags(h) {
+  const p = h.host_profile;
+  if (!p) return null;
+  return el(
+    'div',
+    { class: 'host-tags' },
+    p.host_tags.map((t) => el('span', { class: 'chip-static' }, t)),
+    p.expected_services.length ? null : el('span', { class: 'badge ghost', title: 'The admin profile names no expected services: discovery infers the role' }, 'No declared role'),
+  );
+}
+
+// ----- host deep-dive -----
+
+const HOST_TABS = [
+  ['profile', 'Profile & coverage'],
+  ['discovery', 'Discovery'],
+  ['monitoring', 'Monitoring'],
+  ['review', 'Reviews'],
+];
+const HOST_SOURCES = {
+  profile: (h) => `/api/hosts/${enc(h)}/profile`,
+  discovery: (h, v) => `/api/hosts/${enc(h)}/discovery${v ? `?version=${enc(v)}` : ''}`,
+  monitoring: (h) => `/api/hosts/${enc(h)}/monitoring`,
+  review: (h) => `/api/hosts/${enc(h)}/review`,
+};
+
+function openHostDrawer(hostId, tab = state.hostTab) {
+  const h = state.hosts.find((x) => x.host_id === hostId) ?? { host_id: hostId, liveness_status: 'unknown', agent_version: '—' };
+  const dive = { host: hostId, data: {}, version: null, tab: HOST_TABS.some(([t]) => t === tab) ? tab : 'profile' };
+  const summarySlot = el('div', { class: 'dive-summary' }, Array.from({ length: 4 }, () => el('div', { class: 'skeleton' })));
+  const panelSlot = el('div', { class: 'dive-panel', attrs: { role: 'tabpanel' } }, loading(4));
+  const buttons = HOST_TABS.map(([id, label]) =>
+    el('button', { type: 'button', id: `hosttab-${id}`, attrs: { role: 'tab', 'aria-selected': String(dive.tab === id), 'aria-controls': 'host-tabpanel' }, on: { click: () => select(id) } }, label),
+  );
+  panelSlot.id = 'host-tabpanel';
+  const live = () => drawer().open && panelSlot.isConnected;
+
+  function draw() {
+    if (!live()) return;
+    replace(summarySlot, diveSummary(dive));
+    const d = dive.data[dive.tab];
+    if (!d) return replace(panelSlot, loading(4));
+    const build = { profile: profilePanel, discovery: discoveryPanel, monitoring: monitoringPanel, review: reviewPanel }[dive.tab];
+    replace(panelSlot, build(d, dive, reload));
+    panelSlot.setAttribute('aria-labelledby', `hosttab-${dive.tab}`);
+  }
+  function select(id) {
+    dive.tab = id;
+    state.hostTab = id;
+    for (const b of buttons) b.setAttribute('aria-selected', String(b.id === `hosttab-${id}`));
+    draw();
+  }
+  async function reload(...keys) {
+    await Promise.all(
+      keys.map(async (k) => {
+        try {
+          dive.data[k] = await api(HOST_SOURCES[k](hostId, k === 'discovery' ? dive.version : null));
+        } catch (error) {
+          dive.data[k] = { error };
+        }
+      }),
+    );
+    draw();
+  }
+  dive.reload = reload;
+
+  openDrawer(
+    hostId,
+    [livenessBadge(h.liveness_status), ' ', el('span', { class: 'mono' }, h.agent_version), ' · what this host appears to do, what we can see, and who may change its monitoring'],
+    [summarySlot, el('div', { class: 'tabs', attrs: { role: 'tablist', 'aria-label': 'Host deep-dive sections' } }, buttons), panelSlot],
+    [
+      el('a', { class: 'btn btn-ghost', href: `#/baselines/${enc(hostId)}`, on: { click: () => drawer().close() } }, 'Baselines & telemetry'),
+      el('button', { class: 'btn', type: 'button', on: { click: () => drawer().close() } }, 'Close'),
+    ],
+    { wide: true },
+  );
+  drawer().addEventListener(
+    'close',
+    () => {
+      if (parseRoute().view === 'fleet' && parseRoute().query.get('host')) history.replaceState(null, '', '#/fleet');
+    },
+    { once: true },
+  );
+  reload('profile', 'discovery', 'monitoring', 'review');
+}
+
+function diveSummary(dive) {
+  const d = dive.data;
+  const cell = (k, v, s) => el('div', { class: 'dive-cell' }, el('div', { class: 'k' }, k), el('div', { class: 'v' }, v), s ? el('div', { class: 's' }, s) : null);
+  const disc = d.discovery;
+  const latestA = disc?.available ? disc : null;
+  const interp = latestA?.assessment?.interpretations?.at(-1)?.proposal ?? null;
+  const role = interp ? cell('Inferred role', el('span', { class: 'clamp-2', title: interp.purpose }, interp.purpose), `assessment v${latestA.assessment.version}`) : cell('Inferred role', el('span', { class: 'muted' }, disc && !disc.available ? 'Not available' : 'Not inferred yet'), latestA?.latest_version ? `assessment v${latestA.latest_version}` : null);
+  const cov = d.profile?.coverage ?? [];
+  const covered = cov.filter((c) => ['covered', 'partial'].includes(c.state)).length;
+  const gaps = (latestA?.assessment?.collectors ?? []).filter((c) => c.gap).length + cov.filter((c) => ['partial', 'error', 'awaiting_sample'].includes(c.state)).length;
+  const coverage = !d.profile ? cell('Coverage', el('span', { class: 'muted' }, '…')) : d.profile.error ? cell('Coverage', el('span', { class: 'muted' }, 'Unavailable')) : cell('Coverage', `${covered} of ${cov.length || 6} collectors`, gaps ? el('span', { class: 'warn-text' }, plural(gaps, 'visibility gap')) : 'no open gaps');
+  const m = d.monitoring;
+  const monitoring = !m
+    ? cell('Monitoring', el('span', { class: 'muted' }, '…'))
+    : !m.available
+      ? cell('Monitoring', el('span', { class: 'muted' }, 'Needs admin view'))
+      : cell('Monitoring', plural(m.watches.length, 'managed watch', 'managed watches'), m.grants.filter((g) => !g.revoked).length ? `${plural(m.grants.filter((g) => !g.revoked).length, 'grant')} · ${m.candidates.filter((c) => c.state === 'provisional').length} awaiting corroboration` : 'no delegation grant');
+  const r = d.review;
+  const review = !r
+    ? cell('Last review', el('span', { class: 'muted' }, '…'))
+    : !r.available
+      ? cell('Last review', el('span', { class: 'muted' }, 'Needs admin view'))
+      : r.review
+        ? cell('Last review', interpBadge(r.review.interpretation), [relTime(r.review.completed_at), ' · ', stateBadge(FRESHNESS, r.freshness?.state)])
+        : cell('Last review', el('span', { class: 'muted' }, 'None yet'), r.schedule ? 'scheduled' : 'no schedule');
+  return [role, coverage, monitoring, review];
+}
+
+// P11 -----------------------------------------------------------------------
+
+function profilePanel(p) {
+  if (p.error || p.available === false) return unavailableNotice(p, 'Host profile');
+  const prof = p.host_profile;
+  const profileBlock = prof
+    ? el(
+        'dl',
+        { class: 'kv kv-wide' },
+        el('dt', null, 'Host tags'),
+        el('dd', null, chipList(prof.host_tags, 'none')),
+        el('dt', null, 'Expected services'),
+        el('dd', null, prof.expected_services.length ? chipList(prof.expected_services) : el('span', null, 'None declared. ', el('span', { class: 'muted' }, 'A quiet host: discovery infers its role from evidence.'))),
+        el('dt', null, 'Enabled collectors'),
+        el('dd', null, `${prof.enabled_collectors.length} of ${ALL_COLLECTORS.length}`),
+      )
+    : notice('warn', 'alert', [el('strong', null, 'No host profile reported.'), el('span', null, 'This agent registered without a profile (it predates P11), so which collectors it supports is unknown.')]);
+  const rows = p.coverage.map((c) =>
+    el(
+      'tr',
+      null,
+      el('td', null, el('div', { class: 'cov-name' }, collectorName(c.collector)), el('div', { class: 'mono muted small' }, c.collector)),
+      el('td', null, c.profile === 'unknown' ? el('span', { class: 'muted' }, 'unknown') : c.profile === 'enabled' ? 'enabled' : el('span', { class: 'muted' }, 'disabled')),
+      el('td', null, stateBadge(COVERAGE_STATE, c.state)),
+      el('td', { class: 'num' }, String(c.watches)),
+      el(
+        'td',
+        null,
+        c.latest_observed_at ? [relTime(c.latest_observed_at), ' ', obsTag(c.latest_observation_id)] : el('span', { class: 'muted' }, 'none'),
+        c.partial_attribution ? el('div', { class: 'warn-text small' }, 'some entries have no owning process') : null,
+        c.truncated ? el('div', { class: 'muted small' }, 'agent cap reached; entries omitted') : null,
+      ),
+    ),
+  );
+  const gaps = p.coverage.filter((c) => !['covered', 'sampled', 'idle'].includes(c.state));
+  return el(
+    'div',
+    { class: 'stack' },
+    el('div', { class: 'row' }, el('span', { class: 'muted small' }, 'Agent'), el('span', { class: 'mono' }, p.agent_version), p.discovery_support ? el('span', { class: 'badge ok' }, 'Supports host discovery') : el('span', { class: 'badge ghost', title: 'Host discovery needs an agent built with +host-discovery-v1' }, 'No host discovery')),
+    section('Admin-owned profile', profileBlock),
+    section(
+      'Collector coverage',
+      el('p', { class: 'muted small' }, 'What the profile enables, what control-d advertises to this console, and what the latest sample shows. Agents report on change, so an old sample is not a gap by itself.'),
+      el('div', { class: 'table-wrap' }, el('table', { class: 'obs-table cov-table' }, el('thead', null, el('tr', null, ['Collector', 'Profile', 'Coverage', 'Watches', 'Latest sample'].map((x) => el('th', null, x)))), el('tbody', null, rows))),
+      p.capabilities_available ? null : el('p', { class: 'muted small' }, 'This control-d does not list collector capabilities; advertised support is unknown.'),
+    ),
+    gaps.length
+      ? section(
+          'Visibility gaps',
+          el(
+            'ul',
+            { class: 'gap-list' },
+            gaps.map((c) => el('li', null, stateBadge(COVERAGE_STATE, c.state), ' ', collectorName(c.collector), c.state === 'unavailable' ? el('span', { class: 'muted' }, ' · outside the central floor or this console’s scope') : null)),
+          ),
+        )
+      : null,
+  );
+}
+
+// P15 -----------------------------------------------------------------------
+
+function discoveryPanel(d, dive) {
+  if (d.error || d.available === false) return unavailableNotice(d, 'Host discovery');
+  const a = d.assessment;
+  const latest = d.latest_version;
+  const viewingLatest = !a || a.version === latest;
+  const versionSel = latest > 1
+    ? el(
+        'select',
+        { attrs: { 'aria-label': 'Assessment revision' }, on: { change: (e) => { dive.version = Number(e.target.value) === latest ? null : Number(e.target.value); dive.reload('discovery'); } } },
+        Array.from({ length: latest }, (_, i) => latest - i).map((v) => el('option', { value: String(v), selected: a?.version === v }, v === latest ? `v${v} (latest)` : `v${v}`)),
+      )
+    : null;
+  const advance = adminEnabled() ? el('button', { class: 'btn btn-sm', type: 'button', title: 'Ask control-d to schedule or collect the next bounded discovery samples for this host', on: { click: (e) => advanceDiscovery(e.currentTarget, dive) } }, icon('refresh'), 'Advance discovery') : null;
+  const head = el('div', { class: 'row wrap' }, el('span', { class: 'badge solid' }, a ? `Assessment v${a.version}` : 'No assessment'), versionSel, a?.deadline ? el('span', { class: 'muted small' }, 'deadline ', relTime(a.deadline, { until: true })) : null, el('span', { class: 'spacer' }), advance);
+  const advanceErr = el('div', { class: 'advance-err' });
+  if (!a) return el('div', { class: 'stack' }, head, advanceErr, emptyState('No discovery assessment', 'control-d queues discovery once per enrollment generation. This host has none yet.'));
+
+  const evidenceBy = new Map(a.collectors.filter((c) => c.evidence).map((c) => [c.evidence.observation_id, c.collector]));
+  const interp = a.interpretations.at(-1) ?? null;
+  const p = interp?.proposal;
+  const cite = (id) => obsTag(id, `Observation ${id}${evidenceBy.has(id) ? ` · ${collectorName(evidenceBy.get(id))}` : ''}`);
+  const roleCard = p
+    ? el(
+        'div',
+        { class: 'role-card' },
+        el('div', { class: 'eyebrow' }, 'Inferred role'),
+        el('p', { class: 'role' }, p.purpose),
+        el(
+          'dl',
+          { class: 'kv kv-wide' },
+          el('dt', null, 'Depends on'),
+          el('dd', null, chipList(p.dependencies, 'none identified')),
+          el('dt', null, 'Cited evidence'),
+          el('dd', null, el('div', { class: 'ev-row' }, p.citations.map((id) => [cite(id), evidenceBy.has(id) ? el('span', { class: 'muted small' }, collectorName(evidenceBy.get(id))) : null]))),
+          el('dt', null, 'Proposed watch'),
+          el('dd', null, el('span', { class: 'mono' }, p.proposed_watch.service_unit ?? collectorName(p.proposed_watch.collector)), el('span', { class: 'muted' }, ` · from ${collectorName(p.proposed_watch.collector)}`), el('div', { class: 'small' }, p.proposed_watch.rationale)),
+        ),
+        p.uncertainty ? el('div', { class: 'unc' }, el('b', null, 'Unanswered: '), p.uncertainty) : null,
+        p.visibility_gaps.length ? el('div', null, el('div', { class: 'eyebrow' }, 'What it cannot see'), el('ul', { class: 'gap-list' }, p.visibility_gaps.map((g) => el('li', null, g)))) : null,
+      )
+    : notice('', 'clock', [el('strong', null, 'No interpretation for this revision.'), el('span', null, d.attempts.some((g) => g.attempts.length) ? 'See the interpretation attempts below.' : 'A worker has not interpreted the current samples yet.')]);
+
+  const evidenceRows = a.collectors.map((c) =>
+    el(
+      'tr',
+      null,
+      el('td', null, collectorName(c.collector)),
+      el('td', null, c.evidence ? [obsTag(c.evidence.observation_id), ' ', el('span', { class: 'mono muted small' }, `${c.evidence.watch_id} v${c.evidence.spec_version}`)] : el('span', { class: 'warn-text' }, GAP_TEXT[c.gap] ?? words(c.gap))),
+      el('td', null, c.evidence ? obsStatusBadge(c.evidence.status) : stateBadge({}, c.gap, 'Gap')),
+      el('td', null, c.evidence ? hashChip(c.evidence.state_hash) : el('span', { class: 'muted' }, '—')),
+    ),
+  );
+
+  const samples = viewingLatest && d.samples.length
+    ? section(
+        'Discovery samples',
+        d.samples.map((s) =>
+          el(
+            'details',
+            { class: 'sample' },
+            el('summary', null, el('b', null, collectorName(s.collector)), ' ', obsTag(s.evidence?.observation_id), el('span', { class: 'muted' }, ` · showing ${s.entries.length} of ${s.total}`), s.partial_attribution ? el('span', { class: 'badge warn' }, 'partial attribution') : null, s.truncated ? el('span', { class: 'badge ghost' }, 'truncated') : null),
+            sampleTable(s),
+          ),
+        ),
+      )
+    : null;
+
+  const attemptGroups = d.attempts.filter((g) => g.attempts.length);
+  const attempts = attemptGroups.length
+    ? section(
+        'Interpretation attempts',
+        attemptGroups.map((g) =>
+          el(
+            'div',
+            { class: 'attempts' },
+            el('div', { class: 'muted small' }, 'Sources ', g.source_ids.map((id) => [obsTag(id), ' '])),
+            el(
+              'ol',
+              { class: 'attempt-list' },
+              g.attempts.map((t, i) =>
+                el(
+                  'li',
+                  null,
+                  el('span', { class: 'mono muted' }, `#${i + 1}`),
+                  stateBadge(ATTEMPT_STATUS, t.status),
+                  t.error ? el('span', { class: 'mono warn-text' }, words(t.error)) : null,
+                  t.assessment_version ? el('span', { class: 'small' }, `saved as v${t.assessment_version}`) : null,
+                  el('span', { class: 'spacer' }),
+                  t.usage ? el('span', { class: 'mono muted small', title: `cached ${t.usage.cached_input_tokens} · cache writes ${t.usage.cache_creation_input_tokens}` }, `${fmtTokens(t.usage.input_tokens)} in · ${fmtTokens(t.usage.output_tokens)} out · ${fmtTokens(t.usage.reasoning_tokens)} reasoning`) : el('span', { class: 'muted small' }, 'no usage reported'),
+                  el('span', { class: 'muted small' }, 'lease ', relTime(t.lease_until)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      )
+    : null;
+
+  return el(
+    'div',
+    { class: 'stack' },
+    head,
+    advanceErr,
+    viewingLatest ? null : notice('', 'clock', [el('strong', null, `Viewing revision v${a.version}.`), el('span', null, `The latest is v${latest}. Earlier revisions are kept unchanged.`)]),
+    roleCard,
+    section('Evidence by collector', el('div', { class: 'table-wrap' }, el('table', { class: 'obs-table' }, el('thead', null, el('tr', null, ['Collector', 'Evidence or gap', 'Status', 'State hash'].map((x) => el('th', null, x)))), el('tbody', null, evidenceRows)))),
+    samples,
+    attempts,
+  );
+}
+
+function sampleTable(s) {
+  const sockets = s.collector === 'sockets.listening';
+  const head = sockets ? ['Protocol', 'Address', 'Process', 'Unit'] : ['Package', 'Version', 'Arch'];
+  const row = (e) =>
+    sockets
+      ? [el('td', { class: 'mono' }, e.protocol ?? '—'), el('td', { class: 'mono' }, `${e.local_addr ?? '?'}:${e.local_port ?? '?'}`), el('td', { class: 'mono' }, e.comm ?? el('span', { class: 'warn-text' }, 'no owner')), el('td', { class: 'mono' }, e.systemd_unit ?? '—')]
+      : [el('td', { class: 'mono' }, e.name ?? '—'), el('td', { class: 'mono' }, e.version ?? '—'), el('td', { class: 'mono' }, e.arch ?? '—')];
+  return el('div', { class: 'table-wrap' }, el('table', { class: 'obs-table' }, el('thead', null, el('tr', null, head.map((x) => el('th', null, x)))), el('tbody', null, s.entries.map((e) => el('tr', null, row(e))))));
+}
+
+async function advanceDiscovery(btn, dive) {
+  btn.disabled = true;
+  const errNode = btn.closest('.stack')?.querySelector('.advance-err');
+  if (errNode) replace(errNode);
+  try {
+    const r = await api(`/api/admin/hosts/${enc(dive.host)}/discovery/advance`, { method: 'POST', body: {} });
+    toast(r.bundle_version ? `Discovery samples requested (bundle v${r.bundle_version}); assessment v${r.assessment_version}` : `Discovery advanced; assessment v${r.assessment_version ?? '—'}`, 'ok');
+    dive.version = null;
+    await dive.reload('discovery', 'profile');
+  } catch (err) {
+    if (errNode) replace(errNode, errorBox(err));
+    btn.disabled = false;
+  }
+}
+
+// P16 -----------------------------------------------------------------------
+
+function monitoringPanel(m, dive) {
+  if (m.error || m.available === false) return unavailableNotice(m, 'Delegated monitoring');
+  const admin = adminEnabled();
+  const errNode = el('div');
+  const reload = async (msg) => {
+    toast(msg, 'ok');
+    await dive.reload('monitoring', 'profile');
+  };
+
+  const grantRows = m.grants.length
+    ? el(
+        'div',
+        { class: 'grant-list' },
+        m.grants.map((g) =>
+          el(
+            'div',
+            { class: ['grant', g.revoked && 'revoked'] },
+            el('div', { class: 'grant-who' }, el('span', { class: 'mono' }, g.principal_id), g.revoked ? el('span', { class: 'badge ghost' }, 'revoked') : null),
+            el('div', { class: 'small' }, g.revoked ? 'no watches allowed' : `up to ${plural(g.max_watches, 'persistent watch', 'persistent watches')}`, ' · ', g.allow_promotion ? el('span', { class: 'warn-text' }, 'may promote corroborated baselines') : 'no baseline promotion'),
+            el('div', { class: 'muted small' }, 'set ', relTime(g.updated_at)),
+            admin && !g.revoked ? el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: (e) => revokeGrant(e.currentTarget, g) } }, 'Revoke') : null,
+          ),
+        ),
+      )
+    : el('div', { class: 'empty-slot' }, 'No monitoring grant on this host: investigators can only propose incident-scoped ephemeral watches here.');
+
+  async function revokeGrant(btn, g) {
+    const r = await confirmedPost(btn, errNode, `/api/admin/hosts/${enc(dive.host)}/monitoring/grant`, { principal_id: g.principal_id, max_watches: 0, allow_promotion: false }, {
+      title: 'Revoke monitoring grant?',
+      body: [el('p', null, el('span', { class: 'mono' }, g.principal_id), ` will no longer add, strengthen or renew persistent watches on ${dive.host}. Existing watches stay until they are retired.`)],
+      confirm: 'Revoke grant',
+      danger: true,
+    });
+    if (r) await reload(`Grant for ${g.principal_id} revoked`);
+  }
+
+  const grantForm = admin ? monitoringGrantForm(dive, errNode, reload) : null;
+
+  const watchCards = m.watches.length
+    ? m.watches.map((w) =>
+        el(
+          'article',
+          { class: 'managed' },
+          el('div', { class: 'row wrap' }, el('span', { class: 'mono strong' }, w.watch_id), el('span', { class: 'badge solid' }, `rev ${w.revision ?? '—'}`), stateBadge(BASELINE_STATE, w.baseline_state), w.active ? null : el('span', { class: 'badge ghost' }, 'inactive'), el('span', { class: 'spacer' }), el('span', { class: 'muted small' }, 'owner ', el('span', { class: 'mono' }, w.principal_id))),
+          el('div', { class: 'small' }, el('span', { class: 'mono' }, w.target ?? collectorName(w.collector)), w.interval_seconds ? el('span', { class: 'muted' }, ` · every ${w.interval_seconds}s`) : null),
+          el('dl', { class: 'kv kv-wide' }, el('dt', null, 'Why'), el('dd', null, w.purpose), el('dt', null, 'Expected signal'), el('dd', null, w.expected_signal), el('dt', null, 'Evidence'), el('dd', null, el('div', { class: 'ev-row' }, w.evidence.map((id) => obsTag(id)))), el('dt', null, 'Review by'), el('dd', null, w.review_at ? [el('span', { class: 'num' }, fmtTime(w.review_at)), ' · ', relTime(w.review_at), w.review_overdue ? [' ', el('span', { class: 'badge warn' }, 'review overdue')] : null] : '—')),
+        ),
+      )
+    : el('div', { class: 'empty-slot' }, 'No investigator-managed watches in the audit window.');
+
+  const candRows = m.candidates.map((c) => {
+    const watch = m.watches.find((w) => w.watch_id === c.watch_id);
+    const actions = [];
+    if (admin && c.state === 'provisional') actions.push(el('button', { class: 'btn btn-sm', type: 'button', on: { click: (e) => corroborate(e.currentTarget, c) } }, 'Corroborate…'));
+    if (admin && c.state === 'trusted' && watch?.baseline_revision === c.promoted_revision) actions.push(el('button', { class: 'btn btn-sm btn-danger', type: 'button', on: { click: (e) => rollback(e.currentTarget, c) } }, 'Roll back…'));
+    return el(
+      'article',
+      { class: 'candidate' },
+      el('div', { class: 'row wrap' }, el('span', { class: 'mono' }, `#${c.candidate_id}`), stateBadge(BASELINE_STATE, c.state), el('span', { class: 'mono muted small' }, c.watch_id), el('span', { class: 'spacer' }), actions),
+      el('p', { class: 'small' }, c.rationale),
+      el(
+        'div',
+        { class: 'row wrap muted small' },
+        'samples ',
+        c.observations.map((id) => obsTag(id)),
+        ' · proposed ',
+        relTime(c.created_at),
+        c.corroborated ? [' · corroborated ', relTime(c.corroborated_at)] : null,
+        c.promoted_revision != null ? [' · baseline rev ', el('span', { class: 'mono' }, String(c.promoted_revision))] : null,
+      ),
+      c.corroboration ? el('div', { class: 'unc' }, el('b', null, 'Operator: '), c.corroboration) : null,
+      c.rolled_back ? el('div', { class: 'unc' }, el('b', null, 'Rolled back: '), c.rollback_rationale ?? '') : null,
+    );
+  });
+
+  async function corroborate(btn, c) {
+    const f = { rationale: '' };
+    const input = textArea(f, 'rationale', { rows: 3, placeholder: 'Independent evidence, e.g. the change ticket or golden-image hash this matches' });
+    const r = await confirmedPost(btn, errNode, `/api/admin/monitoring/candidates/${enc(c.candidate_id)}/corroborate`, () => ({ rationale: f.rationale.trim() }), {
+      title: `Corroborate candidate #${c.candidate_id}?`,
+      body: [el('p', null, 'Corroboration is the independent operator input a delegated promotion requires. It does not promote anything by itself.'), el('p', { class: 'small' }, c.rationale), field('Your corroboration (recorded in the audit log)', input)],
+      confirm: 'Corroborate',
+    });
+    if (r) {
+      if (r.allowed) await reload(`Candidate #${c.candidate_id} corroborated`);
+      else replace(errNode, notice('bad', 'alert', [el('strong', null, 'Refused.'), el('span', null, r.reason ?? 'control-d did not record the corroboration')]));
+    }
+  }
+
+  async function rollback(btn, c) {
+    const f = { rationale: '' };
+    const input = textArea(f, 'rationale', { rows: 3, placeholder: 'Why this trusted state is wrong' });
+    const r = await confirmedPost(btn, errNode, `/api/admin/hosts/${enc(dive.host)}/monitoring/${enc(c.watch_id)}/rollback`, () => ({ expected_baseline: c.promoted_revision, rationale: f.rationale.trim() }), {
+      title: `Roll back baseline rev ${c.promoted_revision}?`,
+      body: [el('p', null, `The trusted baseline for `, el('span', { class: 'mono' }, c.watch_id), ' returns to its predecessor. The revision is kept and the rollback is audited.'), field('Rationale (recorded in the audit log)', input)],
+      confirm: 'Roll back',
+      danger: true,
+    });
+    if (r) {
+      if (r.allowed) await reload(`Baseline rev ${c.promoted_revision} rolled back`);
+      else replace(errNode, notice('bad', 'alert', [el('strong', null, 'Refused.'), el('span', null, r.reason ?? 'the baseline changed')]));
+    }
+  }
+
+  return el(
+    'div',
+    { class: 'stack' },
+    errNode,
+    section('Monitoring grants', grantRows, grantForm),
+    section('Investigator-managed watches', watchCards),
+    section('Baseline candidates', m.candidates.length ? candRows : el('div', { class: 'empty-slot' }, 'No provisional or trusted candidates. Provisional expectations guide collection only; nothing is trusted until an operator corroborates it.')),
+    m.decisions.length
+      ? el(
+          'details',
+          { class: 'more' },
+          el('summary', null, `Recent monitoring decisions (${m.decisions.length})`),
+          el('ul', { class: 'decision-log' }, m.decisions.map((x) => el('li', null, el('span', { class: ['dot', x.allowed ? 'ok' : 'bad'] }), el('span', { class: 'mono' }, words(x.operation)), x.watch_id ? el('span', { class: 'mono muted' }, x.watch_id) : null, el('span', { class: 'muted' }, x.actor), x.reason ? el('span', { class: 'warn-text' }, x.reason) : null, el('span', { class: 'spacer' }), relTime(x.at)))),
+        )
+      : null,
+    el('p', { class: 'muted small' }, `Reconstructed from the last ${m.window_entries} audit entries: control-d records every grant, watch change, corroboration and rollback there, but has no direct read for them.`),
+  );
+}
+
+function monitoringGrantForm(dive, errNode, reload) {
+  const f = { principal_id: 'reasoner-d:discovery', max_watches: 3, allow_promotion: false };
+  const form = el('div', { class: 'subform' });
+  const submit = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, 'Set grant…');
+  const note = el('span', { class: 'hint' });
+  append(form, [
+    el('div', { class: 'grid-2' }, field('Principal', textInput(f, 'principal_id', { mono: true })), field('Max persistent watches', numInput(f, 'max_watches', { min: 0, max: 32 }))),
+    el('div', { class: 'checks' }, check(f, 'allow_promotion', 'Also allow promoting operator-corroborated baselines')),
+    el('div', { class: 'form-actions' }, note, el('span', { class: 'spacer' }), submit),
+  ]);
+  guardSubmit(form, submit, note, () => (!String(f.principal_id).trim() ? 'Name the investigator principal.' : !(Number.isInteger(f.max_watches) && f.max_watches >= 0 && f.max_watches <= 32) ? 'Max watches must be 0–32.' : null), 'control-d enforces the host watch limit');
+  submit.addEventListener('click', async () => {
+    const r = await confirmedPost(submit, errNode, `/api/admin/hosts/${enc(dive.host)}/monitoring/grant`, { ...f, principal_id: f.principal_id.trim() }, {
+      title: 'Set monitoring grant?',
+      body: [
+        el('p', null, el('span', { class: 'mono' }, f.principal_id.trim()), ` may add, test, strengthen and renew up to ${plural(f.max_watches, 'persistent service watch', 'persistent service watches')} on `, el('span', { class: 'mono' }, dive.host), ' without per-watch approval.'),
+        f.allow_promotion ? notice('warn', 'alert', [el('strong', null, 'Promotion allowed.'), el('span', null, 'It may also promote a baseline to trusted once an operator has corroborated the candidate.')]) : el('p', { class: 'muted small' }, 'Trusted baseline promotion stays with operators.'),
+      ],
+      confirm: 'Set grant',
+      danger: f.allow_promotion,
+    });
+    if (r) await reload(`Monitoring grant set for ${r.principal_id ?? f.principal_id}`);
+  });
+  return el('details', { class: 'more' }, el('summary', null, 'Set monitoring grant'), form);
+}
+
+// P17 -----------------------------------------------------------------------
+
+function reviewPanel(r, dive) {
+  if (r.error) return errorBox(r.error);
+  const admin = adminEnabled();
+  const errNode = el('div');
+  const schedule = r.schedule;
+  const scheduleBlock = schedule
+    ? el(
+        'dl',
+        { class: 'kv kv-wide' },
+        el('dt', null, 'Every'),
+        el('dd', null, ttlText(schedule.interval_seconds)),
+        el('dt', null, 'Question'),
+        el('dd', null, schedule.question),
+        el('dt', null, 'Collectors'),
+        el('dd', null, chipList(schedule.collectors.map(collectorName))),
+        el('dt', null, 'Route'),
+        el('dd', { class: 'mono' }, schedule.route),
+        schedule.next_due_at ? [el('dt', null, 'Next due'), el('dd', null, el('span', { class: 'num' }, fmtTime(schedule.next_due_at)), ' · ', relTime(schedule.next_due_at))] : null,
+        el('dt', null, 'Set'),
+        el('dd', null, relTime(schedule.set_at), schedule.set_by ? [' by ', el('span', { class: 'mono' }, schedule.set_by)] : null),
+      )
+    : el('div', { class: 'empty-slot' }, r.schedule_visible === false ? 'control-d does not expose review schedules. None was set from this console since it started.' : 'No periodic review is scheduled for this host.');
+  const scheduleNote = schedule?.source === 'console' ? el('p', { class: 'muted small' }, 'control-d has no read for schedules: this is the schedule this console last set.') : null;
+
+  const cancelBtn = admin && (schedule || r.schedule_visible === false)
+    ? el('button', { class: 'btn btn-sm btn-ghost', type: 'button', on: { click: async (e) => {
+        const res = await confirmedPost(e.currentTarget, errNode, `/api/admin/hosts/${enc(dive.host)}/review-schedule/cancel`, {}, {
+          title: 'Cancel periodic reviews?',
+          body: el('p', null, 'Pending reviews for ', el('span', { class: 'mono' }, dive.host), ' are cancelled and the schedule is removed. Completed reviews are kept.'),
+          confirm: 'Cancel schedule',
+          danger: true,
+        });
+        if (res) {
+          toast('Review schedule cancelled', 'ok');
+          await dive.reload('review');
+        }
+      } } }, 'Cancel schedule…')
+    : null;
+
+  let latest;
+  if (r.available === false) latest = unavailableNotice(r, 'Host reviews');
+  else if (!r.review) latest = el('div', { class: 'empty-slot' }, schedule ? 'No review has completed yet.' : 'This host has never been reviewed. Schedule a review to have a worker re-check it against its assessment.');
+  else {
+    const v = r.review;
+    latest = el(
+      'div',
+      { class: ['review-card', `i-${v.interpretation}`] },
+      el('div', { class: 'row wrap' }, interpBadge(v.interpretation), stateBadge(FRESHNESS, r.freshness?.state), el('span', { class: 'spacer' }), el('span', { class: 'muted small' }, 'completed ', relTime(v.completed_at))),
+      el('div', { class: 'muted small' }, 'Q: ', v.question),
+      el('p', null, v.summary),
+      el(
+        'div',
+        { class: 'row wrap small' },
+        el('span', { class: 'muted' }, 'against assessment'),
+        el('button', { class: 'btn btn-sm btn-ghost', type: 'button', title: 'Open this revision in Discovery', on: { click: () => { dive.version = v.assessment_version === r.freshness?.assessment_version ? null : v.assessment_version; dive.reload('discovery').then(() => document.getElementById('hosttab-discovery')?.click()); } } }, `v${v.assessment_version}`),
+        r.freshness?.state === 'assessment_advanced' ? el('span', { class: 'warn-text' }, `now v${r.freshness.assessment_version}`) : null,
+        el('span', { class: 'muted' }, '· cites'),
+        v.citations.length ? v.citations.map((id) => obsTag(id)) : el('span', { class: 'muted' }, 'nothing'),
+      ),
+    );
+  }
+
+  return el(
+    'div',
+    { class: 'stack' },
+    errNode,
+    section('Latest review', latest),
+    section('Schedule', el('div', { class: 'row wrap' }, el('span', { class: 'spacer' }), cancelBtn), scheduleBlock, scheduleNote, admin ? reviewScheduleForm(dive, schedule, errNode) : null),
+  );
+}
+
+function reviewScheduleForm(dive, current, errNode) {
+  // An existing interval is kept to the second (e.g. 5400 s) unless the operator edits it.
+  const exact = Number.isInteger(current?.interval_seconds) ? current.interval_seconds : null;
+  let intervalEdited = exact === null;
+  const f = {
+    interval_hours: exact !== null ? Number((exact / 3600).toFixed(4)) : 24,
+    question: current?.question ?? 'Has this host’s role, exposure or package set changed since the last assessment?',
+    route: current?.route ?? 'host-review',
+    sockets: current ? current.collectors.includes('sockets.listening') : true,
+    packages: current ? current.collectors.includes('packages.inventory') : true,
+  };
+  const form = el('div', { class: 'subform' });
+  const submit = el('button', { class: 'btn btn-primary btn-sm', type: 'button' }, current ? 'Update schedule…' : 'Schedule reviews…');
+  const note = el('span', { class: 'hint' });
+  append(form, [
+    el(
+      'div',
+      { class: 'grid-2' },
+      field('Every (hours)', numInput(f, 'interval_hours', { min: 1, max: 720, onInput: () => (intervalEdited = true) }), exact !== null && exact % 3600 ? el('div', { class: 'hint' }, `Currently ${ttlText(exact)} (${exact} s); kept exactly unless you change it.`) : null),
+      field('Model route', textInput(f, 'route', { mono: true })),
+    ),
+    field('Question for the reviewer', textArea(f, 'question', { rows: 2 })),
+    el('div', { class: 'checks' }, check(f, 'sockets', 'Refresh listening sockets'), check(f, 'packages', 'Refresh package inventory')),
+    el('div', { class: 'form-actions' }, note, el('span', { class: 'spacer' }), submit),
+  ]);
+  guardSubmit(form, submit, note, () => (intervalEdited && !(Number.isInteger(f.interval_hours) && f.interval_hours >= 1 && f.interval_hours <= 720) ? 'Interval must be 1–720 hours.' : !String(f.question).trim() ? 'Ask the reviewer a question.' : !f.sockets && !f.packages ? 'Pick at least one discovery collector.' : !String(f.route).trim() ? 'Name the model route.' : null), 'control-d validates 60 s – 30 days');
+  submit.addEventListener('click', async () => {
+    const body = { interval_seconds: intervalEdited ? f.interval_hours * 3600 : exact, question: f.question.trim(), route: f.route.trim(), collectors: [f.packages && 'packages.inventory', f.sockets && 'sockets.listening'].filter(Boolean) };
+    const r = await confirmedPost(submit, errNode, `/api/admin/hosts/${enc(dive.host)}/review-schedule`, body, {
+      title: current ? 'Replace the review schedule?' : 'Schedule periodic reviews?',
+      body: el('p', null, `Every ${ttlText(body.interval_seconds)}, a review worker re-collects ${body.collectors.map(collectorName).join(' and ').toLowerCase()} on `, el('span', { class: 'mono' }, dive.host), ' and records a cited conclusion against the current assessment.', current ? ' Pending reviews under the old schedule are cancelled.' : ''),
+      confirm: current ? 'Replace schedule' : 'Schedule',
+    });
+    if (r) {
+      toast('Review schedule saved', 'ok');
+      await dive.reload('review', 'discovery');
+    }
+  });
+  return el('details', { class: 'more' }, el('summary', null, current ? 'Change schedule' : 'Schedule reviews'), form);
+}
+
+// P14 -----------------------------------------------------------------------
+
+function followupsCard(r, obsMap) {
+  if (!r || r.available === false || !r.followups?.length) return null;
+  const list = r.followups;
+  const open = list.filter((f) => ['awaiting_evidence', 'ready', 'leased'].includes(f.status)).length;
+  return card(
+    'Follow-up questions',
+    `${plural(list.length, 'question')} from accepted watches${open ? ` · ${open} open` : ''}. Each is answered by a fresh observation and a recorded interpretation.`,
+    el(
+      'div',
+      { class: 'card-body flush fu-list' },
+      list.map((f) => {
+        const inWindow = f.observation_id != null && obsMap.has(f.observation_id);
+        return el(
+          'article',
+          { class: ['fu-item', `fu-${f.status}`] },
+          el('div', { class: 'row wrap' }, stateBadge(FOLLOWUP_STATUS, f.status), el('span', { class: 'mono muted small', title: `spec v${f.spec_version}` }, f.watch_id), el('span', { class: 'spacer' }), f.status === 'answered' ? null : el('span', { class: 'small muted' }, 'deadline ', relTime(f.deadline, { until: true }))),
+          el('p', { class: 'fu-q' }, f.question),
+          f.interpretation
+            ? el('div', { class: ['fu-a', `i-${f.interpretation}`] }, interpBadge(f.interpretation), el('span', null, f.summary ?? ''))
+            : f.status === 'answered'
+              ? el('div', { class: 'fu-a muted' }, 'Answered by a finding outside this console’s collector scope.')
+              : el('div', { class: 'fu-a muted' }, f.observation_id ? 'Fresh evidence collected; waiting for an interpretation.' : 'Waiting for a fresh observation on this watch.'),
+          el(
+            'div',
+            { class: 'row wrap small muted' },
+            'fresh evidence ',
+            f.observation_id == null ? el('span', null, 'none yet') : inWindow ? el('button', { class: 'ev-badge', type: 'button', title: `Show observation ${f.observation_id}`, on: { click: () => focusFact(f.observation_id) } }, `obs ${f.observation_id}`) : obsTag(f.observation_id),
+            f.finding_id != null ? [' · finding ', el('span', { class: 'mono' }, `#${f.finding_id}`)] : null,
+            ' · asked by ',
+            el('span', { class: 'mono' }, shortId(f.origin_run)),
+          ),
+        );
+      }),
+    ),
+    null,
+    'fu-card',
+  );
+}
+
+// P18 -----------------------------------------------------------------------
+
+/**
+ * The latest executor receipt from the same refresh as the verification, or
+ * null when the two snapshots disagree (a receipt arrived between the reads).
+ * The check's receipt_id and receipt_status are authoritative; executor detail
+ * is shown only when it provably belongs to that receipt.
+ */
+function pairLatestReceipt(v, receipts) {
+  if (v.latest_receipt_id == null || !receipts?.length) return null;
+  const checks = [...v.receipt_checks].sort((x, y) => x.receipt_id - y.receipt_id);
+  const latest = checks.at(-1);
+  if (receipts.length !== checks.length || latest?.receipt_id !== v.latest_receipt_id) return null;
+  const r = receipts.at(-1);
+  return r.status === latest.receipt_status ? r : null;
+}
+
+function verificationSection(a, onDetail = null) {
+  const slot = el('div', { class: 'stack' }, loading(3));
+  // Persistent across polls: the reconciliation form and its draft, keyed by receipt.
+  const ctx = { view: null, form: null, formKey: null, draft: { evidence_ref: '', rationale: '' }, draftKey: null, latestKey: null };
+  let timer = null;
+  let seq = 0;
+  const load = async () => {
+    clearTimeout(timer);
+    const mine = ++seq;
+    try {
+      // Re-read the executor receipts with every verification so a new receipt
+      // can never be labelled with the previous receipt's details.
+      const [v, d] = await Promise.all([api(`/api/admin/actions/${enc(a.intent_id)}/verification`), api(`/api/admin/actions/${enc(a.intent_id)}`).catch(() => null)]);
+      if (!slot.isConnected || mine !== seq) return;
+      if (d) onDetail?.(d);
+      const paired = v.available ? pairLatestReceipt(v, d?.receipts) : null;
+      renderVerification(slot, ctx, a, v, d?.receipts ?? null, paired, load);
+      // Snapshots that disagree are re-read a few times; an older ledger whose
+      // receipts predate verification checks never converges, so stop there.
+      const mismatched = v.available && v.latest_receipt_id != null && !paired && d != null;
+      ctx.retries = mismatched ? (ctx.retries ?? 0) + 1 : 0;
+      const retry = mismatched && ctx.retries <= 3;
+      if (drawer().open && v.available && (v.outcome === 'awaiting_evidence' || retry)) timer = setTimeout(() => slot.isConnected && load(), retry ? 1500 : 4000);
+    } catch (err) {
+      if (slot.isConnected && mine === seq) {
+        ctx.view = null;
+        replace(slot, errorBox(err));
+      }
+    }
+  };
+  load();
+  return section('Outcome verification', slot);
+}
+
+function renderVerification(slot, ctx, a, v, receipts, paired, reload) {
+  if (!v.available) {
+    ctx.view = null;
+    replace(slot, unavailableNotice(v, 'Receipt verification'));
+    return;
+  }
+  if (!ctx.view) {
+    const refresh = el('button', { class: 'btn btn-sm btn-ghost', type: 'button', title: 'Reload verification', on: { click: reload } }, icon('refresh'), 'Refresh');
+    ctx.view = {
+      receipt: el('section', { class: 'vrec v-receipt' }),
+      outcome: el('section', { class: 'vrec v-outcome' }),
+      reconList: el('div'),
+      formHolder: el('div'),
+      errNode: el('div'),
+      history: el('div'),
+    };
+    const V = ctx.view;
+    replace(
+      slot,
+      el('div', { class: 'row' }, el('span', { class: 'muted small' }, 'Three separate records: a receipt is not an outcome, and an outcome is not an attestation.'), el('span', { class: 'spacer' }), refresh),
+      V.receipt,
+      V.outcome,
+      el('section', { class: 'vrec v-recon' }, el('div', { class: 'vrec-head' }, el('span', { class: 'eyebrow' }, '3 · Operator reconciliation'), el('span', { class: 'muted small' }, 'attested by an operator from independent evidence')), V.reconList, V.formHolder, V.errNode),
+      V.history,
+    );
+  }
+  const V = ctx.view;
+  const check = v.receipt_checks.find((c) => c.receipt_id === v.latest_receipt_id) ?? null;
+
+  replace(
+    V.receipt,
+    el('div', { class: 'vrec-head' }, el('span', { class: 'eyebrow' }, '1 · Executor receipt'), el('span', { class: 'muted small' }, 'what action-exec-d reported')),
+    paired
+      ? [
+          el('div', { class: 'row wrap' }, actionStatusBadge(paired.status), el('span', { class: ['badge', paired.verification_passed ? 'solid' : 'ghost'] }, paired.verification_passed ? 'executor self-check passed' : 'executor self-check failed'), el('span', { class: 'mono muted small' }, `receipt #${v.latest_receipt_id}`), el('span', { class: 'spacer' }), el('span', { class: 'num muted small' }, fmtTime(paired.executed_at))),
+          el('div', { class: 'r-detail' }, paired.detail || '—'),
+          el('p', { class: 'muted small' }, 'A receipt is the executor’s own claim. It never discharges the postcondition check below.'),
+        ]
+      : check
+        ? [
+            el('div', { class: 'row wrap' }, actionStatusBadge(check.receipt_status), el('span', { class: 'mono muted small' }, `receipt #${check.receipt_id}`)),
+            el('div', { class: 'muted small' }, receipts ? 'Executor detail for this receipt is not in the same snapshot yet; it is shown once the receipt list catches up.' : 'Executor detail could not be loaded; the execution receipts list above may be stale.'),
+          ]
+        : el('div', { class: 'muted' }, 'No receipt recorded yet.'),
+  );
+
+  const concurrent = v.concurrent_service_changes;
+  V.outcome.className = ['vrec', 'v-outcome', `o-${v.outcome}`].join(' ');
+  replace(
+    V.outcome,
+    el('div', { class: 'vrec-head' }, el('span', { class: 'eyebrow' }, '2 · Observed outcome'), el('span', { class: 'muted small' }, 'independent fresh sample after the receipt')),
+    el('div', { class: 'row wrap' }, stateBadge(CHECK_RESULT, v.outcome), check?.expected_state ? el('span', { class: 'small' }, 'expected ', el('span', { class: 'mono' }, check.expected_state)) : null, el('span', { class: 'spacer' }), check?.result === 'awaiting_evidence' && check.deadline ? el('span', { class: 'small muted' }, 'deadline ', relTime(check.deadline, { until: true })) : null),
+    check ? el('div', { class: 'small' }, check.reason ?? '') : null,
+    el(
+      'dl',
+      { class: 'kv' },
+      el('dt', null, 'Precondition'),
+      el('dd', null, v.precondition_observation_id != null ? obsTag(v.precondition_observation_id, 'Pre-dispatch service-state evidence') : el('span', { class: 'muted' }, 'none recorded (no supported effect sensor)')),
+      el('dt', null, 'Postcondition'),
+      el('dd', null, check?.observation_id != null ? [obsTag(check.observation_id, 'Fresh postcondition sample'), ' ', hashChip(check.state_hash)] : el('span', { class: 'muted' }, 'no sample')),
+      el('dt', null, 'Expected effect'),
+      el('dd', null, v.expected_effect || '—'),
+    ),
+    el(
+      'div',
+      { class: 'concurrent' },
+      el('div', { class: 'small strong' }, 'Concurrent changes on other monitored units'),
+      concurrent.length
+        ? el('ul', { class: 'decision-log' }, concurrent.map((c) => el('li', null, el('span', { class: 'mono' }, c.watch_id), obsTag(c.before), el('span', { class: 'rel-arrow' }, '→'), obsTag(c.after), el('span', { class: 'muted small' }, `receipt #${c.receipt_id}`))))
+        : el('div', { class: 'muted small' }, 'None seen in the verification window.'),
+      el('div', { class: 'muted small' }, v.collateral_coverage ?? 'Causation unassessed.'),
+    ),
+  );
+
+  replace(
+    V.reconList,
+    v.operator_reconciliations.length
+      ? el(
+          'ul',
+          { class: 'recon-list' },
+          v.operator_reconciliations.map((x) => el('li', null, el('div', { class: 'row wrap small' }, el('span', { class: 'mono' }, x.receipt_id ? `receipt #${x.receipt_id}` : 'unreceipted'), el('span', { class: 'spacer' }), el('span', { class: 'muted' }, 'recorded ', relTime(x.recorded_at))), el('div', { class: 'mono small' }, x.evidence_ref), el('div', { class: 'small' }, x.rationale))),
+        )
+      : el('div', { class: 'muted small' }, 'None recorded.'),
+  );
+
+  // The form is rebuilt only when what it would attest changes; otherwise the
+  // operator's draft, caret and focus stay exactly where they were.
+  const rec = v.reconcile;
+  const key = rec.allowed && adminEnabled() ? `receipt:${rec.expected_receipt_id ?? 'none'}` : `closed:${rec.reason ?? ''}`;
+  ctx.latestKey = key;
+  if (key !== ctx.formKey) {
+    ctx.formKey = key;
+    ctx.form = rec.allowed && adminEnabled() ? reconcileForm(ctx, a, rec, key, reload) : null;
+    replace(V.formHolder, rec.allowed ? (ctx.form ?? el('div', { class: 'muted small' }, 'An admin can reconcile this outcome.')) : el('div', { class: 'muted small' }, rec.reason ?? ''));
+  }
+
+  replace(
+    V.history,
+    v.receipt_checks.length > 1
+      ? el(
+          'details',
+          { class: 'more' },
+          el('summary', null, `Checks for all ${v.receipt_checks.length} receipts`),
+          el('div', { class: 'table-wrap' }, el('table', { class: 'obs-table' }, el('thead', null, el('tr', null, ['Receipt', 'Receipt status', 'Expected', 'Observed outcome', 'Reason'].map((x) => el('th', null, x)))), el('tbody', null, v.receipt_checks.map((c) => el('tr', null, el('td', { class: 'mono' }, `#${c.receipt_id}`), el('td', null, words(c.receipt_status)), el('td', { class: 'mono' }, c.expected_state ?? '—'), el('td', null, stateBadge(CHECK_RESULT, c.result)), el('td', { class: 'small' }, c.reason ?? '—')))))),
+        )
+      : null,
+  );
+}
+
+function reconcileForm(ctx, a, rec, key, reload) {
+  const receiptId = rec.expected_receipt_id;
+  const label = receiptId != null ? `receipt #${receiptId}` : 'the unreceipted expired authorization';
+  // A draft written against another receipt is kept, but must be re-confirmed.
+  const carried = ctx.draftKey !== null && ctx.draftKey !== key && (ctx.draft.evidence_ref.trim() || ctx.draft.rationale.trim());
+  const f = ctx.draft;
+  f.reconfirmed = !carried;
+  ctx.draftKey = key;
+  const submit = el('button', { class: 'btn btn-primary btn-sm', type: 'button', dataset: { receiptId: receiptId ?? '' } }, 'Record reconciliation…');
+  const note = el('span', { class: 'hint' });
+  const form = el(
+    'div',
+    { class: 'subform', dataset: { receiptKey: key } },
+    carried ? el('div', { class: 'notice warn', attrs: { role: 'alert' } }, `A new receipt arrived: this form now attests ${label}. Your draft was written against an earlier receipt; check it still holds before recording it.`) : null,
+    field('Independent evidence reference', textInput(f, 'evidence_ref', { placeholder: 'e.g. nft list ruleset from a jump-host session, ticket, observation ID', mono: true })),
+    field('Rationale', textArea(f, 'rationale', { rows: 2, placeholder: 'What you checked and what it shows' })),
+    carried ? el('div', { class: 'checks' }, check(f, 'reconfirmed', `I re-checked this evidence against ${label}`)) : null,
+    el('div', { class: 'form-actions' }, note, el('span', { class: 'spacer' }), submit),
+  );
+  guardSubmit(form, submit, note, () => (!f.evidence_ref.trim() ? 'Cite the independent evidence.' : !f.rationale.trim() ? 'Explain what it shows.' : !f.reconfirmed ? `Confirm the draft against ${label}.` : null), receiptId != null ? `against receipt #${receiptId}` : 'unreceipted expired authorization');
+  const errNode = ctx.view.errNode;
+  submit.addEventListener('click', async () => {
+    const r = await confirmedPost(
+      submit,
+      errNode,
+      `/api/admin/actions/${enc(a.intent_id)}/reconcile`,
+      () => {
+        // The receipt may have changed while the dialog was open.
+        if (ctx.latestKey !== key) throw Object.assign(new Error(`a newer receipt arrived after you opened this dialog; review the form against it and confirm again`), { code: 'receipt_changed' });
+        return { expected_receipt_id: receiptId, evidence_ref: f.evidence_ref.trim(), rationale: f.rationale.trim() };
+      },
+      {
+        title: 'Attest this outcome?',
+        body: [el('p', null, receiptId != null ? `You attest the outcome of receipt #${receiptId} from independent evidence.` : 'You attest the outcome of an authorization that expired without a receipt.'), el('p', { class: 'muted small' }, 'control-d records it as an operator reconciliation in the audit log. It admits a retry of this target until a later receipt arrives; it does not change the observed outcome.')],
+        confirm: 'Record reconciliation',
+      },
+    );
+    if (r) {
+      toast('Operator reconciliation recorded', 'ok');
+      ctx.draft = { evidence_ref: '', rationale: '' };
+      ctx.draftKey = null;
+      reload();
+    }
+  });
+  return form;
 }
 
 // ---------------------------------------------------------------------------

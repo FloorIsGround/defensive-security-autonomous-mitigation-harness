@@ -19,6 +19,8 @@ export const COLLECTOR_TYPES = Object.freeze([
   'systemd.unit_state',
   'files.metadata',
   'journal.unit_events',
+  'connections.outbound',
+  'packages.inventory',
 ]);
 export const TRIGGER_TYPES = Object.freeze(['field_changed', 'set_diff', 'threshold_sustained', 'collector_stale_or_error']);
 export const COMPARE_TARGETS = Object.freeze(['last_observed', 'accepted_baseline']);
@@ -109,6 +111,24 @@ export function buildCollector(type, params = {}) {
       if (bytes !== null) parameters.max_message_bytes = bytes;
       return { type, parameters };
     }
+    case 'connections.outbound': {
+      const parameters = {
+        include_tcp: bool(p.include_tcp, true),
+        include_udp: bool(p.include_udp, false),
+        include_ipv6: bool(p.include_ipv6, true),
+        resolve_process: bool(p.resolve_process, true),
+        exclude_loopback: bool(p.exclude_loopback, true),
+      };
+      const flows = int(p.max_flows, 'max_flows', { optional: true, min: 1, max: 1_000_000 });
+      if (flows !== null) parameters.max_flows = flows;
+      return { type, parameters };
+    }
+    case 'packages.inventory': {
+      const parameters = {};
+      const max = int(p.max_packages, 'max_packages', { optional: true, min: 1, max: 1_000_000 });
+      if (max !== null) parameters.max_packages = max;
+      return { type, parameters };
+    }
   }
 }
 
@@ -120,6 +140,10 @@ export function defaultTrigger(collectorType) {
       return { type: 'field_changed', compare_against: 'last_observed', fields: ['active_state', 'sub_state', 'main_pid', 'exec_start_hash'] };
     case 'files.metadata':
       return { type: 'set_diff', compare_against: 'last_observed', set_field: 'files', identity_key: 'path' };
+    case 'connections.outbound':
+      return { type: 'set_diff', compare_against: 'last_observed', set_field: 'flows', identity_key: 'flow_key' };
+    case 'packages.inventory':
+      return { type: 'set_diff', compare_against: 'last_observed', set_field: 'packages', identity_key: 'package_key' };
     default:
       return { type: 'collector_stale_or_error', max_stale_seconds: 300, consecutive_errors: 3 };
   }

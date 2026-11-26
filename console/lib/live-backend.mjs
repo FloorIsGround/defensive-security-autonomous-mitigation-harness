@@ -6,6 +6,32 @@ import { AdminClient, InvestigationClient } from './uds-client.mjs';
 import { verifyEntries } from './audit-chain.mjs';
 import { parseOperatorApproval, signingInfo } from './demo-actions.mjs';
 import {
+  ADAPTIVE_UNSUPPORTED_MESSAGE,
+  ADMIN_VIEW_MESSAGE,
+  DISCOVERY_COLLECTORS,
+  MONITORING_AUDIT_WINDOW,
+  buildCoverage,
+  deriveMonitoring,
+  discoverySourceIds,
+  findingIndex,
+  parseAssessmentVersion,
+  parseCandidateId,
+  parseCorroborateBody,
+  parseGrantBody,
+  parseReconcileBody,
+  parseRollbackBody,
+  parseScheduleBody,
+  publicAssessment,
+  publicAttempt,
+  publicFollowup,
+  publicHostProfile,
+  publicReview,
+  publicSample,
+  publicVerification,
+  reviewFreshness,
+  supportsDiscovery,
+} from './adaptive.mjs';
+import {
   ApiError,
   COLLECTOR_TYPES,
   REASONER_UNSUPPORTED_MESSAGE,
@@ -60,6 +86,8 @@ function unwrap(resp, tag, expected) {
 }
 
 const RUN_TOKEN_TTL_SECONDS = 3600;
+/** AdvanceHostDiscovery needs an unbound, host-scoped investigator grant; it lives only for one call. */
+const DISCOVERY_TOKEN_TTL_SECONDS = 300;
 
 /**
  * A control-d from before Phase 9 cannot deserialize the new ops: it closes
@@ -88,6 +116,9 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
   // incident_id -> { run_id, incident_id, host_id, expires_at, client }. The
   // client holds the per-run token in a private field; it never leaves this map.
   const runs = new Map();
+  // control-d has no read for review schedules: remember what this console set
+  // (host_id -> { schedule, set_at, set_by }) so the UI can say so honestly.
+  const schedules = new Map();
 
   async function clientCall(client, request, expected) {
     let resp;
@@ -100,6 +131,20 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
   }
 
   const invCall = (request, expected) => clientCall(inv, request, expected);
+
+  /**
+   * Admin reads are fleet-wide, so a host-scoped route asks the browse token
+   * first: an out-of-scope host is a 403 before any admin data is fetched. Any
+   * other failure also refuses, since visibility could not be established.
+   */
+  async function requireVisibleHost(hostId) {
+    try {
+      return await invCall({ op: 'list_active_watches', host_id: hostId }, 'watches');
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) throw new ApiError(403, 'forbidden', err.message || `host '${hostId}' is outside this console's scope`);
+      throw err;
+    }
+  }
   const publicRun = (r) => (r ? { run_id: r.run_id, incident_id: r.incident_id, expires_at: r.expires_at } : null);
 
   async function adminCall(request, expected) {
@@ -234,18 +279,32 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
 
     async capabilities(hostId) {
       requireIdent(hostId, 'host_id');
-      const r = await invCall({ op: 'list_collector_capabilities', host_id: hostId }, 'capabilities');
-      return { host_id: hostId, capabilities: r.capabilities };
+      try {
+        const r = await invCall({ op: 'list_collector_capabilities', host_id: hostId }, 'capabilities');
+        return { available: true, host_id: hostId, capabilities: r.capabilities };
+      } catch (err) {
+        // An older control-d closes the connection on an op it cannot decode; an
+        // out-of-scope host stays a 403 so scope errors are never masked.
+        if (!unsupportedOp(err)) throw err;
+        return { available: false, reason: 'unsupported', message: ADAPTIVE_UNSUPPORTED_MESSAGE, host_id: hostId, capabilities: [] };
+      }
     },
 
     async baselines(hostId) {
       requireIdent(hostId, 'host_id');
-      const [b, w, o] = await Promise.all([
-        invCall({ op: 'get_host_baseline_summary', host_id: hostId }, 'baseline_summary'),
-        invCall({ op: 'list_active_watches', host_id: hostId }, 'watches'),
-        invCall({ op: 'query_observations', host_id: hostId, limit: 500 }, 'observations'),
-      ]);
+      let b, w, o;
+      try {
+        [b, w, o] = await Promise.all([
+          invCall({ op: 'get_host_baseline_summary', host_id: hostId }, 'baseline_summary'),
+          invCall({ op: 'list_active_watches', host_id: hostId }, 'watches'),
+          invCall({ op: 'query_observations', host_id: hostId, limit: 500 }, 'observations'),
+        ]);
+      } catch (err) {
+        if (!unsupportedOp(err)) throw err;
+        return { available: false, reason: 'unsupported', message: 'baseline summaries are not supported by this control-d', host_id: hostId, baselines: [], three_state: [] };
+      }
       return {
+        available: true,
         host_id: hostId,
         baselines: b.baselines,
         three_state: deriveThreeState(w.watches, b.baselines, o.observations),
@@ -524,6 +583,251 @@ export function createLiveBackend({ investigateSock, token, adminSock = null, en
       const v = parseRuleRevoke(body);
       const r = await adminCall({ admin_op: 'revoke_expectation_rule', rule_id, actor: v.actor, reason: v.reason }, 'rule_decided');
       return { rule_id: r.rule_id, status: r.status };
+    },
+
+    // ---- Adaptive investigator (P11–P18) ---------------------------------------
+    // Reads use the shared browse token (or the admin interface where control-d
+    // only exposes an admin read). Mutations are admin-only. No capability,
+    // lease or run token ever reaches a response.
+
+    async hostProfile(hostId) {
+      requireIdent(hostId, 'host_id');
+      const [list, caps, w, o] = await Promise.allSettled([
+        invCall({ op: 'list_hosts', limit: 500 }, 'hosts'),
+        invCall({ op: 'list_collector_capabilities', host_id: hostId }, 'capabilities'),
+        invCall({ op: 'list_active_watches', host_id: hostId }, 'watches'),
+        invCall({ op: 'query_observations', host_id: hostId, limit: 200 }, 'observations'),
+      ]);
+      if (list.status === 'rejected') throw list.reason;
+      const host = list.value.hosts.find((x) => x.host_id === hostId);
+      if (!host) throw new ApiError(404, 'not_found', `host '${hostId}' is not visible to this console`);
+      for (const r of [caps, w, o]) if (r.status === 'rejected' && !unsupportedOp(r.reason)) throw r.reason;
+      const profile = publicHostProfile(host.host_profile);
+      const watches = w.status === 'fulfilled' ? w.value.watches : [];
+      const observations = o.status === 'fulfilled' ? [...o.value.observations].sort((a, b) => b.observation_id - a.observation_id) : [];
+      const capabilities = caps.status === 'fulfilled' ? caps.value.capabilities : [];
+      return {
+        available: true,
+        host_id: hostId,
+        agent_version: host.agent_version,
+        liveness_status: host.liveness_status,
+        discovery_support: supportsDiscovery(host.agent_version),
+        host_profile: profile,
+        capabilities_available: caps.status === 'fulfilled',
+        coverage: buildCoverage({ capabilities, profile, watches, observations }),
+        server_time: new Date().toISOString(),
+      };
+    },
+
+    async discovery(hostId, query = {}) {
+      requireIdent(hostId, 'host_id');
+      const version = parseAssessmentVersion(query.version);
+      const server_time = new Date().toISOString();
+      let latest;
+      let pinned = null;
+      try {
+        latest = (await invCall({ op: 'get_host_assessment', host_id: hostId }, 'host_assessment')).assessment;
+        if (version !== null) pinned = (await invCall({ op: 'get_host_assessment', host_id: hostId, version }, 'host_assessment')).assessment;
+      } catch (err) {
+        const u = unavailable(err, ADAPTIVE_UNSUPPORTED_MESSAGE);
+        if (u) return { ...u, host_id: hostId, server_time };
+        throw err;
+      }
+      let samples = [];
+      let samplesAvailable = true;
+      try {
+        samples = (await invCall({ op: 'get_host_discovery_samples', host_id: hostId }, 'host_discovery_samples')).samples ?? [];
+      } catch (err) {
+        if (!unavailable(err)) throw err;
+        samplesAvailable = false;
+      }
+      const assessment = publicAssessment(version !== null ? pinned : latest);
+      // Interpretation attempts are keyed by the exact source-ID list a worker claimed.
+      const keys = new Map();
+      const current = discoverySourceIds(samples);
+      if (current.length) keys.set(JSON.stringify(current), current);
+      for (const i of assessment?.interpretations ?? []) if (i.source_ids.length && keys.size < 4) keys.set(JSON.stringify(i.source_ids), i.source_ids);
+      const attempts = [];
+      for (const source_ids of keys.values()) {
+        try {
+          const r = await invCall({ op: 'list_host_interpretation_attempts', host_id: hostId, source_ids }, 'host_interpretation_attempts');
+          attempts.push({ source_ids, attempts: (r.attempts ?? []).map(publicAttempt) });
+        } catch (err) {
+          if (!unavailable(err)) throw err;
+        }
+      }
+      return {
+        available: true,
+        host_id: hostId,
+        latest_version: latest?.version ?? null,
+        assessment,
+        samples_available: samplesAvailable,
+        samples: samples.map(publicSample),
+        source_ids: current,
+        attempts,
+        server_time,
+      };
+    },
+
+    async advanceDiscovery(hostId) {
+      requireIdent(hostId, 'host_id');
+      if (!admin) throw new ApiError(403, 'admin_disabled', 'admin interface is disabled (start the console with --enable-admin --admin-sock)');
+      // A one-call, host-scoped investigator grant: the browse token is never
+      // widened and the minted token never leaves this function.
+      const grant = {
+        admin_op: 'mint_capability_token',
+        principal_id: 'console-discovery',
+        role: 'investigator',
+        allowed_hosts: [hostId],
+        allowed_collectors: [...DISCOVERY_COLLECTORS],
+        allowed_purposes: ['host_discovery'],
+        ttl_seconds: DISCOVERY_TOKEN_TTL_SECONDS,
+      };
+      let minted;
+      try {
+        minted = await adminCall(grant, 'token_minted');
+      } catch (err) {
+        // A control-d from before purpose-scoped tokens cannot decode the field;
+        // only then fall back to the host- and collector-scoped grant.
+        if (!(unsupportedOp(err) || /unknown field\W*allowed_purposes/i.test(err?.message ?? ''))) throw err;
+        const { allowed_purposes: _omit, ...legacy } = grant;
+        minted = await adminCall(legacy, 'token_minted');
+      }
+      const client = new InvestigationClient({ socketPath: investigateSock, token: minted.token, timeoutMs });
+      const r = await clientCall(client, { op: 'advance_host_discovery', host_id: hostId }, 'host_discovery_advanced');
+      let version = null;
+      try {
+        version = (await invCall({ op: 'get_host_assessment', host_id: hostId }, 'host_assessment')).assessment?.version ?? null;
+      } catch {
+        /* the advance itself succeeded */
+      }
+      return { host_id: r.host_id ?? null, bundle_version: r.bundle_version ?? null, assessment_version: version };
+    },
+
+    async monitoring(hostId) {
+      requireIdent(hostId, 'host_id');
+      const server_time = new Date().toISOString();
+      if (!admin) return { available: false, reason: 'admin_disabled', message: `Monitoring grants and managed watches are ${ADMIN_VIEW_MESSAGE}.`, host_id: hostId, server_time };
+      // The admin socket sees every host: the browse token decides visibility first.
+      const w = await requireVisibleHost(hostId);
+      const [entries, b] = await Promise.all([
+        auditEntries(MONITORING_AUDIT_WINDOW),
+        invCall({ op: 'get_host_baseline_summary', host_id: hostId }, 'baseline_summary').catch((err) => {
+          if (err instanceof ApiError && err.status === 403) throw err;
+          return { baselines: [] };
+        }),
+      ]);
+      return {
+        available: true,
+        source: 'audit',
+        window_entries: entries.length,
+        host_id: hostId,
+        ...deriveMonitoring(entries, hostId, { baselines: b.baselines, watches: w.watches }),
+        server_time,
+      };
+    },
+
+    async setMonitoringGrant(hostId, body = {}) {
+      requireIdent(hostId, 'host_id');
+      const g = parseGrantBody(body);
+      const r = await adminCall({ admin_op: 'set_monitoring_grant', host_id: hostId, principal_id: g.principal_id, max_watches: g.max_watches, allow_promotion: g.allow_promotion }, 'monitoring');
+      return { allowed: r.result?.allowed === true, host_id: hostId, ...g };
+    },
+
+    async corroborateMonitoring(candidateId, body = {}) {
+      const candidate_id = parseCandidateId(candidateId);
+      const { rationale } = parseCorroborateBody(body);
+      const r = await adminCall({ admin_op: 'corroborate_monitoring', candidate_id, rationale }, 'monitoring');
+      const allowed = r.result?.allowed === true;
+      return { allowed, candidate_id, reason: allowed ? null : 'candidate is unknown, already corroborated or already promoted' };
+    },
+
+    async rollbackMonitoring(hostId, watchId, body = {}) {
+      requireIdent(hostId, 'host_id');
+      requireIdent(watchId, 'watch_id');
+      const v = parseRollbackBody(body);
+      const r = await adminCall({ admin_op: 'rollback_monitoring', host_id: hostId, watch_id: watchId, expected_baseline: v.expected_baseline, rationale: v.rationale }, 'monitoring');
+      const x = r.result ?? {};
+      return { allowed: x.allowed === true, reason: x.reason ?? null, baseline: x.baseline ?? null, rolled_back: x.rolled_back ?? null, host_id: hostId, watch_id: watchId };
+    },
+
+    async hostReview(hostId) {
+      requireIdent(hostId, 'host_id');
+      const server_time = new Date().toISOString();
+      const memo = schedules.get(hostId) ?? null;
+      const schedule = memo ? { ...memo.schedule, set_at: memo.set_at, set_by: memo.set_by, source: 'console' } : null;
+      if (!admin) return { available: false, reason: 'admin_disabled', message: `Periodic host reviews are ${ADMIN_VIEW_MESSAGE}.`, host_id: hostId, schedule, server_time };
+      await requireVisibleHost(hostId);
+      let review;
+      try {
+        review = publicReview((await adminCall({ admin_op: 'get_latest_host_review', host_id: hostId }, 'latest_host_review')).review);
+      } catch (err) {
+        const u = unavailable(err, ADAPTIVE_UNSUPPORTED_MESSAGE);
+        if (u) return { ...u, host_id: hostId, schedule, server_time };
+        throw err;
+      }
+      let assessmentVersion = null;
+      try {
+        assessmentVersion = (await invCall({ op: 'get_host_assessment', host_id: hostId }, 'host_assessment')).assessment?.version ?? null;
+      } catch {
+        /* freshness falls back to age only */
+      }
+      return { available: true, host_id: hostId, review, schedule, schedule_visible: false, freshness: reviewFreshness(review, assessmentVersion, schedule), server_time };
+    },
+
+    async setReviewSchedule(hostId, body = {}, ctx = {}) {
+      const schedule = parseScheduleBody(hostId, body);
+      await adminCall({ admin_op: 'set_host_review_schedule', schedule }, 'host_review_schedule_updated');
+      const set_at = new Date().toISOString();
+      schedules.set(schedule.host_id, { schedule, set_at, set_by: ctx.user?.username ?? null });
+      return { host_id: schedule.host_id, schedule: { ...schedule, set_at, source: 'console' } };
+    },
+
+    async cancelReviewSchedule(hostId) {
+      requireIdent(hostId, 'host_id');
+      await adminCall({ admin_op: 'cancel_host_review_schedule', host_id: hostId }, 'host_review_schedule_updated');
+      schedules.delete(hostId);
+      return { host_id: hostId, cancelled: true };
+    },
+
+    async followups(incidentId) {
+      requireIdent(incidentId, 'incident_id');
+      const server_time = new Date().toISOString();
+      let list;
+      let ctx;
+      try {
+        [list, ctx] = await Promise.all([
+          invCall({ op: 'list_watch_followups', incident_id: incidentId }, 'watch_followups'),
+          invCall({ op: 'get_incident_context', incident_id: incidentId }, 'incident_context').catch(() => ({ findings: [] })),
+        ]);
+      } catch (err) {
+        const u = unavailable(err, ADAPTIVE_UNSUPPORTED_MESSAGE);
+        if (u) return { ...u, incident_id: incidentId, followups: [], server_time };
+        throw err;
+      }
+      const findings = findingIndex(ctx.findings ?? []);
+      return { available: true, incident_id: incidentId, followups: (list.followups ?? []).map((f) => publicFollowup(f, findings)), server_time };
+    },
+
+    async actionVerification(intentId) {
+      requireIdent(intentId, 'intent_id');
+      let v;
+      try {
+        v = await adminCall({ admin_op: 'get_action_verification', intent_id: intentId }, 'action_verification');
+      } catch (err) {
+        if (unsupportedOp(err)) return { available: false, reason: 'unsupported', message: ADAPTIVE_UNSUPPORTED_MESSAGE, intent_id: intentId };
+        throw err;
+      }
+      const intent = await adminCall({ admin_op: 'get_action_intent', intent_id: intentId }, 'action_intent_detail').catch(() => null);
+      return { available: true, ...publicVerification(v.detail, intent ? { status: intent.status, expires_at: intent.payload?.expires_at ?? null } : null) };
+    },
+
+    async reconcileAction(intentId, body = {}) {
+      requireIdent(intentId, 'intent_id');
+      const r = parseReconcileBody(body);
+      const v = await adminCall({ admin_op: 'reconcile_action_outcome', intent_id: intentId, expected_receipt_id: r.expected_receipt_id, evidence_ref: r.evidence_ref, rationale: r.rationale }, 'action_verification');
+      const intent = await adminCall({ admin_op: 'get_action_intent', intent_id: intentId }, 'action_intent_detail').catch(() => null);
+      return { available: true, ...publicVerification(v.detail, intent ? { status: intent.status, expires_at: intent.payload?.expires_at ?? null } : null) };
     },
 
     async automation() {
