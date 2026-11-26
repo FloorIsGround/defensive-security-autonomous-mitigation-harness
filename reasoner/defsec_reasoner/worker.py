@@ -9,10 +9,10 @@ Lifecycle of one run:
    monitored data inside provenance envelopes (never raw).
 4. Execute a bounded tool-calling loop through the Investigation RPC only —
    no shell, no filesystem, no direct database access.
-5. Commit findings/proposals, then — and only then — complete the trigger
-   lease. Retryable provider failures requeue the trigger with bounded
-   backoff; non-retryable failures dead-letter it. Expired or fenced leases
-   are dropped without committing results.
+5. Commit findings/proposals, persist the run outcome, then complete the
+   trigger lease. Retryable provider failures requeue the trigger with bounded
+   backoff. Non-retryable failures dead-letter the trigger. Lease completion
+   is fenced by control-d.
 """
 
 from __future__ import annotations
@@ -22,11 +22,18 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from queue import Full, Queue
 from typing import Any, Callable
 
 from defsec_reasoner import PROMPT_SCHEMA_VERSION
-from defsec_reasoner.models import ModelAdapter, ModelTurnResult, ProviderError, ToolCall
+from defsec_reasoner.context import (
+    compact_for_prompt,
+    has_set_items,
+    select_observations,
+    trigger_diff,
+)
+from defsec_reasoner.models import ModelAdapter, ProviderError, ToolCall
 from defsec_reasoner.provenance import (
     build_system_prompt,
     clip_utf8,
@@ -60,7 +67,7 @@ class RunBudgets:
 
     max_turns: int = 6
     max_wall_seconds: float = 45.0
-    max_total_tokens: int = 16000
+    max_total_tokens: int = 48000
     max_cost_usd: float = 0.25
     max_proposals_per_run: int = 3
     max_action_proposals_per_run: int = 1
@@ -99,7 +106,8 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Bounded, classified evidence slices with stable observation IDs. "
             "Arguments: host_id (string, must equal the run host), optional "
-            "watch_id (string), optional limit (integer <= 100)."
+            "watch_id (string), optional limit (integer <= 100), and optional focus_keys "
+            "(array of set identities to retrieve, including keys omitted from the initial context)."
         ),
         "parameters": {
             "type": "object",
@@ -107,6 +115,7 @@ INVESTIGATION_TOOLS: list[dict[str, Any]] = [
                 "host_id": {"type": "string"},
                 "watch_id": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "focus_keys": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["host_id"],
         },
@@ -289,6 +298,69 @@ _ACTION_METADATA_KEYS = frozenset(
 )
 
 
+class _RunProgress:
+    """Send bounded progress snapshots off the investigation's critical path."""
+
+    def __init__(self, client: ControlRpcClient, run_id: str) -> None:
+        self._queue: Queue[tuple[str, dict[str, Any]] | None] = Queue(maxsize=256)
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._send, args=(client, run_id), daemon=True)
+        self._thread.start()
+
+    def record(self, kind: str, **detail: Any) -> None:
+        if not self._stopped.is_set():
+            try:
+                self._queue.put_nowait((kind, detail))
+            except Full:
+                pass
+
+    def close(self) -> None:
+        try:
+            self._queue.put_nowait(None)
+        except Full:
+            self._stopped.set()
+            return
+        # Allow local, already queued events to land before the terminal write.
+        self._thread.join(timeout=0.05)
+        self._stopped.set()
+
+    def _send(self, client: ControlRpcClient, run_id: str) -> None:
+        while not self._stopped.is_set():
+            item = self._queue.get()
+            if item is None or self._stopped.is_set():
+                break
+            kind, detail = item
+            try:
+                client.report_run_progress(run_id, kind, detail)
+            except RpcError as exc:
+                logger.debug("run progress rejected: %s", exc.code)
+                if exc.code == "run_event_quota":
+                    break
+            except (RpcTransportError, OSError):
+                logger.debug("run progress transport failed")
+                break
+        self._stopped.set()
+
+
+def _tool_preview(call: ToolCall) -> tuple[str, str]:
+    for tool in INVESTIGATION_TOOLS + ACTION_TOOLS:
+        if call.name == tool["name"]:
+            args = call.arguments if isinstance(call.arguments, dict) else {}
+            fields = tool["parameters"]["properties"]
+            # Preview only trusted parameter names and types. Free-form strings
+            # and nested arguments may contain sensitive telemetry.
+            preview = ", ".join(f"{key}={fields[key]['type']}" for key in fields if key in args)
+            return call.name, clip_utf8(preview, 160)
+    return "unknown_tool", ""
+
+
+def _redact_credentials(text: str, client: ControlRpcClient, lease_token: str) -> str:
+    for credential in (lease_token, getattr(client, "capability_token", "")):
+        if credential:
+            text = text.replace(credential, "[redacted]")
+    return text
+
+
 class ReasonerWorker:
     """Bounded episodic worker; dormant until a trigger is leased."""
 
@@ -329,7 +401,7 @@ class ReasonerWorker:
         client = self._new_client()
         try:
             lease = client.lease_next_trigger(self.lease_owner, self.budgets.lease_seconds)
-        except RpcError as exc:
+        except (RpcError, RpcTransportError) as exc:
             logger.warning("lease attempt rejected: %s", exc)
             return None
         if not lease:
@@ -349,14 +421,45 @@ class ReasonerWorker:
             outcome.run_id = run_id
             context = client.get_incident_context(incident_id)
             capabilities = client.list_collector_capabilities(host_id)
-        except RpcError as exc:
+        except (RpcError, RpcTransportError) as exc:
             logger.warning(
                 "run setup failed for event %s incident %s: %s", event_id, incident_id, exc
             )
-            return self._fail_lease(client, outcome, lease_token, f"run setup failed: {exc}", retryable=False)
+            return self._fail_lease(
+                client, outcome, lease_token, f"run setup failed: {exc}",
+                retryable=isinstance(exc, RpcTransportError),
+            )
 
+        try:
+            return self._investigate(
+                client, lease, outcome, lease_token, context, capabilities
+            )
+        except Exception as exc:  # noqa: BLE001 - never strand a leased trigger or an active run
+            logger.exception("run %s crashed for event %s", outcome.run_id, event_id)
+            return self._fail_lease(
+                client, outcome, lease_token,
+                f"internal error: {type(exc).__name__}: {exc}", retryable=True,
+            )
+
+    def _investigate(
+        self,
+        client: ControlRpcClient,
+        lease: dict[str, Any],
+        outcome: WorkerOutcome,
+        lease_token: str,
+        context: dict[str, Any],
+        capabilities: list[dict[str, Any]],
+    ) -> WorkerOutcome:
+        """Run the bounded model loop for a leased trigger with a started run."""
+        event_id = int(lease["event_id"])
+        incident_id = str(lease["incident_id"])
+        host_id = str(lease["host_id"])
+        run_id = str(outcome.run_id)
         # A fresh capability is bound to the run by control-d; keep using the
         # same client (same token) for the rest of the run.
+        diff = trigger_diff(lease.get("outcome") or {})
+        focus_keys = {key for keys in diff.values() for key in keys}
+        evidence_ids = set(lease.get("evidence_observation_ids") or [])
         run_header = {
             "run_id": run_id,
             "incident_id": incident_id,
@@ -365,9 +468,9 @@ class ReasonerWorker:
                 "watch_id": lease.get("watch_id"),
                 "spec_version": lease.get("spec_version"),
                 "retry_count": lease.get("retry_count"),
-                "outcome": lease.get("outcome"),
                 "evidence_observation_ids": lease.get("evidence_observation_ids", []),
             },
+            "trigger_diff": {name: keys[:50] for name, keys in diff.items()},
             "budgets": {
                 "max_turns": self.budgets.max_turns,
                 "max_proposals_per_run": self.budgets.max_proposals_per_run,
@@ -377,14 +480,17 @@ class ReasonerWorker:
                 "max_cost_usd": self.budgets.max_cost_usd,
             },
         }
-        envelopes = [wrap_json("trigger:lease", lease)]
-        envelopes.append(
-            wrap_json("rpc:get_incident_context", context, max_content_bytes=8192)
-        )
-        for observation in (context.get("recent_observations") or [])[:20]:
-            envelopes.append(wrap_observation(observation))
+        observations = select_observations(context.get("recent_observations") or [], evidence_ids)
+        compacted = [compact_for_prompt(row, focus_keys) for row in observations]
+        if focus_keys:
+            compacted.sort(key=lambda row: not has_set_items(row))
+        envelopes = [wrap_observation(row) for row in compacted]
+        incident_metadata = {key: value for key, value in context.items() if key != "recent_observations"}
+        envelopes.append(wrap_json("trigger:outcome", lease.get("outcome")))
+        envelopes.append(wrap_json("rpc:get_incident_context", incident_metadata))
         context_block = render_context_block(
-            run_header, envelopes, capabilities, max_block_bytes=self.budgets.max_context_bytes
+            run_header, envelopes, capabilities,
+            max_block_bytes=min(self.budgets.max_context_bytes, 24 * 1024),
         )
         tools = (
             INVESTIGATION_TOOLS + ACTION_TOOLS
@@ -406,36 +512,43 @@ class ReasonerWorker:
 
         # ------------------------------------------------------- bounded loop
         deadline = time.monotonic() + self.budgets.max_wall_seconds
-        proposals = findings = 0
-        proposals_accepted = 0
-        action_proposals = 0
-        action_proposals_accepted = 0
-        finish_requested = False
         final_text: str | None = None
+        finish_summary = ""
+        budget_warning_sent = False
+        progress = _RunProgress(client, run_id)
+        failure: tuple[str, bool] | None = None
 
         try:
             for _turn in range(self.budgets.max_turns):
-                if finish_requested:
-                    break
                 if time.monotonic() > deadline:
                     outcome.budget_stop_reason = "max_wall_seconds"
                     break
-                if outcome.input_tokens + outcome.output_tokens > self.budgets.max_total_tokens:
+                if outcome.input_tokens + outcome.output_tokens >= self.budgets.max_total_tokens:
                     outcome.budget_stop_reason = "max_total_tokens"
                     break
                 if outcome.estimated_cost_usd > self.budgets.max_cost_usd:
                     outcome.budget_stop_reason = "max_cost_usd"
                     break
-                try:
-                    turn = self.adapter.chat(messages, tools)
-                except ProviderError as exc:
-                    return self._fail_lease(
-                        client, outcome, lease_token, f"provider failure: {exc}", retryable=exc.retryable
-                    )
+                progress.record(
+                    "turn_started", turn=_turn + 1,
+                    input_tokens=outcome.input_tokens, output_tokens=outcome.output_tokens,
+                )
+                turn = self.adapter.chat(messages, tools)
                 outcome.turns += 1
                 outcome.input_tokens += turn.input_tokens
                 outcome.output_tokens += turn.output_tokens
                 outcome.estimated_cost_usd += turn.estimated_cost_usd
+
+                tokens_used = outcome.input_tokens + outcome.output_tokens
+                if not budget_warning_sent and tokens_used * 5 >= self.budgets.max_total_tokens * 4:
+                    progress.record(
+                        "budget_warning", total_tokens=tokens_used,
+                        max_total_tokens=self.budgets.max_total_tokens,
+                    )
+                    budget_warning_sent = True
+                if turn.final_text:
+                    text = _redact_credentials(turn.final_text, client, lease_token)
+                    progress.record("model_text", text=text[:300])
 
                 if turn.tool_calls:
                     assistant_msg: dict[str, Any] = {
@@ -451,33 +564,35 @@ class ReasonerWorker:
                     messages.append(assistant_msg)
                     for call in turn.tool_calls:
                         outcome.tool_calls += 1
+                        tool_name, preview = _tool_preview(call)
+                        progress.record("tool_call", tool=tool_name, arguments_preview=preview)
                         result, stop = self._execute_tool(
                             client,
                             call,
                             run_id=run_id,
                             incident_id=incident_id,
                             host_id=host_id,
-                            proposals_done=proposals,
-                            action_proposals_done=action_proposals,
-                            findings_done=findings,
+                            proposals_done=outcome.proposals,
+                            action_proposals_done=outcome.action_proposals_submitted,
+                            findings_done=outcome.findings,
                         )
-                        if result.get("_accepted_proposal"):
-                            proposals += 1
-                            proposals_accepted += 1
-                        elif result.get("_proposal_attempted"):
-                            proposals += 1
-                        if result.get("_action_proposal_accepted"):
-                            action_proposals += 1
-                            action_proposals_accepted += 1
-                        elif result.get("_action_proposal_attempted"):
-                            action_proposals += 1
-                        if result.get("_finding_recorded"):
-                            findings += 1
-                        result.pop("_accepted_proposal", None)
-                        result.pop("_proposal_attempted", None)
-                        result.pop("_action_proposal_accepted", None)
-                        result.pop("_action_proposal_attempted", None)
-                        result.pop("_finding_recorded", None)
+                        proposal_accepted = bool(result.pop("_accepted_proposal", None))
+                        proposal_attempted = result.pop("_proposal_attempted", None)
+                        action_accepted = bool(result.pop("_action_proposal_accepted", None))
+                        action_attempted = result.pop("_action_proposal_attempted", None)
+                        outcome.proposals += int(bool(proposal_attempted) or proposal_accepted)
+                        outcome.proposals_accepted += int(proposal_accepted)
+                        outcome.action_proposals_submitted += int(bool(action_attempted) or action_accepted)
+                        outcome.action_proposals_accepted += int(action_accepted)
+                        outcome.findings += int(bool(result.pop("_finding_recorded", None)))
+
+                        error = result.get("error")
+                        detail: dict[str, Any] = {"tool": tool_name, "ok": error is None}
+                        if error is not None:
+                            detail["error_code"] = clip_utf8(str(error), 64)
+                        if tool_name in ("propose_ephemeral_watch", "propose_action"):
+                            detail["accepted"] = proposal_accepted or action_accepted
+                        progress.record("tool_result", **detail)
                         messages.append(
                             {
                                 "role": "tool",
@@ -486,49 +601,51 @@ class ReasonerWorker:
                                 "content": self._tool_message(result),
                             }
                         )
-                        if call.name == "finish":
-                            finish_requested = True
                         if stop:
+                            finish_summary = result["summary"]
                             break
                     self._compact_messages(messages)
-                    if not finish_requested:
+                    if not stop:
                         continue
-                if turn.final_text is not None or not turn.tool_calls:
-                    final_text = turn.final_text or ""
-                    break
+                final_text = turn.final_text
+                break
             else:
-                outcome.budget_stop_reason = outcome.budget_stop_reason or "max_turns"
+                outcome.budget_stop_reason = "max_turns"
+        except ProviderError as exc:
+            failure = (f"provider failure: {exc}", exc.retryable)
         except RpcTransportError as exc:
-            return self._fail_lease(client, outcome, lease_token, f"control-d transport failure: {exc}", retryable=True)
+            failure = (f"control-d transport failure: {exc}", True)
+        finally:
+            progress.close()
 
-        outcome.proposals = proposals
-        outcome.proposals_accepted = proposals_accepted
-        outcome.action_proposals_submitted = action_proposals
-        outcome.action_proposals_accepted = action_proposals_accepted
-        outcome.findings = findings
-        outcome.summary = clip_utf8(
-            final_text or "investigation run finished without a final model summary", 2048
-        )
+        if failure is not None:
+            error, retryable = failure
+            return self._fail_lease(client, outcome, lease_token, error, retryable=retryable)
+        summary = final_text or finish_summary or "investigation run finished without a final model summary"
+        outcome.summary = clip_utf8(_redact_credentials(summary, client, lease_token), 2048)
         self.last_messages = messages
 
-        # Findings/proposals are durably submitted; only now complete the lease.
+        # Finish is a durable write between the evidence writes and lease completion.
+        terminal = "budget_exhausted" if outcome.budget_stop_reason else "completed"
+        try:
+            self._finish_run(client, outcome, terminal)
+        except (RpcError, RpcTransportError) as exc:
+            return self._fail_lease(client, outcome, lease_token, f"run finish failed: {exc}", retryable=True)
+
         try:
             client.complete_trigger_lease(
                 event_id, lease_token, run_id=run_id, summary=outcome.summary
             )
-        except RpcError as exc:
-            # Fencing token rejection: an expired or reclaimed lease can never
-            # commit results. Drop the run; control-d requeued or dead-lettered
-            # the trigger on expiry.
-            logger.warning("lease %s could not be completed (fencing): %s", event_id, exc)
+        except (RpcError, RpcTransportError) as exc:
+            logger.warning("lease %s could not be completed: %s", event_id, exc)
             outcome.status = "lease_stale"
             outcome.error = str(exc)
             return outcome
         logger.info(
             "event %s completed: turns=%s findings=%s proposals=%s (accepted=%s) "
             "action_proposals=%s (accepted=%s)",
-            event_id, outcome.turns, findings, proposals, proposals_accepted,
-            action_proposals, action_proposals_accepted,
+            event_id, outcome.turns, outcome.findings, outcome.proposals, outcome.proposals_accepted,
+            outcome.action_proposals_submitted, outcome.action_proposals_accepted,
         )
         return outcome
 
@@ -667,16 +784,31 @@ class ReasonerWorker:
                 target_host = str(args.get("host_id") or host_id)
                 if target_host != host_id:
                     return {"error": "forbidden", "detail": "host is outside run scope"}, False
+                focus = args.get("focus_keys", [])
+                if not isinstance(focus, list) or not all(isinstance(key, str) for key in focus):
+                    return {"error": "invalid", "detail": "focus_keys must be an array of strings"}, False
+                limit = args.get("limit", 50)
+                if not isinstance(limit, int) or isinstance(limit, bool):
+                    return {"error": "invalid", "detail": "limit must be an integer"}, False
                 observations = client.query_observations(
-                    host_id,
-                    watch_id=args.get("watch_id"),
-                    limit=int(args.get("limit") or 50),
+                    host_id, watch_id=args.get("watch_id"), limit=max(1, min(100, limit)),
                 )
-                return {"observations": observations}, False
+                keys = set(focus)
+                compacted = [compact_for_prompt(row, keys) for row in observations]
+                if keys:
+                    compacted.sort(key=lambda row: not has_set_items(row))
+                return {"observations": compacted}, False
             if name == "get_incident_context":
                 if str(args.get("incident_id") or incident_id) != incident_id:
                     return {"error": "forbidden", "detail": "incident is outside run scope"}, False
-                return client.get_incident_context(incident_id), False
+                context = client.get_incident_context(incident_id)
+                return {
+                    **context,
+                    "recent_observations": [
+                        compact_for_prompt(row, set())
+                        for row in select_observations(context.get("recent_observations") or [], set())
+                    ],
+                }, False
             if name == "list_active_watches":
                 if str(args.get("host_id") or host_id) != host_id:
                     return {"error": "forbidden", "detail": "host is outside run scope"}, False
@@ -766,7 +898,22 @@ class ReasonerWorker:
         """Render a tool result as an untrusted provenance envelope."""
         from defsec_reasoner.provenance import wrap_tool_result
 
-        return wrap_tool_result("investigation_rpc", result, max_content_bytes=8192)
+        max_bytes = 8192
+        observations = result.get("observations")
+        if isinstance(observations, list):
+            # Keep whole JSON rows so one large query cannot invalidate every
+            # observation in the envelope.
+            shown = []
+            remaining = max_bytes - 128  # room for the wrapper object and omitted count
+            for row in observations:
+                size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+                if size <= remaining:
+                    shown.append(row)
+                    remaining -= size
+            result = {"observations": shown}
+            if len(shown) < len(observations):
+                result["omitted_observations"] = len(observations) - len(shown)
+        return wrap_tool_result("investigation_rpc", result, max_content_bytes=max_bytes)
 
     def _compact_messages(self, messages: list[dict[str, Any]]) -> None:
         """Keep the conversation under ``max_context_bytes`` deterministically."""
@@ -792,6 +939,22 @@ class ReasonerWorker:
 
     # ------------------------------------------------------------ lease policy
 
+    @staticmethod
+    def _finish_run(client: ControlRpcClient, outcome: WorkerOutcome, status: str) -> None:
+        assert outcome.run_id is not None
+        client.finish_investigation_run(outcome.run_id, {
+            "status": status,
+            "summary": outcome.summary,
+            "budget_stop_reason": outcome.budget_stop_reason,
+            "turns": outcome.turns,
+            "tool_calls": outcome.tool_calls,
+            "input_tokens": outcome.input_tokens,
+            "output_tokens": outcome.output_tokens,
+            "findings": outcome.findings,
+            "proposals": outcome.proposals + outcome.action_proposals_submitted,
+            "proposals_accepted": outcome.proposals_accepted + outcome.action_proposals_accepted,
+        })
+
     def _fail_lease(
         self,
         client: ControlRpcClient,
@@ -802,12 +965,19 @@ class ReasonerWorker:
         retryable: bool,
     ) -> WorkerOutcome:
         assert outcome.event_id is not None
+        error = _redact_credentials(error, client, lease_token)
+        outcome.summary = clip_utf8(error, 2048)
+        if outcome.run_id is not None:
+            try:
+                self._finish_run(client, outcome, "failed")
+            except (RpcError, RpcTransportError):
+                logger.debug("failed to persist outcome for run %s", outcome.run_id)
         try:
             reply = client.fail_trigger_lease(
-                outcome.event_id, lease_token, error, retryable=retryable
+                outcome.event_id, lease_token, outcome.summary, retryable=retryable
             )
             status = str(reply.get("status") or ("pending" if retryable else "dead_letter"))
-        except RpcError as exc:
+        except (RpcError, RpcTransportError) as exc:
             # Lease expired and was reclaimed (fencing): nothing to commit.
             logger.warning("lease %s could not be failed (fencing): %s", outcome.event_id, exc)
             outcome.status = "lease_stale"

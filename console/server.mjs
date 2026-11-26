@@ -93,15 +93,18 @@ const routes = [
   ['GET', `/api/hosts/${ID}/observations`, (b, [h], q) => b.observations(h, { watch_id: q.get('watch_id') || null, limit: q.get('limit') || null })],
   ['GET', '/api/incidents', (b) => b.incidents()],
   ['GET', `/api/incidents/${ID}`, (b, [i]) => b.incident(i)],
-  ['POST', `/api/incidents/${ID}/runs`, (b, [i], _q, body) => b.startRun(i, body)],
+  ['POST', `/api/incidents/${ID}/runs`, (b, [i], _q, body, ctx) => b.startRun(i, body, ctx)],
   ['POST', `/api/incidents/${ID}/proposals`, (b, [i], _q, body) => b.propose(i, body)],
   ['POST', `/api/incidents/${ID}/findings`, (b, [i], _q, body) => b.recordFinding(i, body)],
   ['POST', `/api/incidents/${ID}/actions`, (b, [i], _q, body) => b.proposeAction(i, body)],
   ['GET', `/api/incidents/${ID}/changes`, (b, [i]) => b.changes(i)],
   ['GET', '/api/automation', (b) => b.automation()],
+  ['GET', '/api/runs', (b, _p, q) => b.runs({ incident_id: q.get('incident_id') || null, host_id: q.get('host_id') || null, limit: q.get('limit') || null })],
+  ['GET', `/api/runs/${ID}/events`, (b, [r], q) => b.runEvents(r, { after_seq: q.get('after_seq') ?? null, limit: q.get('limit') || null })],
+  ['GET', '/api/triggers', (b, _p, q) => b.triggers({ incident_id: q.get('incident_id') || null, host_id: q.get('host_id') || null, status: q.get('status') || null, limit: q.get('limit') || null })],
   ['GET', '/api/actions', (b, _p, q) => b.actions({ host_id: q.get('host_id') || null, incident_id: q.get('incident_id') || null })],
   ['GET', `/api/admin/actions/${ID}`, (b, [i]) => b.actionDetail(i)],
-  ['POST', `/api/admin/actions/${ID}/approve`, (b, [i], _q, body, ctx) => b.approveAction(i, body, ctx)],
+  ['POST', `/api/admin/actions/${ID}/approve`, (b, [i], _q, body, ctx) => b.approveAction(i, signedAs(body, ctx, 'approver'), ctx)],
   ['GET', '/api/admin/audit', (b, _p, q) => b.audit({ limit: q.get('limit') || 200 })],
   [
     'GET',
@@ -112,12 +115,21 @@ const routes = [
       return rule ? { decisions: r.decisions.filter((d) => d.decision.rule_id === rule) } : r;
     },
   ],
-  ['POST', '/api/admin/baselines/promote', (b, _p, _q, body) => b.promoteBaseline(body)],
-  ['POST', `/api/admin/incidents/${ID}/close`, (b, [i], _q, body) => b.closeIncident(i, body)],
+  ['POST', '/api/admin/baselines/promote', (b, _p, _q, body, ctx) => b.promoteBaseline(signedAs(body, ctx, 'approver'))],
+  ['POST', `/api/admin/incidents/${ID}/close`, (b, [i], _q, body, ctx) => b.closeIncident(i, signedAs(body, ctx, 'actor'))],
   ['POST', '/api/admin/hosts/enroll', (b, _p, _q, body) => b.enrollHost(body)],
   ['POST', '/api/demo/tamper', (b) => demoOnly(b, 'demoTamper')],
   ['POST', '/api/demo/reset', (b) => demoOnly(b, 'demoReset')],
 ].map(([method, pattern, handler]) => [method, new RegExp(`^${pattern}$`), handler]);
+
+/**
+ * With an access gate, the audit identity is the authenticated account, not a
+ * free-text field: the UI no longer asks for it, and a client cannot spoof it.
+ * Without a gate (loopback, auth none) the submitted name is kept.
+ */
+function signedAs(body, ctx, key) {
+  return ctx?.user?.username ? { ...body, [key]: ctx.user.username } : body;
+}
 
 function demoOnly(backend, fn) {
   if (backend.mode !== 'demo' || typeof backend[fn] !== 'function') throw new ApiError(404, 'not_found', 'demo-only route');

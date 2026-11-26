@@ -76,6 +76,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
         max_total_tokens=args.max_total_tokens,
         max_cost_usd=args.max_cost_usd,
         max_proposals_per_run=args.max_proposals,
+        enable_action_proposals=args.enable_action_proposals,
         max_context_bytes=args.max_context_bytes,
         lease_seconds=args.lease_seconds,
     )
@@ -158,7 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--rpc-timeout", type=float, default=10.0)
     worker.add_argument("--max-turns", type=int, default=6)
     worker.add_argument("--max-wall-seconds", type=float, default=45.0)
-    worker.add_argument("--max-total-tokens", type=int, default=16000)
+    worker.add_argument("--max-total-tokens", type=int, default=48000)
+    worker.add_argument(
+        "--enable-action-proposals", action="store_true",
+        help="allow the model to submit typed mitigation proposals for policy evaluation",
+    )
     worker.add_argument("--max-cost-usd", type=float, default=0.25)
     worker.add_argument("--max-proposals", type=int, default=3)
     worker.add_argument("--max-context-bytes", type=int, default=32768)
