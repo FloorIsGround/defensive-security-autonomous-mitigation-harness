@@ -1,0 +1,7 @@
+# Phase 14 follow-up pilot protocol v1
+
+Measure whether each deployed model route can classify a fresh synthetic systemd sample against a persisted question and cite that exact sample. Use one serial attempt per case per route in fixture order, a fresh disposable control ledger per case, one model turn, a 4,096 total-token worker limit and a 60-second worker deadline. Keep default route reasoning and sampling. Record every failure and make zero retries.
+
+A decision passes if the persisted finding's interpretation matches the fixture answer. A citation passes if its evidence references equal the single fresh observation ID. Both must pass for case success. Count verified conclusions only on the two determinate cases. Report the unknown case as an honest unresolved outcome when both gates pass. Free-text summaries are retained for inspection and excluded from the mechanical score. An unavailable route stays visible with zero requests. Token estimates are excluded from on-wire totals.
+
+Reflection's first-party route is preferred when its existing key is available. Use the Go catalog's Beam Free route otherwise and name that route in results. Compare observed usage and allowance when available. Divide total known allowance across all attempts by verified conclusions only when complete. Zero conclusions or incomplete accounting leave the ratio undefined. This is a three-case smoke pilot for route selection, with no inference about fleet effectiveness.

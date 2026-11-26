@@ -21,3 +21,5 @@ node_modules/
 __pycache__/
 *.py[cod]
 *.egg-info/
+/deploy/fleet-test/lab.local.env
+/deploy/fleet-test/results/

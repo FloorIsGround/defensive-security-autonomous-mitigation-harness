@@ -1,0 +1,8 @@
+{
+  "question": "Was ghost.service active when the fresh unit state was sampled?",
+  "cases": [
+    {"id": "active", "active_state": "active", "sub_state": "running", "expected": "supports"},
+    {"id": "inactive", "active_state": "inactive", "sub_state": "dead", "expected": "contradicts"},
+    {"id": "unknown", "active_state": "unknown", "sub_state": "unknown", "expected": "unresolved"}
+  ]
+}
